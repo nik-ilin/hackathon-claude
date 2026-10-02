@@ -380,6 +380,84 @@ def decide_fast(st: NegState, f: FastConfig, ceiling: int, conv_ticks_left: int,
                                f"acotada por {hi} P", p)
 
 
+@dataclass
+class DealerPolicy:
+    """Negociación con un vendedor concreto. Valores heurísticos ajustables, no óptimos demostrados; los rasgos del
+    vendedor (/api/dealers) orientan la elección, pero NO son una fórmula conocida de sus precios."""
+    name: str
+    open_frac: float                 # primera oferta = fracción de su precio vigente
+    gap_frac: float                  # cada contraoferta cierra esta fracción de la brecha restante (redondeo arriba)
+    max_counteroffers: int
+    max_ticks: int                   # por conversación, contando desde que se abrió
+    accept_on_concession: bool       # aceptar en cuanto rebaje (rápido) o seguir mientras quedan contraofertas
+    allow_opening_price: bool        # False en modo score: el precio de apertura no cuenta para la escalera
+    accept_gap: int = 1
+    min_viable_frac: float = 0.8     # si nuestro máximo < 80 % de su precio, mejor otro artículo
+
+
+def dealer_policy(dealer: str, mode: str = "score") -> DealerPolicy:
+    """abuela: paciente y generosa -> concesiones significativas, varias rondas, sin pasos de 1 P.
+    chato: impaciente, estricto y con memoria -> apertura cercana a su precio y una sola contraoferta.
+    Desconocido: la versión prudente del Chato."""
+    allow = mode != "score"
+    if dealer == "abuela":
+        return DealerPolicy("abuela", 0.65, 0.40, 3, 8, accept_on_concession=not (mode == "score"),
+                            allow_opening_price=allow)
+    return DealerPolicy(dealer, 0.90, 0.50, 1, 4, accept_on_concession=True, allow_opening_price=allow)
+
+
+def decide_dealer(st: NegState, pol: DealerPolicy, ceiling: int, conv_ticks_left: int,
+                  total_ticks_left: int = 10 ** 9) -> Decision:
+    """final=true: aceptar dentro del máximo o abandonar. Nunca repite ni baja una oferta, nunca supera el máximo,
+    cuenta las contraofertas de hilos retomados, y una respuesta pendiente no es un rechazo."""
+    live, n = st.live, st.turns
+
+    def valid(price: int) -> bool:
+        return price <= ceiling and (pol.allow_opening_price or st.opening is None or price < st.opening)
+
+    def take(why: str) -> Decision:
+        note = f" ({OPENING_NOTE})" if st.opening is not None and live.price >= st.opening else ""
+        return Decision("accept", why + note, live.price, live.offer_id)
+
+    if live and live.final:
+        return take(f"oferta final de {live.price} P aceptable (máximo {ceiling} P)") if valid(live.price) else \
+            Decision("abandon", f"oferta final de {live.price} P no aceptable (máximo {ceiling} P, apertura {st.opening} P)")
+    if ceiling < 1:
+        return Decision("abandon", f"sin margen económico (máximo {ceiling} P)")
+    if st.current is None:
+        return Decision("wait" if conv_ticks_left > 0 else "abandon", "aún no ha puesto precio")
+    if st.awaiting_reply:
+        return Decision("wait", "esperando su respuesta")
+    out_of_time = conv_ticks_left <= 0 or total_ticks_left <= 0
+    last = st.rounds[-1] if st.rounds else None
+    conceded = bool(last and last.reply is not None and last.before is not None and last.reply < last.before)
+    if live and valid(live.price):
+        if pol.accept_on_concession and conceded:
+            return take(f"ha rebajado de {last.before} P a {last.reply} P")
+        if st.last_ours is not None and live.price - st.last_ours <= pol.accept_gap:
+            return take(f"brecha de {live.price - st.last_ours} P")
+        if n >= pol.max_counteroffers or out_of_time:
+            return take(("contraofertas agotadas" if n >= pol.max_counteroffers else "plazo agotado") +
+                        f"; {live.price} P es aceptable")
+    if out_of_time or n >= pol.max_counteroffers:
+        return Decision("abandon", f"{n} contraofertas / plazo agotado y {st.ref_ask} P no es aceptable o no está vigente")
+    ask = st.ref_ask
+    hi = min(ceiling, ask - 1)
+    if n == 0:
+        if ceiling < ask * pol.min_viable_frac:
+            return Decision("abandon", f"máximo {ceiling} P muy por debajo de su precio {ask} P: mejor otro artículo")
+        p = min(int(pol.open_frac * ask + 0.5), hi)
+        if p < 1:
+            return Decision("abandon", "no hay primera oferta válida")
+        return Decision("counter", f"[{pol.name}] apertura {pol.open_frac:.0%} de {ask} P", p)
+    p = min(st.last_ours + math.ceil(pol.gap_frac * (ask - st.last_ours)), hi)
+    if p <= st.last_ours:
+        if live and valid(live.price):
+            return take(f"no queda oferta nueva por encima de {st.last_ours} P; {live.price} P es aceptable")
+        return Decision("abandon", f"no queda oferta nueva entre {st.last_ours} P y {hi} P")
+    return Decision("counter", f"[{pol.name}] cierra el {pol.gap_frac:.0%} de la brecha ({ask} P vigente)", p)
+
+
 def conversation_ticks_used(thread: dict, now_tick: int) -> int:
     start = thread.get("created_tick")
     if start is None:
@@ -483,6 +561,10 @@ def settlement_status(pending: dict, thread: dict, holdings_now: int, cash_now: 
     """settled | waiting | failed: una compra solo es definitiva cuando el artículo está en nuestras manos."""
     status = thread.get("status")
     if status == "deal":
+        settled = next((m.get("offer") for m in reversed(thread.get("messages") or [])
+                        if (m.get("offer") or {}).get("status") == "settled"), None)
+        if settled is not None:  # evidencia del servidor; un sobre ya abierto no vuelve a aparecer en el inventario
+            return "settled", f"oferta {settled.get('id')} liquidada en el servidor"
         if holdings_now > pending["holdings_before"]:
             paid_ok = pending.get("price") is None or cash_now <= pending["cash_before"] - pending["price"]
             return "settled", "" if paid_ok else "el efectivo no cuadra con el precio (¿otros movimientos?)"
