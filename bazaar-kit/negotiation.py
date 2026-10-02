@@ -1,0 +1,616 @@
+"""Política de compra a un dealer, sin llamadas a la API, para poder probarla en local (sim.py, test_negotiation.py).
+
+Lo que garantizan las reglas (RULES.md): el dealer solo se mueve si nos movemos; repetir precio no consigue nada; cada
+conversación tiene un límite secreto; al agotarse su paciencia nombra una oferta final (final=true); un trato al precio
+de apertura no cuenta para la escalera; solo la estructura de una oferta aceptada mueve algo, en el siguiente tick.
+Todo lo demás de este módulo (zona de cierre, reciprocidad, ahorro esperado) es una ESTIMACIÓN heurística.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import time
+from dataclasses import asdict, dataclass, field
+from typing import Callable, Optional
+
+QUOTA_REASONS = {"persona_quota", "sold_out", "cooloff"}  # cierres que no dicen nada del precio: no se mezclan
+
+
+@dataclass
+class Config:
+    budget: int = 60                # presupuesto máximo configurado (P)
+    reserve: int = 100              # efectivo que nunca se gasta
+    min_margin: int = 2             # beneficio mínimo exigido: valor - precio
+    open_frac: float = 0.70         # primera oferta = fracción de su precio de referencia (heurística, no un óptimo)
+    start_room_frac: float = 0.0    # la primera oferta deja al menos este hueco bajo nuestro máximo
+    step_frac: float = 0.50         # paso = fracción de la brecha mientras ella concede
+    min_step: int = 1
+    max_step: int = 4
+    near_step: int = 1              # paso al acercarnos a la zona plausible de cierre
+    near_gap: int = 3               # brecha a partir de la cual estamos "cerca"
+    low_reciprocity: float = 0.35   # por debajo, ella apenas concede: no aceleramos nuestras concesiones
+    stall_turns: int = 2            # respuestas seguidas sin concesión = se ha plantado
+    turn_budget: int = 12           # control de riesgo PROPIO; no es la paciencia secreta del dealer, que no conocemos
+    accept_gap: int = 2             # acepta si su precio está a esta distancia de nuestra última oferta
+    min_saving: float = 1.5         # ahorro esperado mínimo para seguir regateando...
+    risk_per_turn: float = 0.05     #...que sube con cada turno consumido (más riesgo de que se canse)
+    reciprocity_window: int = 3
+    reply_timeout_ticks: int = 3    # ticks sin respuesta tras los que el turno cuenta como "sin concesión"
+    accept_opening_price: bool = False
+    history_min_samples: int = 3
+    prior_low: float = 0.55         # zona de cierre a priori, en fracción de la apertura (estimación débil)
+    prior_high: float = 0.90
+    pack_value_factor: float = 0.9  # valor de un sobre = valor esperado con tus valores privados * factor (estimación)
+    prior_close_frac: float = 0.6   # sin historial, precio esperado de cierre = precio de lista * fracción (para elegir)
+
+
+def price_ceiling(cfg: Config, cash: int, value: float) -> tuple[int, dict]:
+    """precio_maximo = min(presupuesto, efectivo - reserva, valor - margen), y cada término para mostrarlo."""
+    parts = {"presupuesto": cfg.budget, "efectivo - reserva": cash - cfg.reserve,
+             "valor - margen": math.floor(value - cfg.min_margin)}
+    return int(min(parts.values())), parts
+
+
+# ------------------------------------------------------------------ estado de una conversación
+
+@dataclass
+class Ask:
+    price: int
+    offer_id: int
+    final: bool
+    live: bool
+    tick: int
+
+
+@dataclass
+class Round:
+    ours: int                      # nuestra oferta
+    before: Optional[int]          # su precio vigente cuando ofrecimos
+    tick: int
+    reply: Optional[int] = None    # su primer precio tras nuestra oferta
+
+
+@dataclass
+class NegState:
+    item: Optional[str]
+    opening: Optional[int] = None
+    rounds: list = field(default_factory=list)
+    current: Optional[Ask] = None  # su última oferta estructurada (viva o no)
+    awaiting_reply: bool = False
+
+    @property
+    def turns(self) -> int:
+        return len(self.rounds)
+
+    @property
+    def last_ours(self) -> Optional[int]:
+        return self.rounds[-1].ours if self.rounds else None
+
+    @property
+    def live(self) -> Optional[Ask]:
+        return self.current if self.current and self.current.live else None
+
+    @property
+    def ref_ask(self) -> Optional[int]:
+        return self.current.price if self.current else self.opening
+
+
+def item_of(topic: Optional[dict]) -> Optional[str]:
+    buy = (topic or {}).get("buy") or {}
+    if "card" in buy:
+        return f"card:{buy['card']}"
+    if "pack" in buy:
+        return f"pack:{buy['pack']}"
+    return None
+
+
+def _our_price(m: dict) -> Optional[int]:
+    if m.get("price") is not None:
+        return int(m["price"])
+    cash = ((m.get("offer") or {}).get("give") or {}).get("cash")
+    return int(cash) if cash else None
+
+
+def state_from_thread(thread: dict, dealer: str, now_tick: int, cfg: Config) -> NegState:
+    """Reconstruye el estado desde los mensajes del hilo, así un reinicio retoma la negociación tal cual estaba."""
+    st = NegState(item=item_of(thread.get("topic")))
+    for m in thread.get("messages") or []:
+        o = m.get("offer")
+        if m.get("sender") == dealer:
+            if not o:
+                continue
+            a = Ask(int(o["want"]["cash"]), o["id"], bool(o.get("final")), o.get("status") == "open", int(m.get("tick", 0)))
+            if st.opening is None:
+                st.opening = a.price
+            if st.rounds and st.rounds[-1].reply is None:
+                st.rounds[-1].reply = a.price
+            st.current = a
+        else:
+            p = _our_price(m)
+            if p is not None:
+                st.rounds.append(Round(p, st.current.price if st.current else None, int(m.get("tick", 0))))
+    last = st.rounds[-1] if st.rounds else None
+    st.awaiting_reply = bool(last and last.reply is None and now_tick - last.tick < cfg.reply_timeout_ticks)
+    return st
+
+
+# ------------------------------------------------------------------ indicadores y estimación
+
+@dataclass
+class Metrics:
+    gap: Optional[int]                 # su precio de referencia - nuestra última oferta
+    her_drop: Optional[int]            # su último descenso
+    our_raise: Optional[int]           # nuestra última subida
+    reciprocity: Optional[float]       # sus descensos / nuestras subidas en la ventana reciente
+    stalled: int                       # respuestas seguidas sin concesión (o sin respuesta)
+    projection: Optional[float]        # precio de encuentro si la reciprocidad se mantuviera
+    expected_saving: Optional[float]   # su precio - proyección
+
+
+def metrics(st: NegState, cfg: Config) -> Metrics:
+    ask, last = st.ref_ask, st.last_ours
+    gap = ask - last if ask is not None and last is not None else None
+    pairs = []  # (su descenso, nuestra subida) por ronda respondida
+    for i, r in enumerate(st.rounds):
+        if r.reply is not None and r.before is not None:
+            pairs.append((r.before - r.reply, r.ours - st.rounds[i - 1].ours if i else None))
+    win = [(d, s) for d, s in pairs if s and s > 0][-cfg.reciprocity_window:]
+    rec = sum(d for d, _ in win) / sum(s for _, s in win) if win else None
+    stalled = 0
+    for i, r in enumerate(reversed(st.rounds)):
+        if r.reply is None:
+            if i == 0 and st.awaiting_reply:
+                continue
+            stalled += 1
+        elif r.before is not None and r.reply >= r.before:
+            stalled += 1
+        else:
+            break
+    proj = saving = None
+    if gap is not None and gap > 0 and rec:  # con reciprocidad 0 no se extrapola un precio mínimo fijo
+        proj = last + gap / (1 + rec)
+        saving = ask - proj
+    return Metrics(gap, pairs[-1][0] if pairs else None,
+                   st.rounds[-1].ours - st.rounds[-2].ours if len(st.rounds) >= 2 else None,
+                   rec, stalled, proj, saving)
+
+
+@dataclass
+class Estimate:
+    low: Optional[float]
+    high: Optional[float]
+    n: int                  # cierres comparables usados
+    strength: str           # "sin datos" | "supuesto" | "limitada" | "razonable" (cualitativo, no estadístico)
+    evidence: list
+
+
+def estimate(outcomes: list, st: NegState, m: Metrics, cfg: Config) -> Estimate:
+    """Zona heurística de cierre. `outcomes`: resultados previos del MISMO dealer y artículo, sin cierres por cuota."""
+    if st.opening is None:
+        return Estimate(None, None, 0, "sin datos", ["aún no hay precio de apertura"])
+    deals = [o for o in outcomes if o.get("status") == "deal" and o.get("opening") and o.get("close_price")]
+    ev = []
+    if len(deals) >= cfg.history_min_samples:
+        ratios = sorted(o["close_price"] / o["opening"] for o in deals)
+        low, high = ratios[0] * st.opening, ratios[-1] * st.opening
+        strength = "limitada" if len(deals) < 10 else "razonable"
+        ev.append(f"{len(deals)} cierres comparables entre {ratios[0]:.0%} y {ratios[-1]:.0%} de la apertura")
+    else:
+        low, high = cfg.prior_low * st.opening, cfg.prior_high * st.opening
+        strength = "supuesto"
+        ev.append(f"SUPUESTO INICIAL, no aprendido: {cfg.prior_low:.0%}-{cfg.prior_high:.0%} de la apertura "
+                  f"({len(deals)} cierres comparables, se necesitan {cfg.history_min_samples})")
+    if len(outcomes) > len(deals):
+        ev.append(f"{len(outcomes) - len(deals)} negociaciones comparables sin compra")
+    replies = [r for r in st.rounds if r.reply is not None and r.before is not None]
+    if replies:
+        conceded = sum(1 for r in replies if r.reply < r.before)
+        ev.append(f"observado: {conceded} concesiones en {len(replies)} respuestas")
+        if not conceded:
+            ev.append("sin concesiones: la hipótesis de descuento gradual pierde confianza "
+                      "(pocas respuestas: no prueba un precio mínimo fijo)")
+    if m.projection is not None:
+        ev.append(f"reciprocidad {m.reciprocity:.2f} en esta conversación: encuentro proyectado ~{m.projection:.1f} P")
+    if st.current:
+        high = min(high, st.current.price)
+    return Estimate(round(min(low, high), 1), round(high, 1), len(deals), strength, ev)
+
+
+# ------------------------------------------------------------------ decisión
+
+@dataclass
+class Decision:
+    action: str                     # counter | accept | abandon | wait
+    reason: str
+    price: Optional[int] = None
+    offer_id: Optional[int] = None
+
+
+def next_price(st: NegState, cfg: Config, ceiling: int, est: Estimate, m: Metrics) -> tuple[Optional[int], str]:
+    """Nuestra siguiente oferta, siempre estrictamente por encima de la anterior y por debajo de su precio y del máximo."""
+    ask = st.ref_ask
+    hi = min(ceiling, ask - 1)  # ofrecer su precio o más no tiene sentido: entonces se acepta
+    last = st.last_ours
+    if last is None:
+        p = max(1, min(int(cfg.open_frac * ask + 0.5), math.floor(ceiling * (1 - cfg.start_room_frac)), hi))
+        if p > hi:
+            return None, f"no hay primera oferta válida por debajo de {hi + 1} P"
+        return p, f"apertura heurística: {cfg.open_frac:.0%} de {ask} P, acotada por el máximo de {ceiling} P"
+    gap = ask - last
+    step = min(cfg.max_step, max(cfg.min_step, int(gap * cfg.step_frac + 0.5)))
+    why = f"paso moderado de {step} P (brecha {gap} P)"
+    mid = (est.low + est.high) / 2 if est.low is not None else None
+    if m.reciprocity and m.reciprocity < cfg.low_reciprocity:  # concede poco; si no concede nada, no se frena
+        step, why = cfg.min_step, f"apenas concede (reciprocidad {m.reciprocity:.2f}): paso mínimo de {cfg.min_step} P"
+    elif gap <= cfg.near_gap or (mid is not None and last + step > mid):
+        step = min(step, cfg.near_step)
+        why = f"cerca de la zona estimada ({est.low}-{est.high} P) o brecha corta: paso de {step} P"
+    p = min(last + step, hi)
+    if p <= last:
+        return None, f"no queda una oferta nueva entre {last} P y {hi} P"
+    return p, why
+
+
+def decide(st: NegState, cfg: Config, ceiling: int, est: Estimate, m: Optional[Metrics] = None) -> Decision:
+    m = m or metrics(st, cfg)
+    live = st.live
+
+    def worth(price: int) -> bool:  # económicamente válido y no el precio de apertura sin negociar
+        return price <= ceiling and (cfg.accept_opening_price or st.opening is None or price < st.opening)
+
+    if live and live.final:  # su última palabra: no se regatea más
+        if worth(live.price):
+            return Decision("accept", f"oferta final de {live.price} P dentro del máximo de {ceiling} P", live.price, live.offer_id)
+        return Decision("abandon", f"oferta final de {live.price} P por encima del máximo ({ceiling} P) o igual a la apertura")
+    if ceiling < 1:
+        return Decision("abandon", f"sin margen económico (precio máximo {ceiling} P)")
+    if st.current is None:
+        return Decision("wait", "la abuela aún no ha puesto precio")
+    if st.awaiting_reply:
+        return Decision("wait", "esperando su respuesta a nuestra oferta")
+    if live and worth(live.price):
+        def take(why: str) -> Decision:
+            return Decision("accept", why, live.price, live.offer_id)
+        if st.last_ours is not None and live.price - st.last_ours <= cfg.accept_gap:
+            return take(f"brecha de {live.price - st.last_ours} P: otro turno no compensa")
+        if st.turns >= cfg.turn_budget:
+            return take(f"presupuesto de {cfg.turn_budget} turnos agotado y {live.price} P está dentro del máximo")
+        if m.stalled >= cfg.stall_turns:
+            return take(f"{m.stalled} respuestas sin concesión: parece plantada en {live.price} P")
+        need = cfg.min_saving + cfg.risk_per_turn * st.turns
+        if m.expected_saving is not None and m.expected_saving < need:
+            return take(f"ahorro esperado {m.expected_saving:.1f} P < {need:.1f} P exigidos por el riesgo de perder el trato")
+    if st.turns >= cfg.turn_budget:
+        return Decision("abandon", f"presupuesto de {cfg.turn_budget} turnos agotado y {st.ref_ask} P no es aceptable "
+                                   f"(máximo {ceiling} P)")
+    p, why = next_price(st, cfg, ceiling, est, m)
+    if p is None:
+        if live and worth(live.price):
+            return Decision("accept", f"{why}; su precio de {live.price} P es aceptable", live.price, live.offer_id)
+        return Decision("abandon", why)
+    return Decision("counter", why, p)
+
+
+MESSAGES = (
+    "¡Buenas, Abuela Carmen! ¿Le parecería bien {p} P por {item}?",
+    "Muchas gracias por atenderme. ¿Qué tal {p} P?",
+    "Subo un poquito, con todo el cariño: {p} P.",
+    "Me haría mucha ilusión. ¿Lo dejamos en {p} P?",
+    "Hago un esfuerzo más: {p} P. ¿Trato hecho?",
+    "Es usted un encanto. ¿{p} P le parece justo?",
+    "Un pasito más por mi parte: {p} P.",
+    "Gracias por su paciencia, Abuela. ¿{p} P?",
+)
+
+
+def message(turn: int, price: int, item_name: str) -> str:
+    return MESSAGES[turn % len(MESSAGES)].format(p=price, item=item_name)
+
+
+# ------------------------------------------------------------------ modo primera compra (--first-purchase)
+
+@dataclass
+class FastConfig:
+    """Negociación corta: rebaja moderada en dos contraofertas como mucho. Todos los valores son heurísticas ajustables."""
+    open_frac: float = 0.85          # primera oferta = 85 % de su precio, siempre por debajo de él
+    second_gap_frac: float = 0.75    # segunda oferta cierra el 75 % de la brecha restante (redondeo hacia arriba)
+    max_counteroffers: int = 2
+    max_negotiation_ticks: int = 6   # por conversación, contando desde que se abrió (también si se retoma)
+    max_total_ticks: int = 12        # para todo el intento de primera compra, persistido entre reinicios
+    accept_gap: int = 1              # con una brecha de 1 P y oferta válida, se acepta
+    min_viable_frac: float = 0.85    # si nuestro máximo < 85 % de su precio, no insistimos: mejor otro artículo
+    allow_opening_price: bool = True  # tras el intento breve; puede no contar como trato negociado para la escalera
+
+
+OPENING_NOTE = "es su precio inicial: puede no contar como trato negociado para la progresión"
+
+
+def decide_fast(st: NegState, f: FastConfig, ceiling: int, conv_ticks_left: int, total_ticks_left: int) -> Decision:
+    """Primera oferta ~85 %; si rebaja dentro del máximo, aceptar; si mantiene, una segunda oferta que cierra ~75 % de la
+    brecha; después aceptar una oferta válida o abandonar. Nunca más de `max_counteroffers` (cuenta las de hilos retomados)."""
+    live, n = st.live, st.turns
+
+    def take(why: str) -> Decision:
+        note = f" ({OPENING_NOTE})" if st.opening is not None and live.price >= st.opening else ""
+        return Decision("accept", why + note, live.price, live.offer_id)
+
+    if live and live.final:  # siempre tiene prioridad
+        return take(f"oferta final de {live.price} P dentro del máximo de {ceiling} P") if live.price <= ceiling else \
+            Decision("abandon", f"oferta final de {live.price} P por encima del máximo de {ceiling} P")
+    if ceiling < 1:
+        return Decision("abandon", f"sin margen económico (máximo {ceiling} P)")
+    if st.current is None:
+        return Decision("wait" if conv_ticks_left > 0 else "abandon",
+                        "la abuela aún no ha puesto precio" + ("" if conv_ticks_left > 0 else " y se agotó el plazo"))
+    if st.awaiting_reply:  # una respuesta pendiente no es un rechazo
+        return Decision("wait", "esperando su respuesta a nuestra oferta")
+    out_of_time = conv_ticks_left <= 0 or total_ticks_left <= 0
+    if live and live.price <= ceiling:
+        last = st.rounds[-1] if st.rounds else None
+        if last and last.reply is not None and last.before is not None and last.reply < last.before:
+            return take(f"ha rebajado de {last.before} P a {last.reply} P y cabe en el máximo de {ceiling} P")
+        if st.last_ours is not None and live.price - st.last_ours <= f.accept_gap:
+            return take(f"brecha de {live.price - st.last_ours} P con una oferta válida")
+        if n >= f.max_counteroffers or out_of_time:
+            if live.price >= (st.opening or 0) and not f.allow_opening_price:
+                return Decision("abandon", "solo queda su precio inicial y este modo no lo acepta")
+            why = "contraofertas agotadas" if n >= f.max_counteroffers else "plazo agotado"
+            return take(f"{why}; {live.price} P cabe en el máximo de {ceiling} P")
+    if out_of_time:
+        return Decision("abandon", f"plazo agotado y no hay oferta vigente dentro del máximo de {ceiling} P")
+    if n >= f.max_counteroffers:
+        return Decision("abandon", f"{n} contraofertas hechas y su precio ({st.ref_ask} P) no es aceptable o ya no está vigente")
+    ask = st.ref_ask
+    hi = min(ceiling, ask - 1)
+    if n == 0:
+        if ceiling < ask * f.min_viable_frac:
+            return Decision("abandon", f"nuestro máximo ({ceiling} P) está muy por debajo de su precio ({ask} P): "
+                                       "mejor otro artículo")
+        p = min(int(f.open_frac * ask + 0.5), hi)
+        if p < 1:
+            return Decision("abandon", "no hay primera oferta válida")
+        return Decision("counter", f"primera oferta: {f.open_frac:.0%} de {ask} P, acotada por el máximo de {ceiling} P", p)
+    p = min(st.last_ours + math.ceil(f.second_gap_frac * (ask - st.last_ours)), hi)
+    if p <= st.last_ours:
+        if live and live.price <= ceiling:
+            return take(f"no queda una oferta nueva por encima de {st.last_ours} P; {live.price} P es válido")
+        return Decision("abandon", f"no queda una oferta nueva entre {st.last_ours} P y el máximo de {ceiling} P")
+    return Decision("counter", f"mantiene {ask} P: segunda oferta cierra el {f.second_gap_frac:.0%} de la brecha, "
+                               f"acotada por {hi} P", p)
+
+
+def conversation_ticks_used(thread: dict, now_tick: int) -> int:
+    start = thread.get("created_tick")
+    if start is None:
+        ticks = [m.get("tick") for m in thread.get("messages") or [] if m.get("tick") is not None]
+        start = min(ticks) if ticks else now_tick
+    return max(0, now_tick - int(start))
+
+
+@dataclass
+class Candidate:
+    item: str
+    name: str
+    value: float
+    list_price: Optional[int]
+    ceiling: int
+    owned: int
+    tier: int          # 0 = viable al precio publicado, 1 = necesita una rebaja moderada, 2 = descartada
+    why: str
+
+
+def rank_cards(cards: list, f: FastConfig) -> list:
+    """cards: dicts {item, name, value, list_price, ceiling, owned}. Ordena TODOS los candidatos: primero las cartas que
+    no tenemos y ya son viables al precio publicado (no dependen de un descuento incierto), luego las que necesitan una
+    rebaja moderada; dentro de cada grupo, mayor beneficio al precio publicado."""
+    out = []
+    for c in cards:
+        lp, ceiling = c.get("list_price"), c["ceiling"]
+        if lp is None:
+            tier, why = 2, "la abuela no la vende"
+        elif ceiling >= lp:
+            tier, why = 0, f"viable al precio publicado ({lp} P <= máximo {ceiling} P)"
+        elif ceiling >= lp * f.min_viable_frac:
+            tier, why = 1, f"necesita rebaja: publicado {lp} P > máximo {ceiling} P"
+        else:
+            tier, why = 2, f"máximo {ceiling} P muy por debajo de {lp} P"
+        out.append(Candidate(c["item"], c["name"], c["value"], lp, ceiling, c.get("owned", 0), tier, why))
+    return sorted(out, key=lambda c: (c.tier, c.owned > 0, -(c.value - (c.list_price or 0)), c.item))
+
+
+# ------------------------------------------------------------------ validación y liquidación
+
+def find_offer(thread: dict, offer_id: Optional[int]) -> Optional[dict]:
+    for m in thread.get("messages") or []:
+        o = m.get("offer")
+        if o and o.get("id") == offer_id:
+            return o
+    for o in thread.get("standing_offers") or []:
+        if o.get("id") == offer_id:
+            return o
+    return None
+
+
+def validate_offer(offer: dict, *, dealer: str, team: Optional[str], thread_id: int, item: str, ceiling: int,
+                   cash: int, now_tick: int, resolve_asset: Optional[Callable[[int], Optional[str]]] = None) -> list:
+    """Problemas de la estructura de la oferta (lista vacía = se puede aceptar). El texto del hilo no cuenta."""
+    problems = []
+    give, want = offer.get("give") or {}, offer.get("want") or {}
+    if offer.get("maker") != dealer:
+        problems.append(f"la hace {offer.get('maker')!r}, no {dealer!r}")
+    if team and offer.get("to") != team:
+        problems.append(f"va dirigida a {offer.get('to')!r}, no a {team!r}")
+    if offer.get("thread") != thread_id:
+        problems.append(f"pertenece al hilo {offer.get('thread')!r}, no al {thread_id}")
+    if offer.get("status") != "open":
+        problems.append(f"no está abierta ({offer.get('status')!r})")
+    if offer.get("expires_tick") is not None and offer["expires_tick"] < now_tick:
+        problems.append(f"caducada en el tick {offer['expires_tick']}")
+    price = want.get("cash")
+    if not isinstance(price, int) or price < 1:
+        problems.append(f"precio no válido: {price!r}")
+    else:
+        if price > ceiling:
+            problems.append(f"{price} P supera nuestro máximo de {ceiling} P")
+        if price > cash:
+            problems.append(f"{price} P supera nuestro efectivo ({cash} P)")
+    if want.get("assets") or want.get("types"):
+        problems.append("además del dinero nos pide cartas o activos")
+    if give.get("cash"):
+        problems.append("incluye dinero en sentido inesperado")
+    types, assets = list(give.get("types") or []), list(give.get("assets") or [])
+    if not ((types == [item] and not assets) or
+            (not types and len(assets) == 1 and resolve_asset is not None and resolve_asset(assets[0]) == item)):
+        problems.append(f"no entrega exactamente {item} (types={types}, assets={assets})")
+    return problems
+
+
+def settled_price(thread: dict, dealer: str) -> Optional[int]:
+    """Precio realmente pagado según el servidor: la oferta del hilo con estado "settled" (no nuestra última oferta)."""
+    for m in reversed(thread.get("messages") or []):
+        o = m.get("offer") or {}
+        if o.get("status") == "settled":
+            return (o.get("want") or {}).get("cash") if o.get("maker") == dealer else (o.get("give") or {}).get("cash")
+    return None
+
+
+def holdings(assets: list, item: str) -> int:
+    return sum(1 for a in assets if f"{a.get('kind')}:{a.get('ref')}" == item)
+
+
+def settlement_status(pending: dict, thread: dict, holdings_now: int, cash_now: int) -> tuple[str, str]:
+    """settled | waiting | failed: una compra solo es definitiva cuando el artículo está en nuestras manos."""
+    status = thread.get("status")
+    if status == "deal":
+        if holdings_now > pending["holdings_before"]:
+            paid_ok = pending.get("price") is None or cash_now <= pending["cash_before"] - pending["price"]
+            return "settled", "" if paid_ok else "el efectivo no cuadra con el precio (¿otros movimientos?)"
+        return "waiting", "trato cerrado, esperando la entrega"
+    offer = find_offer(thread, pending.get("offer_id"))
+    if status == "open" and offer and offer.get("status") in ("open", "accepted", "queued", "pending"):
+        return "waiting", f"oferta {offer.get('status')}: se liquida en el siguiente tick"
+    return "failed", f"conversación {status}, oferta {offer.get('status') if offer else 'no encontrada'}"
+
+
+def outcome_record(st: NegState, *, dealer: str, thread_id: int, status: str, closed_reason: Optional[str],
+                   close_price: Optional[int], ceiling: int, est: Optional[Estimate], settled: bool, note: str = "") -> dict:
+    offers = [r.ours for r in st.rounds]
+    return {
+        "dealer": dealer, "item": st.item, "thread": thread_id, "status": status, "closed_reason": closed_reason,
+        "context": "quota" if closed_reason in QUOTA_REASONS else "normal",
+        "opening": st.opening, "close_price": close_price, "ceiling": ceiling,
+        "offers": offers, "replies": [r.reply for r in st.rounds],
+        "our_concessions": [b - a for a, b in zip(offers, offers[1:])],
+        "her_concessions": [r.before - r.reply for r in st.rounds if r.before is not None and r.reply is not None],
+        "turns": st.turns, "estimate": asdict(est) if est else None,
+        "saving_vs_opening": st.opening - close_price if st.opening and close_price else None,
+        "settled": settled, "note": note,
+    }
+
+
+class Journal:
+    """Registro local en JSON Lines, sin credenciales: decisiones, resultados y la aceptación pendiente."""
+
+    def __init__(self, folder: str):
+        os.makedirs(folder, exist_ok=True)
+        self.folder = folder
+        self.log = os.path.join(folder, "negotiations.jsonl")
+        self.pending_path = os.path.join(folder, "pending.json")
+
+    def append(self, kind: str, rec: dict) -> None:
+        with open(self.log, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"kind": kind, "ts": round(time.time()), **rec}, ensure_ascii=False) + "\n")
+
+    def records(self, kind: Optional[str] = None) -> list:
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log, encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+        return [r for r in rows if kind is None or r.get("kind") == kind]
+
+    def outcomes(self, dealer: str, item: str) -> list:
+        """Comparables: mismo dealer, mismo artículo, sin cierres por cuota o enfriamiento."""
+        return [r for r in self.records("outcome")
+                if r.get("dealer") == dealer and r.get("item") == item and r.get("context") == "normal"]
+
+    def purchased(self, dealer: str, item: str) -> bool:
+        return any(r.get("status") == "deal" and r.get("settled") for r in self.records("outcome")
+                   if r.get("dealer") == dealer and r.get("item") == item)
+
+    def known_threads(self) -> set:
+        return {r.get("thread") for r in self.records("outcome")}
+
+    def pending(self) -> Optional[dict]:
+        if not os.path.exists(self.pending_path):
+            return None
+        with open(self.pending_path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def set_pending(self, pending: dict) -> None:
+        tmp = self.pending_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(pending, f)
+        os.replace(tmp, self.pending_path)
+
+    def clear_pending(self) -> None:
+        if os.path.exists(self.pending_path):
+            os.remove(self.pending_path)
+
+    def load(self, name: str) -> Optional[dict]:
+        path = os.path.join(self.folder, name)
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def save(self, name: str, data: dict) -> None:
+        path = os.path.join(self.folder, name)
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(path + ".tmp", path)
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class InstanceLock:
+    """Una sola instancia a la vez: data/agent.lock guarda pid y versión; el bloqueo de un proceso muerto se recupera."""
+
+    def __init__(self, path: str, info: dict):
+        self.path, self.info = path, {**info, "pid": os.getpid(), "since": round(time.time())}
+
+    def acquire(self) -> Optional[dict]:
+        """None si lo hemos obtenido; si no, los datos de la instancia que lo tiene."""
+        for _ in range(2):
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:
+                    with open(self.path, encoding="utf-8") as f:
+                        holder = json.load(f)
+                except (OSError, ValueError):
+                    holder = {}
+                if holder.get("pid") and pid_alive(int(holder["pid"])):
+                    return holder
+                os.remove(self.path)  # bloqueo huérfano
+                continue
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self.info, f)
+            return None
+        return {"pid": "?"}
+
+    def release(self) -> None:
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                if json.load(f).get("pid") == os.getpid():
+                    os.remove(self.path)
+        except (OSError, ValueError):
+            pass
