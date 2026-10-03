@@ -357,6 +357,19 @@ class Integration(unittest.TestCase):
         self.assertEqual(calls[1][:2], ({"assets": [4]}, {"cards": ["LAT-03"]}))
         self.assertEqual(led["actions"][0]["effective_ticks"], 60)
 
+class AliasOwnOffers(unittest.TestCase):
+    def test_own_offer_shown_under_alias_on_board_is_still_ours(self):
+        mine = swap(8926, "rastro", 214, "MAL-01", "LAT-03", maker=TEAM)
+        aliased = dict(mine, maker="m3950d43b")  # El Rastro anonimiza: también a nosotros
+        s = snap(BASE, [aliased], mine=[mine])
+        books, ours = mi.build_books(s, mi.venues_from(s))
+        self.assertEqual([o["id"] for o in ours], [8926])
+        self.assertFalse(books["MAL-01"]["swaps_give"], "nuestra oferta no es un trueque rival")
+        pl = mi.plan(s, mi.IntelConfig(), expiry_ratio=2.0)
+        self.assertFalse([o for o in pl["opportunities"] if o.get("offer") == 8926], "nunca aceptar la propia")
+        self.assertFalse([o for o in pl["opportunities"] if o["type"] in ("bid", "swap_list") and o.get("ref") == "LAT-03"],
+                         "ya perseguimos LAT-03 con ese trueque")
+
 
 if __name__ == "__main__":
     unittest.main()

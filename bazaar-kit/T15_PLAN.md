@@ -24,7 +24,7 @@ python3 flagger.py                            # 5. dry run; --execute solo si lo
 | No perseguir MAL-09/MAL-10 | Valen 77 P y se venden a 65–98 P: margen casi nulo. |
 | No pujar al 80 % del valor en el Rastro | Por debajo del mercado para MAL; para RET-10 supera la caja y revela nuestro valor. |
 | `--pilar-sell SAL,LAV:1.25 --allow-last-copy SAL-07` | Llena la escalera de Pilar (peso 3) vendiendo LAV-06/08/10 y SAL-07 al Chato por encima de su valor privado; LAV y SAL están lejos de completar página. |
-| `--deny-teams t14,t12,t10,t18`, `--no-rival-venues` | No regalar valor ni market-making a los cuatro primeros. |
+| `--deny-teams t05,t14,t12,t10,t18`, `--no-rival-venues` | No regalar valor ni market-making a los líderes (t05 se sumó a la lista: lidera según `intel/REPORT.md`). |
 | No abrir venue `board` (`venue_switch.py`) | Faltan ~185 P, el puesto ya da 0,5 de bench y abrir hace perder el puesto para siempre. |
 | No vender cartas RET | Es nuestro set de mayor afinidad (1,6) y el que más buscan t12, t10 y t05. |
 | Rechazar los cambios de t13/t08/t05 que piden RET-02/03/04 | Romperían la página RET justo cuando RET-10 la cierra. |

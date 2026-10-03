@@ -77,6 +77,10 @@ CREATE INDEX IF NOT EXISTS ix_mkt_ref ON market_snapshots (ref, venue);
 """
 
 
+def _is_team(x) -> bool:
+    return isinstance(x, str) and len(x) > 1 and x[0] == "t" and x[1:].isdigit()
+
+
 def confidence_label(n: int) -> str:
     return "UNKNOWN" if n <= 0 else "LOW" if n < 5 else "MEDIUM" if n < 15 else "HIGH"
 
@@ -202,13 +206,44 @@ class Intelligence:
                     pool.append((p["offer"], "feed"))
                 elif e.get("type") == "thread.message" and isinstance(p.get("offer"), dict) and p.get("kind") == "persona":
                     self._dealer(p, int(e.get("tick") or tick))
+            # ALIAS: una oferta que un tablón muestra con un maker que no es un id de equipo es anónima. Nunca se
+            # vincula a un equipo (aunque el feed exponga otro maker para el mismo id): no se desanonimiza.
+            alias = {o["id"]: o.get("maker") for o, src in pool if src == "board" and isinstance(o, dict)
+                     and o.get("id") is not None and not _is_team(o.get("maker"))}
+            for oid, mk in alias.items():
+                self.db.execute("DELETE FROM inventory_evidence WHERE source_id=?", (f"offer:{oid}",))
+                self.db.execute("DELETE FROM interactions WHERE offer_id=? AND kind LIKE 'offer:%'", (oid,))
+                self.db.execute("UPDATE offers SET maker=? WHERE offer_id=?", (mk, oid))
+            self.meta("alias_offers", int(self.meta("alias_offers") or 0) + len(alias))
+            # venues cuyo tablón anonimiza: allí, lo que solo vemos por el feed tampoco se atribuye a un equipo
+            av = set(json.loads(self.meta("alias_venues") or "[]")) | {o.get("venue") for o, src in pool
+                                                                          if src == "board" and o.get("id") in alias}
+            av.discard(None)
+            self.meta("alias_venues", json.dumps(sorted(av)))
+            # purga general: nada atribuido a un equipo puede venir de una oferta registrada bajo un alias
+            self.db.execute("DELETE FROM inventory_evidence WHERE source_id IN (SELECT 'offer:' || offer_id FROM offers "
+                            "WHERE maker IS NOT NULL AND maker NOT GLOB 't[0-9]*')")
+            self.db.execute("DELETE FROM interactions WHERE kind LIKE 'offer:%' AND offer_id IN (SELECT offer_id FROM "
+                            "offers WHERE maker IS NOT NULL AND maker NOT GLOB 't[0-9]*')")
+            self.alias_venues = av
+            if av:
+                q = ",".join("?" * len(av))
+                ids = [r[0] for r in self.db.execute(f"SELECT offer_id FROM offers WHERE source='feed' AND venue IN ({q})",
+                                                      sorted(av))]
+                for oid in ids:
+                    self.db.execute("DELETE FROM inventory_evidence WHERE source_id=?", (f"offer:{oid}",))
+                    self.db.execute("DELETE FROM interactions WHERE offer_id=? AND kind LIKE 'offer:%'", (oid,))
             seen = set()
             for o, src in pool:
                 if not isinstance(o, dict) or o.get("id") is None or o["id"] in seen:
                     continue
                 seen.add(o["id"])
-                n["offers"] += self._offer(o, tick, src)
-                n["evidence"] += self._evidence_from_offer(o, tick)
+                if o["id"] in alias:
+                    o = {**o, "maker": alias[o["id"]]}
+                anon = src == "feed" and o.get("venue") in av and o.get("to") is None
+                n["offers"] += self._offer(o, tick, src, attribute=not anon)
+                if not anon:
+                    n["evidence"] += self._evidence_from_offer(o, tick)
             for e in events:
                 p = e.get("payload") or {}
                 if e.get("type") == "offer.cancelled" and p.get("offer") is not None:
@@ -227,7 +262,7 @@ class Intelligence:
                         "(team_id) DO UPDATE SET last_seen=MAX(last_seen, excluded.last_seen), venue_owner="
                         "COALESCE(excluded.venue_owner, venue_owner)", (team, tick, tick, venue))
 
-    def _offer(self, o, tick, src) -> int:
+    def _offer(self, o, tick, src, attribute: bool = True) -> int:
         kind, ref, want_ref, price = classify_offer(o)
         maker = o.get("maker")
         self._team(maker, tick)
@@ -239,7 +274,7 @@ class Intelligence:
              json.dumps(o.get("want") or {}), kind, ref, want_ref, price, o.get("created_tick"), o.get("expires_tick"),
              tick, tick, o.get("status") or "open", src))
         self.db.execute("INSERT OR IGNORE INTO offer_snapshots VALUES(?,?,?,?)", (o["id"], tick, o.get("status"), price))
-        if maker and str(maker).startswith("t") and (want_ref or ref):
+        if attribute and _is_team(maker) and (want_ref or ref):
             self.db.execute("INSERT OR IGNORE INTO interactions VALUES(?,?,?,?,?,?,?)",
                             (o.get("created_tick") or tick, maker, f"offer:{kind}", want_ref or ref, price, o["id"],
                              json.dumps({"to": o.get("to"), "venue": o.get("venue")})))
@@ -247,7 +282,7 @@ class Intelligence:
 
     def _evidence_from_offer(self, o, tick) -> int:
         maker = o.get("maker")
-        if not maker or not str(maker).startswith("t"):
+        if not _is_team(maker):
             return 0
         kind, _, _, _ = classify_offer(o)
         n = 0
@@ -577,6 +612,16 @@ class Intelligence:
             if team in json.loads(r["parties_json"] or "[]") and self.team in json.loads(r["parties_json"] or "[]")][:5]
         return CounterpartyContext(team, wants, owns, res, offers, settles, min(gaps) if gaps else None, conc, venues,
                                    self.profile(team))
+
+    def record_event(self, ref: str, team: Optional[str], event: str, price: Optional[int], tick: int,
+                     venue: Optional[str] = None, detail: Optional[dict] = None) -> None:
+        """Evidencia de campañas (rutas propuestas, contactos, resultados) para mejorar futuras clasificaciones."""
+        import zlib
+        key = zlib.crc32(f"{tick}|{ref}|{team}|{event}".encode()) & 0x7FFFFFFF
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO interactions VALUES(?,?,?,?,?,?,?)",
+                            (tick, team, f"campaign:{event}", ref, price, key,
+                             json.dumps({"venue": venue, **(detail or {})})))
 
     def stats(self) -> dict:
         tables = [r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]

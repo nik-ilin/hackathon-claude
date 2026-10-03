@@ -164,3 +164,7 @@ Con `--execute [--announce]` abre `board` a 0 bps y 0 P por carta, toma la broke
 **Riesgo:** si el proceso cae, el venue no cruza nada. Además, la broker key solo se devuelve una vez. **Vuelta atrás:** cerrar el venue devuelve la fianza tras un cooldown, pero RULES.md no promete que vuelva el puesto, y sin venue la sesión cuenta 0. La vuelta atrás real es `--broker-mode stall`, que cruza como el puesto. Detalle en el docstring de `venue_switch.py`.
 
 Pruebas: `python3 -m unittest test_venue_switch test_market_broker`.
+
+## Campaña de página (Malasaña)
+
+`--page-campaign MAL` (por defecto) prioriza las cartas que faltan de Malasaña: compra ya los asks rentables (la última carta sin regatear), propone trueques dirigidos con duplicados que el dueño quiere, puja dirigida por debajo del techo, cancela búsquedas ya cumplidas o redundantes y no dispersa efectivo en pujas públicas ajenas. Nunca paga por encima del valor privado, nunca usa copias protegidas y nunca desanonimiza alias. El informe `=== MAL COMPLETION CAMPAIGN ===` sale en cada tick.

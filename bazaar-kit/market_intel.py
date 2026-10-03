@@ -151,8 +151,11 @@ def build_books(snap: dict, venues: dict) -> tuple[dict, list]:
     team, tick = snap["me"]["id"], snap["clock"]["tick"]
     books = defaultdict(lambda: {"asks": [], "bids": [], "swaps_give": [], "swaps_want": []})
     seen, ours = set(), []
-    pools = [(vid, (snap.get("boards") or {}).get(vid, {}).get("offers", [])) for vid in venues]
-    pools.append((None, (snap.get("offers") or {}).get("offers", [])))
+    # /api/me/offers PRIMERO: es la fuente autoritativa de lo nuestro. Los tablones que anonimizan (El Rastro) muestran
+    # NUESTRAS ofertas bajo un alias; leídas primero, se tomaban por ajenas y `ours` quedaba incompleto (publicaciones
+    # y búsquedas duplicadas, e incluso aceptar una oferta propia).
+    pools = [(None, (snap.get("offers") or {}).get("offers", []))]
+    pools += [(vid, (snap.get("boards") or {}).get(vid, {}).get("offers", [])) for vid in venues]
     for vid, offers in pools:
         for o in offers:
             if o.get("id") in seen or o.get("status") != "open":

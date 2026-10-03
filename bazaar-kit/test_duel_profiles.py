@@ -85,7 +85,8 @@ class Profiles(Params):
         self.assertEqual(kinds(dl.duel_candidates([d], 2)), [])
         self.assertEqual(kinds(dl.duel_candidates([d], 15)), ["duel_accept"])   # cierre seguro
         self.flags(PROFILES=False)
-        self.assertEqual(kinds(dl.duel_candidates([d], 2)), ["duel_accept"])
+        # Con perfiles desactivados aplica la política adaptativa local: sondea al rival estancado.
+        self.assertEqual(kinds(dl.duel_candidates([d], 2)), ["duel_say"])
 
     def test_jump_then_accept(self):
         self.assertEqual(kinds(dl.duel_candidates([duel("Rival Oro", prices=[95, 95, 95])], 2)), [])

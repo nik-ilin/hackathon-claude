@@ -38,7 +38,7 @@ LOG = DATA / "duels_log.jsonl"
 PARAMS_FILE = DATA / "duel_params.json"
 LADDER = (0.20, 0.12, 0.06)
 PENDING_TICKS = 1      # un duelo aceptado se excluye hasta tick + PENDING_TICKS (liquida en el tick siguiente)
-GRID = {"GOOD_SHARE": [0.4, 0.5, 0.6, 0.7, 0.8], "STALL_TICKS": [2, 3, 4], "SAFE_TICKS": [1, 2]}
+GRID = {"MID_ACCEPT_RATIO": [0.1, 0.15, 0.2], "STALL_TICKS": [2, 3, 4], "SAFE_TICKS": [1, 2]}
 
 
 def log(rec: dict) -> None:
@@ -132,8 +132,10 @@ def main() -> None:
     # retries: un GET fallido (rate_limited, red) ya no hace perder el tick; las escrituras con fallo de red nunca se
     # repiten (bazaar_sdk las propaga al instante) y rate_limited es un rechazo seguro de reintentar.
     b = PacedBazaar(os.environ.get("BAZAAR_URL", "https://bazaar.causaprima.ai"), key, wait_on_tick=False, retries=2)
-    log({"start": True, "execute": a.execute, "params": dl.PARAMS,
-         "reconcile": a.reconcile, "verify_accept": a.verify_accept})
+    log({"start": True, "execute": a.execute, "params": dl.PARAMS, "deprecated": dl.DEPRECATED,
+         "reconcile": a.reconcile, "verify_accept": a.verify_accept,
+         "note": "safe_ticks efectivo = SAFE_TICKS + max(duelos con el mismo deadline, cola de aceptables) − 1; "
+                 "ver facts por decisión"})
     lock = InstanceLock(str(DATA / "agent.lock"), {"version": "duels-1.1"})
     if a.execute:
         holder = lock.acquire()

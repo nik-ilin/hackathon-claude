@@ -344,6 +344,19 @@ class Operational(unittest.TestCase):
         c3 = co.directed_buys(s, {"actions": []}, a, val, tr.counts_of(s["me"]["assets"]), rich)[0]
         self.assertEqual(c3["type"], "bid", "por encima del precio ordenado no se acepta: se mantiene la puja")
 
+    def test_21_dealer_accept_settles_by_inventory_when_deal_thread_lacks_settled_offer(self):
+        thread = {"id": 900, "kind": "persona", "with": "abuela", "status": "deal", "created_tick": 690,
+                  "topic": {"buy": {"card": "MAL-02"}}, "standing_offers": [], "messages": []}
+        s = snap10(latina())
+        s["threads"] = {"open": [], "deal": [thread]}
+        led = {"actions": [{"type": "dealer_accept", "status": "submitted", "thread": 900, "tick": 693, "dealer": "abuela",
+                            "item": "card:MAL-01", "price": 10, "cost": 10, "offer": 1}],
+               "spent_confirmed": 0, "cash_received": 0, "threads": [900]}
+        with tempfile.TemporaryDirectory() as d:
+            s["clock"]["tick"] = 699
+            co.reconcile(led, s, neg.Journal(d))
+        self.assertEqual((led["actions"][0]["status"], led["spent_confirmed"]), ("settled", 10))
+
 
 if __name__ == "__main__":
     unittest.main()

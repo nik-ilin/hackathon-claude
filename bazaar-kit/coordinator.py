@@ -35,6 +35,7 @@ import negotiation as neg
 import news_watch as nw
 import intelligence as intel_mod
 import ladder_calibrated as lcal
+import page_campaign as pc
 import ladder_plus as lplus
 import page_guard as pg
 import performance as perf
@@ -193,6 +194,16 @@ def reconcile(led, s, journal):
                                                "status": "deal", "close_price": paid, "settled": True,
                                                "context": "normal", "opening": a.get("opening"),
                                                "note": f"coordinador {VERSION}"})
+                elif a["type"] == "dealer_accept" and tick > a["tick"] + 3:
+                    # hilo en "deal" sin oferta marcada settled: la carta en el inventario es la evidencia
+                    ref = (a.get("item") or "")[5:] if str(a.get("item") or "").startswith("card:") else None
+                    held = ref and any(x.get("ref") == ref for x in s["me"]["assets"])
+                    if held:
+                        a.update(status="settled", paid=a.get("price"), settled_tick=tick,
+                                 note="liquidada por inventario (hilo deal sin oferta settled)")
+                        led["spent_confirmed"] += int(a.get("price") or 0)
+                    else:
+                        a["status"] = "released"
                 else:
                     a["status"] = "released" if a["type"] == "dealer_counter" else a["status"]
             elif t is None or t.get("status") != "open":
@@ -436,10 +447,16 @@ def candidates(s, led, args, journal):
         did = t["with"]
         n_q = len(ladder.get(did, []))
         mode = neg.ladder_mode(n_q)
-        pol = neg.policy_for(did, args.mode, n_q)
+        camp = getattr(args, "page_campaign", "none")
+        if item and item.startswith("card:") and camp in val.pages and item[5:] in val.pages[camp] \
+                and not counts.get(item[5:]):
+            mode = "SECURE"  # carta de la campaña de página: no se arriesga por ahorrar 1-3 P
+        pol = neg.policy_for(did, args.mode, 0 if mode == "SECURE" else n_q)
         avail = view.free_dealer_cash + exposure  # lo que el vendedor puede cobrar YA (incluida nuestra oferta vigente)
         ceiling = max(0, math.floor(min(a["econ"], avail + rel)))  # capital liberable cancelando pujas débiles
         st = neg.state_from_thread(t, did, tick, neg.Config())
+        if st.opening is not None and item:  # memoria: su precio de apertura por carta (para no reabrir en balde)
+            led.setdefault("dealer_openings", {})[f"{did}|{item}"] = {"opening": st.opening, "tick": tick}
         if ladder_on:  # --dealer-ladder: política observada (sustituye a decide_dealer, también en SECURE)
             pol = neg.ladder_profile(did, lc, args.mode)
             notes_mode = "escalera observada"
@@ -499,6 +516,7 @@ def candidates(s, led, args, journal):
         n_q = len(ladder.get(did, []))
         mode = neg.ladder_mode(n_q)
         bonus = (5000 if n_q == neg.LADDER_SLOTS - 1 else 2000) if mode == "SECURE" else 0  # prioridad, no valor
+        camp_set = getattr(args, "page_campaign", "none")
         for row in sells:
             if "rarity" not in row:
                 continue
@@ -529,12 +547,17 @@ def candidates(s, led, args, journal):
                     blockers.append("sin conversaciones libres")
                 if lp is None or ceiling < lp * viable:
                     blockers.append(f"máximo {ceiling} P frente a precio publicado {lp} P")
+                seen_open = (led.get("dealer_openings") or {}).get(f"{did}|card:{ref}")
+                if seen_open and ceiling < seen_open["opening"] * neg.dealer_policy(did, args.mode).min_viable_frac:
+                    blockers.append(f"{did} abrió a {seen_open['opening']} P por {ref} (tick {seen_open['tick']}); nuestro "
+                                    f"máximo {ceiling} P no llega: se reabre cuando valga más (p. ej. última carta)")
                 out.append({"type": "dealer_open", "module": "vendedores", "kind": f"abrir con {did} [{mode}]",
                             "dealer": did, "ref": f"card:{ref}", "price": lp, "ceiling": ceiling,
                             "du": round(value - (lp or 0), 2),
                             "score": 10 ** 3 + bonus + value - (lp or 0) +
                             (lplus.fill_priority(did, c["rarity"]) if fill and n_q < neg.LADDER_SLOTS else 0) +
-                            (3 * 10 ** 4 if (did, "buy", ref) in planned else 0),
+                            (3 * 10 ** 4 if (did, "buy", ref) in planned else 0) +
+                            (5 * 10 ** 4 if camp_set not in (None, "none") and c.get("set") == camp_set else 0),
                             "blockers": blockers, "ladder_mode": mode,
                             "notes": [f"valor {value:.1f} P (con bono si completa página)",
                                       "precio real desconocido hasta su primera oferta",
@@ -587,6 +610,8 @@ def candidates(s, led, args, journal):
         out += news_sell_candidates(s, led, args, busy, open_count)
     if getattr(args, "dedupe_bids", False):
         out += dealer_bid_cancels(s, out, open_dealer, mine_threads)
+    # 10. Campaña de completar página (objetivo actual: Malasaña).
+    pl["page_campaign"] = page_campaign_step(s, led, args, val, counts, pl, view, scored, ccfg, used, out)
     # 10. --pilar-sell / --ladder-fill (opt-in): abrir una venta a Pilar; la copia en venta no sale por otra vía.
     pilar, pilar_report, selling_assets = pilar_candidates(s, led, args, val, counts, ladder, cal_plan)
     for c in out if selling_assets else ():
@@ -639,11 +664,33 @@ def sell_open_candidates(s, led, args, lc, val, counts, busy, open_count):
     selling = {a for t in s["threads"]["open"] if t.get("kind") == "persona"
                for a in neg.sell_assets_of(t.get("topic"))}
     out = []
-    for rarity, did in lc.sell_route.items():
+    sell_route = dict(lc.sell_route)
+    pilar_rule = getattr(args, "pilar_sell", None)
+    pilar_set, pilar_factor = None, None
+    pilar_window = (getattr(args, "pilar_from_tick", None), getattr(args, "pilar_until_tick", None))
+    if pilar_rule:
+        try:
+            pilar_set, pilar_factor = pilar_rule.split(":", 1)
+            pilar_factor = float(pilar_factor)
+            if not pilar_set or pilar_factor <= 0:
+                raise ValueError
+        except ValueError:
+            raise ValueError("--pilar-sell debe tener formato SET:FACTOR positivo, por ejemplo SAL:1.25")
+        if dealer_available(s, "pilar"):
+            for rarity in ("uncommon", "rare", "epic"):
+                sell_route[rarity] = "pilar"
+    if pilar_rule and ((pilar_window[0] is not None and s["clock"]["tick"] < pilar_window[0]) or
+                       (pilar_window[1] is not None and s["clock"]["tick"] > pilar_window[1])):
+        sell_route = {r: d for r, d in sell_route.items() if d != "pilar"}
+    for rarity, did in sell_route.items():
         expected = lc.sell_expected.get(did, {}).get(rarity)
+        allow_last = {x.strip() for x in (getattr(args, "allow_last_copy", "") or "").split(",") if x.strip()}
         for ref, n in sorted(counts.items()):
             c = val.cards.get(ref)
-            if not c or c["rarity"] != rarity or n < 2 or val.unit(ref) is None:
+            # duplicados, o la ÚLTIMA copia solo si está en --allow-last-copy (page_guard sigue protegiendo páginas)
+            if not c or c["rarity"] != rarity or (n < 2 and ref not in allow_last) or val.unit(ref) is None:
+                continue
+            if did == "pilar" and (not pilar_set or c.get("set") != pilar_set):
                 continue
             if pg.tradeable_surplus(ref, counts, s["catalog"], committed_refs) < 1:
                 continue  # page_guard: solo copias por encima del mínimo protegido
@@ -652,6 +699,10 @@ def sell_open_candidates(s, led, args, lc, val, counts, busy, open_count):
             if not ids:
                 continue
             loss, floor = sell_floor(val, counts, ref, lc)
+            if did == "pilar" and pilar_factor is not None:
+                expected = math.ceil(17.5 * pilar_factor)
+                if expected < floor:
+                    continue
             blockers = []
             if not dealer_available(s, did):
                 blockers.append(f"{did} no disponible")
@@ -1209,6 +1260,127 @@ def seller_offer(s, ref, seller, max_price):
     return best
 
 
+def page_campaign_step(s, led, args, val, counts, pl, view, scored, ccfg, used, out):
+    """Rutas activas hacia las cartas que faltan de la página objetivo; cancela búsquedas ya cumplidas; enfoca el
+    capital (sin pujas públicas para cartas ajenas a la campaña mientras esté activa) y rebalancea si un cierre de
+    campaña necesita efectivo. Nunca autoriza ΔU < margen: la prioridad solo ordena."""
+    set_id = getattr(args, "page_campaign", "none")
+    team, tick = s["me"]["id"], s["clock"]["tick"]
+    cancels = pc.acquired_target_cancels(s["offers"].get("offers", []), team, counts)
+    out += [dict(c, module="campaña página") for c in cancels]
+    choice = None
+    if set_id == "auto":  # página principal por viabilidad económica (inventario y ofertas ACTUALES)
+        budget = max(view.free_tactical_cash, view.free_dealer_cash)  # el táctico está dentro del de vendedores
+        choice = pc.choose_page(s, val, mi.venues_from(s), s.get("dealers") or {}, max(budget, 0), args.margin)
+        set_id = choice["choice"] or next((p["set"] for p in choice["pages"] if not p["blocked"]), None)
+    if not set_id or set_id == "none" or set_id not in val.pages:
+        return {"selection": choice} if choice else None
+    cfg = pc.CampaignConfig(set_id=set_id, margin=args.margin, per_card=args.per_card,
+                            directed_expiry=getattr(args, "directed_expiry", 20),
+                            anchor_near=getattr(args, "profile", None) == "fast-close")
+    state = pc.campaign_state(s, val, set_id)
+    rep = {"state": state, "plans": [], "next_action": "—", "selection": choice}
+    if state["complete"]:
+        rep["next_action"] = (f"{set_id} COMPLETA: campaña terminada; page_guard protege una copia de cada carta de "
+                              "la página; solo los duplicados son negociables")
+        return rep
+    venues = mi.venues_from(s)
+    committed = committed_ids(s, led)
+    assets = pc.our_trade_assets(s, val, committed)
+    intel = INTEL_STATE.get("intel")
+    pursuing = {}
+    for o in s["offers"].get("offers", []):
+        if o.get("maker") == team and o.get("status") == "open" and not o.get("thread"):
+            w = o.get("want") or {}
+            for t in list(w.get("types") or []) + [f"card:{c}" for c in w.get("cards") or []]:
+                if isinstance(t, str) and t.startswith("card:"):
+                    pursuing.setdefault(t[5:], []).append(o)
+    order = sorted(state["missing"], key=lambda r: -state["gains"][r]["gain"])
+    plan_offers = set()
+    for ref in order:
+        g = state["gains"][ref]
+        st = (pl.get("states") or {}).get(ref)
+        market = {"value": st.market.value, "best_ask": st.best_ask.price if st.best_ask else None} if st else {}
+        plan = pc.plan_target(ref, g["gain"], g["completes_page"], state["level"], s, val, cfg, venues, intel,
+                              assets, market)
+        rep["plans"].append(plan)
+        best = plan.get("best")
+        c = dict(best["candidate"]) if best and best.get("candidate") else None
+        if c is None:
+            continue
+        c["module"] = "campaña página"
+        if c.get("venue") is None:
+            c["venue"] = args.duende_venue
+        existing = pursuing.get(ref, [])
+        if c["type"] == "accept":
+            plan_offers.add(c["offer"])
+            need = -int(c["cash"]) - view.free_tactical_cash
+            if need > 0:
+                rb, _, why = ca.rebalance(scored, need, c["du"], ccfg, f"campaña {ref}", used)
+                out += [dict(x, module="capital") for x in rb]
+                used |= {x["offer"] for x in rb}
+                c["blockers"] = [f"capital: faltan {need} P · {why}" + ("; se ejecuta cuando el servidor confirme"
+                                                                       if rb else "")]
+            for o in existing:  # cierre inmediato: las búsquedas pasivas de esa carta sobran
+                out.append({"type": "cancel", "module": "campaña página", "kind": "retirar búsqueda redundante",
+                            "offer": o["id"], "venue": o.get("venue"), "ref": ref, "price": 0, "du": 0.0,
+                            "score": 2.2 * 10 ** 5, "blockers": [], "notes": [], "uncertainty": "",
+                            "reason": f"{ref}: hay una ruta inmediata superior ({best['via']})"})
+        elif existing:
+            c["blockers"] = [f"ya perseguimos {ref} con la oferta {[o['id'] for o in existing]} (una vía por carta)"]
+        elif c["type"] == "bid" and -int(c["cash"]) > view.free_tactical_cash:
+            c["blockers"] = [f"{-int(c['cash'])} P > efectivo táctico libre {view.free_tactical_cash} P"]
+        out.append(c)
+        if intel is not None and not c["blockers"]:
+            try:
+                intel.record_event(ref, c.get("maker") or c.get("to"), f"route:{best['route']}", c.get("price"),
+                                   tick, c.get("venue"), {"du": c.get("du")})
+            except Exception:
+                pass
+    targets = set(state["missing"])
+    for x in out:  # foco: nada de dispersar efectivo en pujas públicas ajenas a la campaña; sin rutas duplicadas
+        if x.get("page_campaign") or x.get("module") != "mercado":
+            continue
+        if x["type"] == "accept" and x.get("offer") in plan_offers:
+            x["blockers"] = list(x.get("blockers") or []) + ["sustituida por la ruta de la campaña de página"]
+        elif x["type"] == "bid" and not x.get("to"):
+            why = (f"la campaña {set_id} gestiona {x.get('ref')}" if x.get("ref") in targets else
+                   f"campaña {set_id} activa: el efectivo se enfoca en {sorted(targets)}")
+            x["blockers"] = list(x.get("blockers") or []) + [why]
+        elif x["type"] == "accept" and -(x.get("cash") or 0) > 0 and not set(x.get("receive") or {}) & targets:
+            cost = -(x.get("cash") or 0)
+            if (x.get("du") or 0) < max(10.0, 0.5 * cost):  # una compra ajena solo si es muy buena
+                x["blockers"] = list(x.get("blockers") or []) + [
+                    f"campaña {set_id} activa: compra ajena con ΔU {x.get('du')} P < max(10, 50 % de {cost} P)"]
+    ranked = sorted((p for p in rep["plans"] if p.get("best")),
+                    key=lambda p: (not p["completes_page"], -p["best"]["eu"]))
+    if ranked:
+        b = ranked[0]["best"]
+        rep["next_action"] = f"{b['route'].upper()} · {b['via']} ({ranked[0]['ref']}, ΔU {b['du']} P)"
+    else:
+        dealers = sorted((x for x in out if x["type"] == "dealer_open" and x.get("ref", "")[5:] in targets),
+                         key=lambda x: (bool(x["blockers"]), -x.get("du", 0)))
+        if dealers:
+            d = dealers[0]
+            rep["next_action"] = (f"ABRIR con {d['dealer']} por {d['ref'][5:]} (lista {d['price']} P, máximo "
+                                  f"{d['ceiling']} P)" + (f" · BLOQUEO: {'; '.join(d['blockers'])}" if d["blockers"] else ""))
+        else:
+            rep["next_action"] = ("sin ruta rentable: ningún ask por debajo del techo ni dueño identificable con "
+                                  "evidencia; seguir observando tablones, feed y vendedores")
+    rep["sequencing"] = sequencing_note(val, counts, state)
+    return rep
+
+
+def sequencing_note(val, counts, state):
+    """La última carta se lleva el bono de página: conviene que sea la MÁS disponible/barata."""
+    miss = state["missing"]
+    if len(miss) < 2:
+        return None
+    total, _ = val.delta(counts, Counter({r: 1 for r in miss}), Counter())
+    last = {r: round(val.next_copy(counts + Counter({x: 1 for x in miss if x != r}), r), 2) for r in miss}
+    return {"total_gain_all": round(total, 2), "gain_if_last": last}
+
+
 def dedupe_cancels(cands):
     """Una sola cancelación por oferta: la de mayor prioridad."""
     best = {}
@@ -1273,9 +1445,36 @@ def dealer_lines(diag):
 
 def campaign_cfg(args):
     kinds = ("collect", "sell", "swap") if args.campaign in ("all", "none") else (args.campaign,)
+    extra = {}
+    if getattr(args, "profile", None) == "fast-close":  # aperturas cercanas a un comparable y segunda propuesta fuerte
+        extra = dict(buy_open_frac=0.92, sell_markup=1.08, concession=0.6)
     return cp.CampaignConfig(kinds=kinds, ticks=args.campaign_ticks, budget=args.campaign_budget,
                              max_proposals=args.max_proposals, negotiation_ticks=args.negotiation_ticks,
-                             max_conversations=args.max_conversations, margin=args.margin)
+                             max_conversations=args.max_conversations, margin=args.margin, **extra)
+
+
+PROFILES = {
+    # Cierre rápido + colección. Margen económico 1 P (la verificación de la valoración contra collection_value
+    # sigue bloqueando TODO si no cuadra: el margen no sustituye al colchón de incertidumbre); 2 propuestas y 4
+    # ticks por conversación; colchones ajustados al trabajo activo y capital pasivo limitado.
+    "fast-close": {"margin": 1.0, "max_proposals": 2, "negotiation_ticks": 4, "tactical_buffer": 15,
+                   "max_passive_frac": 0.3, "page_campaign": "auto"},
+}
+
+
+def apply_profile(args, argv=None):
+    """Aplica un perfil SOLO a los parámetros que el usuario no fijó explicitamente en la línea de órdenes."""
+    prof = PROFILES.get(getattr(args, "profile", None) or "")
+    if not prof:
+        return {}
+    argv = list(sys.argv[1:] if argv is None else argv)
+    given = {a.split("=", 1)[0].lstrip("-").replace("-", "_") for a in argv if a.startswith("--")}
+    applied = {}
+    for k, v in prof.items():
+        if k not in given:
+            setattr(args, k, v)
+            applied[k] = v
+    return applied
 
 
 def counterparty(t, team):
@@ -1776,6 +1975,18 @@ def cycle(reader, args, led, journal, execute, cache=None):
                   f"{b['confidence']}) · eficiencia {b['efficiency']} · {b.get('market_position')} (rival "
                   f"{b.get('best_competing_bid')}, ask {b.get('best_ask')}) · página {b.get('page_completion')} · "
                   f"prioridad {b.get('strategic_priority')}")
+    camp = pl.get("page_campaign")
+    if camp and camp.get("selection"):
+        for pg_ in camp["selection"]["pages"][:4]:
+            print(f"   PÁGINA {pg_['set']}: faltan {pg_['missing']} · ganancia {pg_['gain_all']} P · coste estimado "
+                  f"{pg_['est_cost']} P · {'VIABLE' if pg_['feasible'] else 'no viable'}"
+                  + (f" · sin oferta: {pg_['blocked']}" if pg_["blocked"] else ""))
+    if camp and camp.get("state"):
+        print("   " + pc.report_block(camp["state"], camp["plans"], camp["next_action"]).replace("\n", "\n   "))
+        if camp.get("sequencing"):
+            print(f"   Secuencia: ganancia de completar todo {camp['sequencing']['total_gain_all']} P · valor de cada "
+                  f"carta si es la ÚLTIMA {camp['sequencing']['gain_if_last']} (conviene dejar para el final la más "
+                  "disponible)")
     for rep_ in pl.get("tactical_sales") or []:
         print("   " + ts.report_block(rep_).replace("\n", "\n   "))
     for line in dealer_lines(pl.get("dealer_diag") or {}):
@@ -1950,6 +2161,10 @@ def main():
     p.add_argument("--override-value", action="store_true",
                    help="permite que --directed-buy tenga ΔU < margen (solo esa regla; reserva y presupuesto siguen)")
     p.add_argument("--directed-expiry", type=int, default=20, help="ticks de vida pedidos para la compra dirigida")
+    p.add_argument("--profile", choices=sorted(PROFILES), default=None,
+                   help="perfil de estrategia: fast-close = cierre rápido + colección (margen 1 P, 2 propuestas, 4 ticks)")
+    p.add_argument("--page-campaign", default="MAL",
+                   help="colección cuya página se completa con prioridad (por defecto MAL; 'none' la desactiva)")
     p.add_argument("--intel-team", help="informe de inteligencia de un equipo (solo lectura)")
     p.add_argument("--intel-card", help="quién tiene / quién quiere una carta (solo lectura)")
     p.add_argument("--intel-counterparties", help="mejores contrapartes para conseguir una carta (solo lectura)")
@@ -2030,6 +2245,8 @@ def main():
     g.add_argument("--news-db", default=None, metavar="market.db",
                    help="con --news-sell: calibrar la fiabilidad por fuente con este market.db (solo lectura)")
     args = p.parse_args()
+    if args.ladder_fill:
+        args.dealer_ladder = True
     if not 1 <= args.ticks <= 120:
         p.error("--ticks entre 1 y 120")
     try:
@@ -2059,6 +2276,9 @@ def main():
             raise SystemExit(f"Bloqueo ocupado por pid {holder.get('pid')} ({holder.get('version')})")
     if args.sale_target is None:
         args.sale_target = ["LAT-10=86"]
+    applied = apply_profile(args)
+    if applied:
+        print(f"PERFIL {args.profile}: {applied} (lo fijado explícitamente en la línea de órdenes manda)")
     try:
         me = api.me()
         led = load_ledger(me["id"])

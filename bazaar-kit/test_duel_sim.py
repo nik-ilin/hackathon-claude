@@ -51,7 +51,8 @@ class Simulator(Params):
         self.assertGreater(res["on"]["TOTAL"]["capture"], 0.3)
 
     def test_silence_beats_early_acceptance_on_ceding_rivals(self):
-        res = sim.simulate(n=40, seed=4, mix=["cedente"], variants={"d": {}, "e": {"GOOD_SHARE": 0.3}})
+        res = sim.simulate(n=40, seed=4, mix=["cedente"],
+                           variants={"d": {}, "e": {"EARLY_ACCEPT_RATIO": 0.0, "MID_ACCEPT_RATIO": 0.0}})
         self.assertGreater(res["d"]["cedente"]["capture"], res["e"]["cedente"]["capture"])
 
 
@@ -134,15 +135,17 @@ class Ordering(Params):
         talking = dict(d, rival_offer={"price": 140}, messages=[{"tick": 18, "from": "R", "price": 140}])
         self.assertEqual(dl.duel_candidates([talking], 19), [])
 
-    def test_probe_is_opt_in(self):
+    def test_probe_is_now_default_counter_for_stalled_rival(self):
+        # Hotfix de duelos: la contraoferta a un rival estancado es política por defecto (PROBE ya no cambia nada);
+        # tras nuestra contraoferta, en la fase media se cierra el trato razonable en lugar de esperar indefinidamente.
         d = live(1, 30, 90)
         d["messages"] = [{"tick": t, "from": "R", "price": 90} for t in range(10, 14)]
-        self.assertEqual(dl.duel_candidates([d], 14)[0]["type"], "duel_accept")
-        dl.PARAMS["PROBE"] = True
         c = dl.duel_candidates([d], 14)[0]
-        self.assertEqual((c["type"], c["price"]), ("duel_say", 80))
-        d["your_offer"] = {"price": 80}
-        self.assertEqual(dl.duel_candidates([d], 15)[0]["type"], "duel_accept")
+        self.assertEqual(c["type"], "duel_say")
+        dl.PARAMS["PROBE"] = True
+        self.assertEqual(dl.duel_candidates([d], 14)[0]["price"], c["price"], "PROBE sin efecto")
+        d["your_offer"] = {"price": c["price"]}
+        self.assertEqual(dl.duel_candidates([d], 23)[0]["type"], "duel_accept")
 
 
 def api_for(duels_seq, ticks=(9,)):
