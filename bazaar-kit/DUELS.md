@@ -97,3 +97,19 @@ Robustez: con los alias barajados (la casa reasigna perfiles) `--ladder --profil
 a 42–43 %, 3 semillas); con los rivales genéricos de #7, 41 % → 45 % (solo cambian los mudos). El logroll es neutro: con
 días lineales («urgencia de la fecha de entrega») y el rival proponiendo su día, apenas hay tarta extra que compense una
 ronda de decay.
+
+## Precio + días: convención de signos (corregida)
+
+`your_days_weight` es un **peso positivo por día**; el signo lo da el rol (`days_meaning`): comprador «each delivery day *costs*
+you this much cash» → −peso·días; vendedor «each delivery day *adds* this much cash to your side» → +peso·días.
+`excedente total = margen de precio ∓ peso·días` y `result = total · (1 − decay)^rondas` (verificado con los 37 duelos
+liquidados, `duels_fixture_days.json`). Dos restricciones independientes: precio dentro del límite **y** total > 0.
+Antes `margin()` sumaba los días al comprador y se aceptaron tratos con total negativo (5842: +122,8 calculado, −32,8 real).
+
+## Aprendizaje en línea (`duel_runner.py --learn`, `duel_learning.py`, `duel_lab.py`)
+
+Resultado = lo que dice el servidor (`done=true`: status, result, price, days, rounds, mensajes); lo inferido (quién cerró) va marcado como
+hipótesis. El modelo (por rol · rival · fase, con decaimiento, agrupación y un duelo = una observación) solo puede **refinar** la política
+base: esperar en vez de aceptar si la mejora esperada tiene cota inferior > 0, o cerrar ya si el rival no mejora; con evidencia
+insuficiente devuelve la base y lo dice en la razón. Nunca toca límites, la regla total > 0, una aceptación por tick ni el mercado.
+Laboratorio: `python3 duel_lab.py audit|summary|replay|sim|all|fetch` (separación temporal, semillas disjuntas, sin enviar nada).

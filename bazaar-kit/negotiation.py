@@ -462,6 +462,13 @@ DEALER_TRAITS = {
 # `picaros` no tiene observaciones todavía: 3 es interpolación, no medición.
 
 
+ROUND_CAP = None   # --max-rounds: tope de contraofertas NUESTRAS por conversación con un vendedor (última hora: 2)
+
+
+def capped(n: int) -> int:
+    return n if ROUND_CAP is None else max(1, min(n, int(ROUND_CAP)))
+
+
 def dealer_policy(dealer: str, mode: str = "score") -> DealerPolicy:
     """Una política por vendedor, derivada de sus rasgos publicados.
 
@@ -478,7 +485,7 @@ def dealer_policy(dealer: str, mode: str = "score") -> DealerPolicy:
     if t is None:  # vendedor nuevo: prudente, pero nunca a precio de apertura
         t = dict(open_frac=0.55, gap_frac=0.40, max_counteroffers=2, max_ticks=5,
                  sell_open_mult=1.9, sell_gap_frac=0.35, sell_step=2)
-    return DealerPolicy(dealer, t["open_frac"], t["gap_frac"], t["max_counteroffers"], t["max_ticks"],
+    return DealerPolicy(dealer, t["open_frac"], t["gap_frac"], capped(t["max_counteroffers"]), t["max_ticks"],
                         accept_on_concession=mode != "score", allow_opening_price=allow,
                         sell_open_mult=t["sell_open_mult"], sell_gap_frac=t["sell_gap_frac"],
                         sell_step=t["sell_step"])

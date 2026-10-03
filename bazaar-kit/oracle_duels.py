@@ -386,9 +386,21 @@ class DuelView:
             rounds_used=int(pick("rounds_used", "round", "messages", default=0)),
             ticks_left=pick("ticks_left", "ticks_remaining"),
             issues=tuple(issues),
-            days_weight=_scalar_weight(pick("your_days_weight", "days_weight", default=0.0)),
+            days_weight=_signed_weight(_scalar_weight(pick("your_days_weight", "days_weight", default=0.0)),
+                                       raw, pick("role", "side", default="seller")),
             item=str(pick("item", "scenario", default="") or ""),
         )
+
+
+def _signed_weight(w: float, raw: dict, role) -> float:
+    """El servidor da un peso POSITIVO por día y `days_meaning` fija el signo (comprador: «costs you» → −; vendedor: «adds» → +).
+    Este módulo usa la convención `w > 0 = nos conviene entrega tarde`: solo se firma el formato del servidor (peso ≥ 0 con
+    frase o con rol); un peso ya negativo se respeta tal cual. (La política que ejecuta duel_runner es duels.py.)"""
+    if w < 0:
+        return w
+    text = str((raw or {}).get("days_meaning") or "").lower()
+    cost = "cost" in text or (not text and str(role) == "buyer")
+    return -w if cost else w
 
 
 def _scalar_weight(w) -> float:

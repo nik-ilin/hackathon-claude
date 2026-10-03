@@ -3,6 +3,9 @@
     python3 duel_runner.py                 # análisis (por defecto): lee duelos y muestra lo que haría, no envía nada
     python3 duel_runner.py --execute       # juega los duelos vivos con la política de duels.py
     python3 duel_runner.py --execute --days --ladder --profiles --reconcile --verify-accept   # recomendado Duelos II
+    # Registro (data/duels_log.jsonl): `accept_requested`/`offer_sent` con sent:true NO son tratos puntuados; el estado final
+    # (deal/no_deal, precio, días, rol, deadline, predicción y error) lo escribe `reconciled` en el tick siguiente, y
+    # `score_snapshot` guarda duel_points/negotiating de /api/me antes y después (variación observada, no atribuida).
 
 Opt-in (por defecto desactivados, medidos con duel_sim.py):
     --days           jugar duelos de precio + días (sin él se omiten y puntúan 0)
@@ -26,8 +29,10 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import Optional
 
 import duels as dl
+import duel_learning
 import duel_tree
 from bazaar_sdk import Bazaar, BazaarError
 from negotiation import InstanceLock
@@ -118,6 +123,9 @@ def main() -> None:
     ap.add_argument("--verify-accept", action="store_true", help="opt-in: releer el duelo antes de aceptar")
     ap.add_argument("--profiles", action="store_true", help="opt-in: reglas por perfil del bot de la casa")
     ap.add_argument("--logroll", action="store_true", help="opt-in (con --days): días baratos a cambio de precio")
+    ap.add_argument("--learn", action="store_true",
+                    help="opt-in: aprendizaje en línea con los duelos TERMINADOS (resultado del servidor): refina accept/wait y el ancla "
+                         "de apertura solo con evidencia suficiente; sin ella, política base. Registra la razón de cada decisión")
     a = ap.parse_args()
     dl.PARAMS["PLAY_DAYS"] = a.days
     if a.ladder:
@@ -126,6 +134,7 @@ def main() -> None:
         dl.PARAMS["PROBE"] = True
     dl.PARAMS["PROFILES"] = a.profiles
     dl.PARAMS["LOGROLL"] = a.logroll
+    learner = duel_learning.Learner(LOG) if a.learn else None
     key = os.environ.get("BAZAAR_KEY", "")
     if not key or key == "tk-xxxx-xxxx":
         raise SystemExit("Falta BAZAAR_KEY (carga .env o exporta la variable)")
@@ -142,7 +151,7 @@ def main() -> None:
         if holder:
             raise SystemExit(f"Otro agente está activo (pid {holder.get('pid')}); detén ese agente antes de ejecutar duelos")
     try:
-        run(b, a.execute, a.feed_file, reconcile=a.reconcile, verify_accept=a.verify_accept)
+        run(b, a.execute, a.feed_file, reconcile=a.reconcile, verify_accept=a.verify_accept, track=True, learner=learner)
     finally:
         if a.execute:
             lock.release()
@@ -162,9 +171,78 @@ def _still_acceptable(b, cand: dict, snapshot: dict) -> bool:
         return True
     ro = fresh.get("rival_offer") or {}
     days = ro.get("days") if "days" in (fresh.get("issues") or []) else None
-    m = dl.margin(fresh, ro.get("price"), days)
-    pm = dl.margin(dict(fresh, your_days_weight=None), ro.get("price"))
-    return m is not None and pm is not None and pm >= 0 and m >= cand["du"]
+    m = dl.margin(fresh, ro.get("price"), days)               # excedente TOTAL: precio + utilidad firmada de los días
+    pm = dl.price_margin(fresh, ro.get("price"))              # límite de precio del servidor, restricción independiente
+    return m is not None and pm is not None and pm >= 0 and m > 0 and m >= cand["du"]
+
+
+def score_snapshot(b, tick: int, prev: dict | None) -> dict | None:
+    """Lee duel_points y negotiating de /api/me. La variación es OBSERVADA entre dos lecturas: no se atribuye a un duelo
+    concreto (el leaderboard público se refresca con retraso y `/api/me` mezcla todo lo que pasó entre lecturas)."""
+    try:
+        sc = (b.me() or {}).get("score") or {}
+        snap = {"tick": tick, "duel_points": sc.get("duel_points"), "negotiating": sc.get("negotiating"),
+                "score": sc.get("score"), "rank": sc.get("rank")}
+        if not isinstance(snap["duel_points"], (int, float)) and not isinstance(snap["negotiating"], (int, float)):
+            return None
+    except Exception:  # noqa: BLE001 — la medición nunca debe frenar el duelo
+        return None
+    if prev:
+        snap["delta"] = {k: round(snap[k] - prev[k], 2) for k in ("duel_points", "negotiating", "score")
+                         if isinstance(snap.get(k), (int, float)) and isinstance(prev.get(k), (int, float))}
+        snap["since_tick"] = prev["tick"]
+    snap["note"] = "variación observada entre lecturas de /api/me; no atribuida a un duelo (el leaderboard público va con retraso)"
+    return snap
+
+
+def _learn(learner, done: list, tick: int) -> None:
+    """Reajusta el modelo cuando hay un duelo resuelto nuevo (y lo instala la primera vez). Registra qué cambió."""
+    if learner is None or not done:
+        return
+    try:
+        first = learner.model is None
+        if learner.update(done):
+            if first:
+                learner.install()
+            snap = learner.snapshot()
+            log({"event": "learn_update", "tick": tick, **snap})
+            try:
+                (DATA / "duel_learning.json").write_text(json.dumps(snap, ensure_ascii=False, indent=1))
+            except OSError:
+                pass
+    except Exception as e:  # noqa: BLE001 — el aprendizaje nunca frena el duelo
+        log({"event": "learn_error", "tick": tick, "error": f"{type(e).__name__}: {e}"})
+
+
+def reconcile_accepted(b, awaiting: dict, tick: int, stats: dict) -> Optional[list]:
+    """Tras aceptar, en el tick siguiente se relee el duelo y se registra su estado FINAL (deal/no_deal, precio, días, rol,
+    deadline) con la predicción hecha antes de aceptar. `sent: true` solo prueba que se envió la acción."""
+    due = {k: v for k, v in awaiting.items() if tick > v["tick"]}
+    if not due:
+        return None
+    done_list = b.duels(done=True).get("duels", [])
+    done = {d.get("duel"): d for d in done_list}
+    for duel_id, w in due.items():
+        d = done.get(duel_id)
+        if d is None or d.get("status") == "live":
+            if tick - w["tick"] >= 3:
+                log({"event": "reconcile_pending", "tick": tick, "duel": duel_id, "accepted_at": w["tick"],
+                     "note": "sigue sin liquidarse tras 3 ticks: revisar en el servidor"})
+                awaiting.pop(duel_id, None)
+            continue
+        pred = w["prediction"] or {}
+        real = d.get("result")
+        stats["deals" if d.get("status") == "deal" else "no_deals"] += 1
+        log({"event": "reconciled", "tick": tick, "duel": duel_id, "status": d.get("status"), "role": d.get("role"),
+             "price": d.get("price"), "days": d.get("days"), "deadline_tick": d.get("deadline_tick"),
+             "result": real, "rounds": d.get("rounds"), "predicted_result": pred.get("expected_result"),
+             "predicted_surplus": pred.get("surplus_total"), "predicted_price_margin": pred.get("price_margin"),
+             "predicted_days_utility": pred.get("days_utility"), "decision_reason": w.get("why"),
+             "prediction_error": (round(real - pred["expected_result"], 2)
+                                  if isinstance(real, (int, float)) and isinstance(pred.get("expected_result"), (int, float)) else None),
+             "public_events": [e for e in w.get("events", [])][:3], "learned": w.get("learned")})
+        awaiting.pop(duel_id, None)
+    return done_list
 
 
 def _timeout_for(c: dict) -> float:
@@ -173,8 +251,15 @@ def _timeout_for(c: dict) -> float:
     return 15.0 if not isinstance(ts, (int, float)) or ts <= 0 else max(3.0, min(15.0, 0.5 * ts))
 
 
-def run(b, execute, feed_file: Path | None = None, reconcile=False, verify_accept=False):
+def run(b, execute, feed_file: Path | None = None, reconcile=False, verify_accept=False, track=False, learner=None):
+    """`track=True` (lo activa main): relee duelos terminados para reconciliar aceptaciones, medir duel_points/negotiating
+    en /api/me y alimentar el historial de anclas. Desactivado, el bucle solo hace las lecturas/escrituras de siempre."""
     last_tick = None
+    stats = {"offers_sent": 0, "accepts_requested": 0, "deals": 0, "no_deals": 0}
+    awaiting: dict = {}          # duelo aceptado → {tick, prediction, why}: se reconcilia en el tick siguiente
+    history: list = []
+    history_tick = None
+    prev_score = None
     seen_weights: set = set()
     pending: dict = {}           # duelo aceptado → tick del envío (no volver a gastar la aceptación del tick en él)
     while True:
@@ -190,6 +275,27 @@ def run(b, execute, feed_file: Path | None = None, reconcile=False, verify_accep
             tick = c["tick"]
             live = [d for d in b.duels().get("duels", []) if d.get("status") == "live"]
             last_tick = tick                 # solo tras leer los duelos: un fallo de lectura no hace perder el tick
+            if track and execute:
+                if prev_score is None:
+                    prev_score = score_snapshot(b, tick, None)
+                    if prev_score:
+                        log({"event": "score_snapshot", "label": "inicio", **prev_score})
+                if history_tick is None or tick - history_tick >= 20:
+                    history_tick = tick
+                    try:
+                        history = [d for d in b.duels(done=True).get("duels", []) if d.get("status") in ("deal", "no_deal")]
+                    except BazaarError:
+                        history = history or []
+                    _learn(learner, history, tick)
+                if awaiting:
+                    done_now = reconcile_accepted(b, awaiting, tick, stats)
+                    if done_now is not None:
+                        _learn(learner, [d for d in done_now if d.get("status") in ("deal", "no_deal")], tick)
+                    snap = score_snapshot(b, tick, prev_score)
+                    if snap:
+                        log({"event": "score_snapshot", "label": "tras reconciliar", **snap,
+                             "resumen": {**stats, "duelos_activos": len(live)}})
+                        prev_score = snap
             if not live:
                 time.sleep(2)
                 continue
@@ -200,14 +306,16 @@ def run(b, execute, feed_file: Path | None = None, reconcile=False, verify_accep
                     elif d.get("duel") not in seen_weights:   # formato real de your_days_weight, una vez por duelo
                         seen_weights.add(d.get("duel"))
                         log({"tick": tick, "duel": d.get("duel"), "your_days_weight": d.get("your_days_weight"),
-                             "days_table": dl.days_table(d)})
+                             "days_meaning": d.get("days_meaning"), "role": d.get("role"),
+                             "days_sign": dl.days_sign(d)[0], "days_format": dl.days_format(d),
+                             "days_table": dl.days_table(d), "days_utility": dl.days_utility_table(d)})
             pending = {k: v for k, v in pending.items() if tick <= v + PENDING_TICKS}
             playable = [d for d in live if d.get("duel") not in pending]
             by_id = {d.get("duel"): d for d in playable}
             events = load_feed_events(feed_file)
             accepted = False
             for step in duel_tree.plan(playable, tick, events,
-                                       load_feed_events(LOG)):
+                                       load_feed_events(LOG), history):
                 cand = step["candidate"]
                 if step["action"] in {"wait", "defer", "already_sent"}:
                     log({"tick": tick, "duel": step["duel"],
@@ -231,9 +339,15 @@ def run(b, execute, feed_file: Path | None = None, reconcile=False, verify_accep
                         b.duel_accept(cand["duel"])
                         accepted = True
                         pending[cand["duel"]] = tick
+                        stats["accepts_requested"] += 1
+                        awaiting[cand["duel"]] = {"tick": tick, "prediction": cand.get("prediction"), "why": cand.get("why"),
+                                                  "learned": cand.get("learned")}
                     else:
                         b.duel_say(cand["duel"], text=cand["text"], price=cand["price"], days=cand.get("days"))
-                    log({**rec, "sent": True})
+                        stats["offers_sent"] += 1
+                    # `sent: true` = la acción se envió. NO es un trato puntuado: eso solo lo confirma «reconciled».
+                    log({**rec, "sent": True, "event": "accept_requested" if cand["type"] == "duel_accept" else "offer_sent",
+                         "scored": False})
                 except BazaarError as e:
                     log({**rec, "sent": False, "error": e.code, "message": e.message})
                     if e.code in {"network", "bad_response"}:

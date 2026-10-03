@@ -472,3 +472,11 @@ publicador y lado) → modelos (tasas con IC90 y agrupación si n_eff < 3, media
 decisiones (solo vía una versión de política acotada: plazo, ventanas secas, paso mínimo, ajuste de objetivo ±10 %, orden
 de contacto, uso del precio aprendido). Nunca toca límites, protección de activos, contabilidad ni validación.
 `python3 lab.py replay|eval|sim|shadow|propose`; `--policy-version vN` aplica una versión (sin él, configuración actual).
+
+## Última hora (`--profile last-hour`)
+
+Perfil sobre el coordinador existente (sin agente paralelo): `--final-floor 150` (suelo inviolable de saldo LIBRE tras compromisos,
+cálculo acumulado por tick; compras bloqueadas si el saldo no es fiable o el barrio ya tiene página completa), `--max-rounds 2`
+(tope de contraofertas nuestras por conversación con vendedores, también en la escalera), fases B desde cierre−60 min (cerrar y
+comprar a vendedores) y C desde cierre−25 min (liquidar duplicados y cancelar lo que no cierre), sin publicaciones nuevas en los
+últimos 10 ticks (confirmar liquidaciones). Sin campañas con otros equipos ni de página. La radio no se activa (`--radio` actúa en ventas).

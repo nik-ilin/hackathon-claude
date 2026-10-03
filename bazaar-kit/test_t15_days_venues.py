@@ -27,8 +27,13 @@ class TestDays(unittest.TestCase):
 
     def test_play_days_accepts_inside_limit(self):
         dl.PARAMS["PLAY_DAYS"] = True
-        c = dl.duel_candidates([days_duel(price=30, left=1)], 10)
+        d = days_duel(price=30, weight=1.0, left=1)         # peso positivo del servidor: cada día cuesta 1 P al comprador
+        d["days_meaning"] = "each delivery day costs you this much cash"
+        c = dl.duel_candidates([d], 10)
         self.assertEqual([x["type"] for x in c], ["duel_accept"])
+        self.assertEqual(c[0]["du"], 70 - 3.0)                # margen de precio − coste de 3 días
+        # sin peso entendible no se acepta: se desconoce el coste de los días
+        self.assertNotIn("duel_accept", [x["type"] for x in dl.duel_candidates([days_duel(price=30, left=1)], 10)])
 
     def test_play_days_never_accepts_outside_limit(self):
         dl.PARAMS["PLAY_DAYS"] = True
@@ -39,7 +44,9 @@ class TestDays(unittest.TestCase):
         dl.PARAMS["PLAY_DAYS"] = True
         d = days_duel(price=130, weight=[0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0], left=2)
         says = [x for x in dl.duel_candidates([d], 10) if x["type"] == "duel_say"]
-        self.assertEqual(says[0]["days"], 2)
+        # comprador: el día 2 cuesta 5 P (peso por rol), el resto 0: se evita el 2 y, en empate, se toma el del rival (3)
+        self.assertEqual(says[0]["days"], 3)
+        self.assertNotEqual(says[0]["days"], 2)
 
     def test_tree_no_longer_waits_on_days_when_enabled(self):
         dl.PARAMS["PLAY_DAYS"] = True

@@ -48,7 +48,9 @@ def _waiting_reason(duel: dict, tick: int) -> tuple[str, list[str]]:
     if price is None:
         return "waiting_for_rival_or_opening_window", ["no_rival_offer", "wait"]
     margin = duels.margin(duel, price, offer.get("days"))
-    if margin is not None and margin < 0:
+    if margin is not None and margin <= 0:
+        if (duels.price_margin(duel, price) or 0) >= 0:
+            return "total_surplus_not_positive", ["inside_price_limit", "days_cost_exceeds_margin", "wait_or_counter"]
         return "rival_offer_outside_limit", ["outside_own_limit", "wait_or_offer_near_deadline"]
     return "rival_may_improve_without_our_message", ["inside_own_limit", "wait_for_better_offer"]
 
@@ -71,8 +73,8 @@ def decision_facts(duel: dict, tick: int, same_deadline: int = 1) -> dict:
     if duels.PARAMS.get("PROFILES"):
         facts["rival_profile"] = duels.rival_profile(duel)
     if "days" in facts["issues"] and duels.PARAMS.get("PLAY_DAYS"):
-        facts.update(days_weight_format="reconocido" if duels.days_table(duel) else "desconocido_solo_precio",
-                     rival_day=duels.rival_days(duel), days_meaning=duel.get("days_meaning"))
+        facts.update(days_weight_format=duels.days_format(duel), rival_day=duels.rival_days(duel),
+                     days_meaning=duel.get("days_meaning"))
     return facts
 
 
@@ -100,14 +102,14 @@ def _trigger(action: str, facts: dict) -> str:
 
 
 def plan(live: list[dict], tick: int, events: Iterable[dict] = (),
-         actions: Iterable[dict] = ()) -> list[dict]:
+         actions: Iterable[dict] = (), history: list | None = None) -> list[dict]:
     """Una decisión JSON por duelo, con máximo una aceptación ejecutable.
 
     Las acciones y el orden son exactamente los de la política actual. `wait`
     y `defer` se vuelven explícitos para el agente; nunca se envían al API.
     """
     evidence = feed_evidence(events)
-    candidates = duels.duel_candidates(live, tick)
+    candidates = duels.duel_candidates(live, tick, history)
     same_deadline = Counter(d.get("deadline_tick") for d in live
                             if isinstance(d, dict) and d.get("status") == "live")
     by_id = {d.get("duel"): d for d in live if isinstance(d, dict)}
@@ -136,7 +138,7 @@ def plan(live: list[dict], tick: int, events: Iterable[dict] = (),
             path.append("local_action_memory")
         facts = decision_facts(by_id.get(duel_id, {}), tick,
                                same_deadline.get(by_id.get(duel_id, {}).get("deadline_tick"), 1))
-        out.append({"duel": duel_id, "action": action, "candidate": candidate,
+        out.append({"duel": duel_id, "action": action, "candidate": candidate, "learned": candidate.get("learned"),
                     "path": path, "trigger": _trigger(action, facts), "facts": facts,
                     "reason": candidate.get("why", ""),
                     "feed": evidence})
@@ -147,7 +149,8 @@ def plan(live: list[dict], tick: int, events: Iterable[dict] = (),
         reason, path = _waiting_reason(duel, tick)
         facts = decision_facts(duel, tick,
                                same_deadline.get(duel.get("deadline_tick"), 1))
-        out.append({"duel": duel_id, "action": "wait", "candidate": None,
+        note = duels.NOTES.get(duel_id) or {}
+        out.append({"duel": duel_id, "action": "wait", "candidate": None, "learned": note.get("learned"),
                     "path": path, "trigger": reason, "facts": facts,
-                    "reason": reason, "feed": evidence})
+                    "reason": note.get("reason") or reason, "feed": evidence})
     return out

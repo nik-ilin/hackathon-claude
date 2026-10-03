@@ -935,6 +935,7 @@ def candidates(s, led, args, journal):
     free_cash = view.cash - view.market_reserved_cash - view.dealer_exposure - view.pending_cash
     exec_sales = sum(int(c.get("cash") or c.get("price") or 0) for c in out
                      if ph_mod.is_sale(c) and not c.get("blockers") and c["type"] != "list")
+    pl["last_hour"] = last_hour_gate(out, s, led, args, view, free_cash, counts)
     fill = perf.realized(led.get("actions", [])).get("median_ticks_to_fill")
     fill_min = (fill * (s["clock"].get("tick_seconds") or 30.0) / 60.0) if fill else None
     ph = ph_mod.state(s["clock"], pcfg, ph_mod.scenarios(free_cash, open_sell_net(s, team), exec_sales), fill_min=fill_min)
@@ -967,6 +968,10 @@ def ladder_cfg(args):
         v = getattr(args, f"ladder_{k}", None)
         if v is not None:
             setattr(lc, k, v)
+    cap = getattr(args, "max_rounds", None)
+    if cap:   # última hora: como mucho `cap` contraofertas nuestras por conversación, también en la escalera
+        for k in ("chato_counters", "abuela_counters", "new_counters", "sell_counters"):
+            setattr(lc, k, max(1, min(getattr(lc, k), int(cap))))
     return lc
 
 
@@ -1910,6 +1915,56 @@ def learned_rows(s):
     return LEARN_CACHE["rows"]
 
 
+def balance_reliable(s, led, view, free_cash):
+    """¿Son fiables saldo y reservas? Si no, se bloquean las compras (las ventas y cierres seguros siguen)."""
+    cash = (s.get("me") or {}).get("cash")
+    if not isinstance(cash, (int, float)) or cash < 0:
+        return False, f"saldo ilegible ({cash!r})"
+    if view.cash != cash:
+        return False, f"saldo de la vista de capital ({view.cash}) distinto del servidor ({cash})"
+    if min(view.market_reserved_cash, view.dealer_exposure, view.pending_cash) < 0 or free_cash > cash:
+        return False, "reservas incoherentes con el saldo"
+    amb = [a for a in led.get("actions", []) if a.get("status") == "ambiguous"]
+    if amb:
+        return False, f"{len(amb)} escritura(s) ambigua(s) sin reconciliar"
+    return True, ""
+
+
+def last_hour_gate(out, s, led, args, view, free_cash, counts):
+    """--final-floor N (perfil last-hour): SUELO INVIOLABLE de saldo libre. Ninguna compra, puja ni aceptación con coste puede
+    dejar (caja − pujas abiertas − exposición con vendedores − pendientes − lo ya concedido en este tick − su coste) por debajo
+    de N. Se evalúa en orden de puntuación y de forma ACUMULADA (varias pujas del mismo tick cuentan juntas). Además:
+    no se compra para un barrio con página completa, y con saldo no fiable se bloquean todas las compras."""
+    floor = getattr(args, "final_floor", None)
+    if floor is None:
+        return None
+    ok, why = balance_reliable(s, led, view, free_cash)
+    cat = s["catalog"]
+    done_sets = pg.completed_pages(counts, cat)
+    set_of = {c["id"]: st["id"] for st in cat.get("sets", []) for c in st.get("cards", [])}
+    spent, blocked = 0, 0
+    for c in sorted(out, key=lambda c: -c.get("score", 0)):
+        if c["type"] in ("cancel", "team_cancel", "dealer_close", "team_close", "info") or c.get("blockers"):
+            continue
+        cost = ph_mod.purchase_cost(c)
+        if cost <= 0:
+            continue
+        bl = c.setdefault("blockers", [])
+        refs = [r for r in list((c.get("receive") or {}).keys()) or [str(c.get("ref") or "").removeprefix("card:")] if r in set_of]
+        if not ok:
+            bl.append(f"saldo no fiable ({why}): compras bloqueadas, solo ventas y cierres seguros")
+        elif free_cash - spent - cost < floor:
+            bl.append(f"SUELO {floor} P: quedarían {free_cash - spent - cost} P libres (caja {s['me']['cash']} − comprometido "
+                      f"{s['me']['cash'] - free_cash} − ya concedido {spent} − coste {cost})")
+        elif any(set_of[r] in done_sets for r in refs):
+            bl.append("barrio con página completa: no se compra para un barrio ya completo")
+        if bl:
+            blocked += 1
+            continue
+        spent += cost
+    return {"floor": floor, "free_cash": free_cash, "reliable": ok, "why": why, "granted": spent, "blocked": blocked}
+
+
 def liquidity_step(s, led, args, val, counts, view, free_cash, pl, out):
     """--liquidity-report: reconciliación, escenarios y ofertas excepcionales (estas, solo como información)."""
     try:
@@ -2342,6 +2397,12 @@ PROFILES = {
     # Cierre rápido + colección. Margen económico 1 P (la verificación de la valoración contra collection_value
     # sigue bloqueando TODO si no cuadra: el margen no sustituye al colchón de incertidumbre); 2 propuestas y 4
     # ticks por conversación; colchones ajustados al trabajo activo y capital pasivo limitado.
+    # Última hora: cierre rápido (≤ 2 contraofertas nuestras, 4 ticks por conversación), fases con ventana 1 (cerrar y comprar a
+    # vendedores) hasta cierre − 25 min, ventana 2 (liquidar y cancelar lo que no cierre) hasta los últimos 10 ticks, y SUELO
+    # inviolable de 150 P libres. Sin campañas con otros equipos ni de página: solo vendedores, cierres y ventas.
+    "last-hour": {"margin": 1.0, "max_proposals": 2, "negotiation_ticks": 4, "tactical_buffer": 15, "max_passive_frac": 0.3,
+                  "page_campaign": "none", "cooldown_ticks": 6, "phases": True, "phase_transition_min": 60,
+                  "phase_treasury_min": 25, "phase_final_ticks": 10, "final_floor": 150, "max_rounds": 2},
     "fast-close": {"margin": 1.0, "max_proposals": 2, "negotiation_ticks": 4, "tactical_buffer": 15,
                    "max_passive_frac": 0.3, "page_campaign": "auto", "cooldown_ticks": 6},
 }
@@ -3208,6 +3269,11 @@ def main():
     g = p.add_argument_group("fases hacia el cierre (opt-in con --phases; sin ello nada cambia)")
     g.add_argument("--phases", action="store_true",
                    help="A operación activa → B transición → C tesorería, según el cierre OFICIAL del servidor (clock.closes)")
+    g.add_argument("--final-floor", type=int, default=None, metavar="P",
+                   help="SUELO inviolable de saldo libre (caja − compromisos) tras cualquier compra/puja/aceptación; "
+                        "cálculo acumulado por tick y compras bloqueadas si el saldo no es fiable (perfil last-hour: 150)")
+    g.add_argument("--max-rounds", type=int, default=None, metavar="N",
+                   help="tope de contraofertas NUESTRAS por conversación con vendedores (perfil last-hour: 2)")
     g.add_argument("--phase-transition-min", type=int, default=90, help="minutos antes del cierre en que empieza B (90)")
     g.add_argument("--phase-treasury-min", type=int, default=30, help="minutos antes del cierre en que empieza C (30)")
     g.add_argument("--cash-target-min", type=int, default=150, help="meta mínima de efectivo libre al cierre (150 P)")
@@ -3414,6 +3480,7 @@ def main():
     applied = apply_profile(args)
     if applied:
         print(f"PERFIL {args.profile}: {applied} (lo fijado explícitamente en la línea de órdenes manda)")
+    neg.ROUND_CAP = args.max_rounds        # tras el perfil: --max-rounds (o el 2 de last-hour) acota TODA contraoferta a vendedores
     try:
         me = api.me()
         led = load_ledger(me["id"])

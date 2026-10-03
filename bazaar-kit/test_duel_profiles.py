@@ -155,12 +155,12 @@ class Logroll(Params):
         self.assertIsNone(dl.logroll_offer(duel(prices=[90], days=3, weight="raro"), 90, 3))
         self.assertIsNone(dl.logroll_offer(duel(prices=[90], weight=[0] * 11), 90, 5))   # rival sin día
 
-    def test_unknown_format_plays_price_only(self):
+    def test_unknown_format_never_accepts_without_knowing_the_days_cost(self):
         self.flags(PROFILES=True)
         d = duel("Rival Rojo", prices=[80], days=7, weight={"raro": [1, 2]})
         c = dl.duel_candidates([d], 0)
-        self.assertEqual((kinds(c), c[0]["du"]), (["duel_accept"], 20))
-        self.assertEqual(duel_tree.plan([d], 0)[0]["facts"]["days_weight_format"], "desconocido_solo_precio")
+        self.assertEqual([x for x in kinds(c) if x == "duel_accept"], [])       # antes aceptaba «solo precio» ignorando los días
+        self.assertEqual(duel_tree.plan([d], 0)[0]["facts"]["days_weight_format"], "desconocido")
 
     def test_never_outside_limit(self):
         rng = random.Random(1)

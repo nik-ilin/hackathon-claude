@@ -48,7 +48,7 @@ class Simulator(Params):
     def test_days_duels_score_zero_without_flag(self):
         res = sim.simulate(n=20, seed=2, days=True, variants={"off": {"PLAY_DAYS": False}, "on": {}})
         self.assertEqual(res["off"]["TOTAL"]["deals"], 0)
-        self.assertGreater(res["on"]["TOTAL"]["capture"], 0.3)
+        self.assertGreater(res["on"]["TOTAL"]["capture"], 0.2)   # con el signo correcto de los días (antes inflado)
 
     def test_silence_beats_early_acceptance_on_ceding_rivals(self):
         res = sim.simulate(n=40, seed=4, mix=["cedente"],
@@ -88,7 +88,8 @@ class DaysFormat(Params):
         dl.PARAMS["PLAY_DAYS"] = True
         c = dl.duel_candidates([d], 17)
         self.assertEqual(c[0]["type"], "duel_say")
-        self.assertEqual((c[0]["price"], c[0]["days"]), (130, 0))
+        # vendedor con días que valen (lista firmada, día 0 el mejor): ancla REALISTA (a 3 ticks del deadline, 0,18 del límite)
+        self.assertEqual((c[0]["price"], c[0]["days"]), (118, 0))
 
     def test_days_never_turn_out_of_limit_price_into_accept(self):
         dl.PARAMS["PLAY_DAYS"] = True
@@ -207,7 +208,9 @@ class Runner(Params):
         api = api_for([{"duels": [d]}])
         self.play(api)
         kw = api.duel_say.call_args.kwargs
-        self.assertEqual((kw["price"], kw["days"]), (70, 10))
+        # comprador: cada día cuesta (peso positivo + rol) ⇒ día 0; antes elegía el 10 porque sumaba los días al comprador
+        self.assertEqual(kw["days"], 0)
+        self.assertEqual(kw["price"], 82)
 
     def test_timeout_follows_tick(self):
         self.assertEqual(runner._timeout_for({"tick_seconds": 5}), 3.0)
@@ -222,7 +225,7 @@ class Runner(Params):
         self.assertTrue(dl.PARAMS["PLAY_DAYS"])
         self.assertEqual(dl.PARAMS["LADDER"], runner.LADDER)
         self.assertFalse(dl.PARAMS["PROBE"])
-        self.assertEqual(run.call_args.kwargs, {"reconcile": False, "verify_accept": False})
+        self.assertEqual(run.call_args.kwargs, {"reconcile": False, "verify_accept": False, "track": True, "learner": None})
         self.assertFalse(run.call_args.args[1])                    # sin --execute: análisis
 
     def test_defaults_unchanged(self):

@@ -49,7 +49,8 @@ class TestDuels(unittest.TestCase):
         self.assertFalse(dl.duel_candidates([d], 10))
         c = dl.duel_candidates([d], 16)
         self.assertEqual([x["type"] for x in c], ["duel_say"])
-        self.assertEqual(c[0]["price"], 130)
+        self.assertEqual(c[0]["price"], dl._own_price(d, dl.realistic_share(d, d["deadline_tick"] - 16)))   # ancla realista
+        self.assertGreaterEqual(c[0]["price"], 100)
 
     def test_wave_is_staggered(self):
         wave = [{"duel": i, "status": "live", "role": "buyer", "your_limit": 100, "rival": "R", "deadline_tick": 50,

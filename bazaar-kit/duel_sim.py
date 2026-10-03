@@ -241,15 +241,18 @@ HOUSE = {c.name: c for c in (Plata, Verde, Oro, Luna, Rojo, Noche, Sol)}
 SESSIONS = {"II": {"ticks": 16, "decay": 0.08, "wave": 6}, "III": {"ticks": 12, "decay": 0.10, "wave": 4}}
 
 
-def _days_weights(rng: random.Random, scale: float) -> list:
-    """Utilidad por día: preferencia lineal hacia pronto o tarde, con intensidad aleatoria."""
-    slope = rng.choice([-1, 1]) * rng.uniform(0.0, 0.03) * scale
-    base = 0 if slope > 0 else -slope * 10
-    return [round(base + slope * d, 2) for d in range(11)]
+def _day_weight(rng: random.Random, scale: float) -> float:
+    """Peso POSITIVO por día de entrega, como lo da el servidor (`your_days_weight`); el signo lo pone el rol."""
+    return round(rng.uniform(0.0, 0.05) * scale, 2)
+
+
+def _signed(role: str, w: float) -> list:
+    """Utilidad por día desde el lado de `role`: el comprador PAGA cada día (−w·d), el vendedor COBRA (+w·d)."""
+    return [round((-w if role == "buyer" else w) * d, 2) for d in range(11)]
 
 
 def play_wave(kinds: list, rng: random.Random, params: Optional[dict] = None, days: bool = False,
-              house: bool = False) -> list:
+              house: bool = False, collect: Optional[list] = None, base_duel: int = 0) -> list:
     """Juega una oleada de duelos simultáneos (uno por tipo de `kinds`). Devuelve [{kind, capture, deal, outside}]."""
     saved = dict(dl.PARAMS)
     dl.PARAMS.update(params or {})
@@ -261,8 +264,10 @@ def play_wave(kinds: list, rng: random.Random, params: Optional[dict] = None, da
             value = cost * rng.uniform(1.25, 2.0)
             ours, theirs = (value, cost) if role == "buyer" else (cost, value)
             rrole = "seller" if role == "buyer" else "buyer"
-            wd = _days_weights(rng, value - cost) if days else None
-            rw = _days_weights(rng, value - cost) if days else None
+            wo = _day_weight(rng, value - cost) if days else None            # nuestro peso, formato del servidor
+            wr = _day_weight(rng, value - cost) if days else None
+            wd = _signed(role, wo) if days else None                       # utilidades firmadas (solo para el modelo)
+            rw = _signed(rrole, wr) if days else None
             if kind == "mudo" and house:
                 rivals.append(HouseMute(rrole, theirs, rng, rw, alias=rng.choice([c.alias for c in HOUSE.values()])))
             else:
@@ -270,7 +275,9 @@ def play_wave(kinds: list, rng: random.Random, params: Optional[dict] = None, da
             joint = max(wd[k] + rw[k] for k in range(11)) if days else 0.0
             duels.append({"duel": i, "status": "live", "role": role, "your_limit": int(round(ours)), "rival": rivals[-1].alias,
                           "deadline_tick": TICKS, "decay_per_round": DECAY, "issues": ["price", "days"] if days else ["price"],
-                          "your_days_weight": wd, "rival_offer": None, "your_offer": None, "messages": [],
+                          "your_days_weight": wo, "days_meaning": (None if not days else
+                          "each delivery day costs you this much cash" if role == "buyer" else
+                          "each delivery day adds this much cash to your side"), "rival_offer": None, "your_offer": None, "messages": [],
                           "rounds": 0, "_pie": value - cost + joint, "_spoke": [False, False], "_last_ours": None})
         done = {}
         for t in range(TICKS):
@@ -314,6 +321,14 @@ def play_wave(kinds: list, rng: random.Random, params: Optional[dict] = None, da
             u = dl.margin(d, *done[d["duel"]]) if deal else 0.0
             cap = (u / d["_pie"]) * (1 - DECAY) ** d["rounds"] if deal and d["_pie"] > 0 else 0.0
             results.append({"kind": r.name, "capture": cap, "deal": deal, "outside": deal and u < 0})
+            if collect is not None:      # historial con la forma del servidor (done=true) para el laboratorio de aprendizaje
+                px, dx = done[d["duel"]] if deal else (None, None)
+                collect.append({"duel": base_duel + d["duel"], "session": 3, "status": "deal" if deal else "no_deal",
+                                "role": d["role"], "item": "sim", "issues": d["issues"], "your_days_weight": d["your_days_weight"],
+                                "days_meaning": d.get("days_meaning"), "your_limit": d["your_limit"], "rival": "Rival " + r.name.capitalize(),
+                                "deadline_tick": d["deadline_tick"] + base_duel * 0, "decay_per_round": DECAY, "rounds": d["rounds"],
+                                "result": round(u * (1 - DECAY) ** d["rounds"], 2) if deal else 0.0, "price": px, "days": dx,
+                                "messages": [dict(m, **{"from": ("you" if m["from"] == "us" else m["from"])}) for m in d["messages"]]})
         return results
     finally:
         dl.PARAMS.clear()

@@ -1,0 +1,465 @@
+{
+"source": "GET /api/duels?done=true, sesión 3 (Duelos II, precio + días), 2026-10-03; solo campos de decisión y resultado del servidor",
+"duels": [
+{
+"duel": 5640,
+"session": 3,
+"status": "deal",
+"role": "buyer",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 2.08,
+"days_meaning": "each delivery day costs you this much cash",
+"your_limit": 125,
+"rival": "Rival Verde",
+"deadline_tick": 1255,
+"decay_per_round": 0.08,
+"rounds": 0,
+"price": 77,
+"days": 10,
+"result": 27.2
+},
+{
+"duel": 5641,
+"session": 3,
+"status": "deal",
+"role": "seller",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 4.47,
+"days_meaning": "each delivery day adds this much cash to your side",
+"your_limit": 50,
+"rival": "Rival Plata",
+"deadline_tick": 1255,
+"decay_per_round": 0.08,
+"rounds": 0,
+"price": 52,
+"days": 10,
+"result": 46.7
+},
+{
+"duel": 5664,
+"session": 3,
+"status": "deal",
+"role": "seller",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 0.97,
+"days_meaning": "each delivery day adds this much cash to your side",
+"your_limit": 31,
+"rival": "Rival Oro",
+"deadline_tick": 1255,
+"decay_per_round": 0.08,
+"rounds": 0,
+"price": 55,
+"days": 0,
+"result": 24.0
+},
+{
+"duel": 5665,
+"session": 3,
+"status": "deal",
+"role": "buyer",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 1.93,
+"days_meaning": "each delivery day costs you this much cash",
+"your_limit": 110,
+"rival": "Rival Azul",
+"deadline_tick": 1255,
+"decay_per_round": 0.08,
+"rounds": 0,
+"price": 68,
+"days": 10,
+"result": 22.7
+},
+{
+"duel": 5676,
+"session": 3,
+"status": "deal",
+"role": "buyer",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 1.09,
+"days_meaning": "each delivery day costs you this much cash",
+"your_limit": 71,
+"rival": "Rival Noche",
+"deadline_tick": 1271,
+"decay_per_round": 0.08,
+"rounds": 0,
+"price": 51,
+"days": 7,
+"result": 12.4
+},
+{
+"duel": 5677,
+"session": 3,
+"status": "deal",
+"role": "seller",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 6.53,
+"days_meaning": "each delivery day adds this much cash to your side",
+"your_limit": 64,
+"rival": "Rival Oro",
+"deadline_tick": 1278,
+"decay_per_round": 0.08,
+"rounds": 0,
+"price": 82,
+"days": 0,
+"result": 18.0
+},
+{
+"duel": 5694,
+"session": 3,
+"status": "deal",
+"role": "buyer",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 4.48,
+"days_meaning": "each delivery day costs you this much cash",
+"your_limit": 66,
+"rival": "Rival Azul",
+"deadline_tick": 1267,
+"decay_per_round": 0.08,
+"rounds": 1,
+"price": 63,
+"days": 10,
+"result": -38.5
+},
+{
+"duel": 5695,
+"session": 3,
+"status": "no_deal",
+"role": "seller",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 5.06,
+"days_meaning": "each delivery day adds this much cash to your side",
+"your_limit": 127,
+"rival": "Rival Azul",
+"deadline_tick": 1277,
+"decay_per_round": 0.08,
+"rounds": 1,
+"price": null,
+"days": null,
+"result": 0.0
+},
+{
+"duel": 5696,
+"session": 3,
+"status": "deal",
+"role": "buyer",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 2.8,
+"days_meaning": "each delivery day costs you this much cash",
+"your_limit": 85,
+"rival": "Rival Plata",
+"deadline_tick": 1261,
+"decay_per_round": 0.08,
+"rounds": 0,
+"price": 79,
+"days": 0,
+"result": 6.0
+},
+{
+"duel": 5697,
+"session": 3,
+"status": "deal",
+"role": "seller",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 1.98,
+"days_meaning": "each delivery day adds this much cash to your side",
+"your_limit": 57,
+"rival": "Rival Sol",
+"deadline_tick": 1269,
+"decay_per_round": 0.08,
+"rounds": 0,
+"price": 81,
+"days": 0,
+"result": 24.0
+},
+{
+"duel": 5702,
+"session": 3,
+"status": "deal",
+"role": "buyer",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 1.75,
+"days_meaning": "each delivery day costs you this much cash",
+"your_limit": 137,
+"rival": "Rival Rojo",
+"deadline_tick": 1286,
+"decay_per_round": 0.08,
+"rounds": 0,
+"price": 137,
+"days": 5,
+"result": -8.8
+},
+{
+"duel": 5718,
+"session": 3,
+"status": "deal",
+"role": "seller",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 2.4,
+"days_meaning": "each delivery day adds this much cash to your side",
+"your_limit": 116,
+"rival": "Rival Azul",
+"deadline_tick": 1272,
+"decay_per_round": 0.08,
+"rounds": 1,
+"price": 146,
+"days": 0,
+"result": 27.6
+},
+{
+"duel": 5719,
+"session": 3,
+"status": "deal",
+"role": "buyer",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 4.98,
+"days_meaning": "each delivery day costs you this much cash",
+"your_limit": 169,
+"rival": "Rival Plata",
+"deadline_tick": 1282,
+"decay_per_round": 0.08,
+"rounds": 1,
+"price": 118,
+"days": 10,
+"result": 1.1
+},
+{
+"duel": 5728,
+"session": 3,
+"status": "deal",
+"role": "buyer",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 3.57,
+"days_meaning": "each delivery day costs you this much cash",
+"your_limit": 88,
+"rival": "Rival Oro",
+"deadline_tick": 1255,
+"decay_per_round": 0.08,
+"rounds": 1,
+"price": 62,
+"days": 10,
+"result": -8.9
+},
+{
+"duel": 5729,
+"session": 3,
+"status": "no_deal",
+"role": "seller",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 2.1,
+"days_meaning": "each delivery day adds this much cash to your side",
+"your_limit": 42,
+"rival": "Rival Noche",
+"deadline_tick": 1255,
+"decay_per_round": 0.08,
+"rounds": 1,
+"price": null,
+"days": null,
+"result": 0.0
+},
+{
+"duel": 5762,
+"session": 3,
+"status": "deal",
+"role": "buyer",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 5.07,
+"days_meaning": "each delivery day costs you this much cash",
+"your_limit": 135,
+"rival": "Rival Noche",
+"deadline_tick": 1280,
+"decay_per_round": 0.08,
+"rounds": 0,
+"price": 104,
+"days": 10,
+"result": -19.7
+},
+{
+"duel": 5763,
+"session": 3,
+"status": "no_deal",
+"role": "seller",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 1.24,
+"days_meaning": "each delivery day adds this much cash to your side",
+"your_limit": 25,
+"rival": "Rival Noche",
+"deadline_tick": 1281,
+"decay_per_round": 0.08,
+"rounds": 0,
+"price": null,
+"days": null,
+"result": 0.0
+},
+{
+"duel": 5768,
+"session": 3,
+"status": "no_deal",
+"role": "buyer",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 6.82,
+"days_meaning": "each delivery day costs you this much cash",
+"your_limit": 88,
+"rival": "Rival Rojo",
+"deadline_tick": 1284,
+"decay_per_round": 0.08,
+"rounds": 0,
+"price": null,
+"days": null,
+"result": 0.0
+},
+{
+"duel": 5842,
+"session": 3,
+"status": "deal",
+"role": "buyer",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 7.78,
+"days_meaning": "each delivery day costs you this much cash",
+"your_limit": 187,
+"rival": "Rival Sol",
+"deadline_tick": 1268,
+"decay_per_round": 0.08,
+"rounds": 0,
+"price": 142,
+"days": 10,
+"result": -32.8
+},
+{
+"duel": 5844,
+"session": 3,
+"status": "deal",
+"role": "buyer",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 4.67,
+"days_meaning": "each delivery day costs you this much cash",
+"your_limit": 113,
+"rival": "Rival Rojo",
+"deadline_tick": 1292,
+"decay_per_round": 0.08,
+"rounds": 0,
+"price": 69,
+"days": 10,
+"result": -2.7
+},
+{
+"duel": 5918,
+"session": 3,
+"status": "deal",
+"role": "seller",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 2.71,
+"days_meaning": "each delivery day adds this much cash to your side",
+"your_limit": 83,
+"rival": "Rival Azul",
+"deadline_tick": 1270,
+"decay_per_round": 0.08,
+"rounds": 0,
+"price": 125,
+"days": 0,
+"result": 42.0
+},
+{
+"duel": 5919,
+"session": 3,
+"status": "deal",
+"role": "buyer",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 5.68,
+"days_meaning": "each delivery day costs you this much cash",
+"your_limit": 98,
+"rival": "Rival Oro",
+"deadline_tick": 1270,
+"decay_per_round": 0.08,
+"rounds": 0,
+"price": 55,
+"days": 10,
+"result": -13.8
+},
+{
+"duel": 6098,
+"session": 3,
+"status": "deal",
+"role": "buyer",
+"issues": [
+"price",
+"days"
+],
+"your_days_weight": 1.46,
+"days_meaning": "each delivery day costs you this much cash",
+"your_limit": 139,
+"rival": "Rival Sol",
+"deadline_tick": 1297,
+"decay_per_round": 0.08,
+"rounds": 0,
+"price": 104,
+"days": 10,
+"result": 20.4
+}
+]
+}
