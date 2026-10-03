@@ -1,5 +1,5 @@
 {
- "generated": "2026-10-03 10:07:31",
+ "generated": "2026-10-03 10:26:35",
  "dealer_finals": {
   "abuela|buy|sobre_barrio": {
    "n": 5,
@@ -19,7 +19,7 @@
   },
   "abuela|sell|common": {
    "n": 6,
-   "median": 6.0
+   "median": 6
   },
   "abuela|buy|common": {
    "n": 10,
@@ -30,7 +30,7 @@
    "median": 22.5
   },
   "chato|buy|rare": {
-   "n": 3,
+   "n": 4,
    "median": 92
   },
   "chato|buy|sobre_plata": {
@@ -46,7 +46,7 @@
    "median": 14
   },
   "abuela|buy|carta": {
-   "n": 20,
+   "n": 23,
    "median": 24
   },
   "chato|buy|uncommon": {
@@ -58,15 +58,15 @@
    "median": 26
   },
   "chato|buy|carta": {
-   "n": 6,
-   "median": 86.5
+   "n": 7,
+   "median": 86
   },
   "chato|sell|?": {
    "n": 3,
    "median": 14.5
   },
   "abuela|sell|?": {
-   "n": 7,
+   "n": 6,
    "median": 5.5
   },
   "abuela|sell|lote2": {
@@ -86,58 +86,60 @@
   "abuela|sell|uncommon": 2,
   "abuela|buy|carta": 1,
   "chato|buy|uncommon": 3,
-  "chato|buy|carta": 1,
+  "chato|buy|carta": 3.0,
   "chato|sell|?": 1.0,
   "abuela|sell|?": 1
  },
  "p2p_median_by_rarity": {
-  "common": 8.5,
+  "common": 8,
   "uncommon": 25,
   "rare": 76.0
  },
  "buyers_by_set": {
   "LAV": [
-   "t04",
-   "t08",
-   "t03",
-   "t05",
-   "t02",
-   "t13",
    "t06",
-   "t14"
-  ],
-  "LAT": [
-   "t04",
-   "t08",
-   "t18",
-   "t03"
-  ],
-  "MAL": [
-   "t01",
    "t05",
-   "t17",
-   "t02",
-   "t10"
+   "t03",
+   "t08",
+   "t14",
+   "t13",
+   "t04",
+   "t02"
   ],
   "SAL": [
-   "t01",
-   "t08",
+   "t06",
    "t18",
    "t03",
+   "t08",
    "t16",
-   "t06"
+   "t01"
+  ],
+  "MAL": [
+   "t17",
+   "t05",
+   "t01",
+   "t10",
+   "t02"
   ],
   "RET": [
-   "t18",
    "t05",
-   "t02",
+   "t18",
+   "t13",
+   "t04",
    "t10",
-   "t13"
+   "t02"
+  ],
+  "LAT": [
+   "t18",
+   "t03",
+   "t08",
+   "t13",
+   "t04"
   ]
  },
  "leaders": [
-  "t12",
   "t18",
-  "t13"
+  "t12",
+  "t02"
  ]
 }
