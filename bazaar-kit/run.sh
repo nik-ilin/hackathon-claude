@@ -8,6 +8,7 @@
 #   ./run.sh coord                    -> coordinador único: análisis (solo lectura); --execute para operar
 #   ./run.sh market                   -> análisis de colección y mercado (solo lectura)
 #   ./run.sh market --execute --cycles 8 -> operación entre equipos, máximo una acción por ciclo
+#   ./run.sh celestina [--loop]       -> casamentera de v15: imprime el anuncio (dry run); --execute para publicarlo
 #   ./run.sh t15                      -> coordinador con la configuración decidida del equipo (ver T15_PLAN.md)
 #   ./run.sh t15 --execute --ticks 120 -> igual, operando
 set -euo pipefail
@@ -31,14 +32,16 @@ case "${1:-}" in
   memory) shift; exec python3 memory_coordinator.py "$@" ;;
   coord)  shift; exec python3 coordinator.py "$@" ;;
   market) shift; exec python3 market_agent.py "$@" ;;
-  broker) exec python3 starter_broker.py ;;
-  market-broker) shift; exec python3 market_broker.py "$@" ;;
-  duels) shift; exec python3 duel_runner.py "$@" ;;
+  celestina) shift; exec python3 celestina.py "$@" ;;
   t15)    shift; exec python3 coordinator.py --reserve 5 --per-card 95 --margin 2 \
             --no-rival-venues --duende-venue rastro \
             --deny-teams t05,t14,t12,t10,t18 --deny-margin 15 \
-            --ladder-fill --dealer-sell-dups --dedupe-bids \
-            --pilar-sell SAL,LAV:1.25 --pilar-last-copy --allow-last-copy SAL-07 "$@" ;;
+            --ladder-fill --ladder-calibrated --dealer-sell-dups --dedupe-bids \
+            --pilar-sell SAL,LAV:1.25 --pilar-last-copy --allow-last-copy SAL-07 \
+            --news-sell --chato-mirror on --fever-priority "$@" ;;
+  broker) exec python3 starter_broker.py ;;
+  market-broker) shift; exec python3 market_broker.py "$@" ;;
+  duels) shift; exec python3 duel_runner.py "$@" ;;
   agent)  shift; exec python3 starter_agent.py "$@" ;;
   *)      exec python3 starter_agent.py "$@" ;;
 esac

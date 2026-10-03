@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 HERE = Path(__file__).resolve().parent
 BASE = ["./run.sh", "coord", "--execute", "--max-spend", "0", "--reserve", "118",
         "--duende-venue", "rastro", "--no-rival-venues", "--ladder-fill", "--dealer-sell-dups",
-        "--dedupe-bids", "--deny-teams", "t12,t13,t14", "--page-campaign", "none",
+        "--dedupe-bids", "--deny-teams", "t05,t12,t13,t14", "--page-campaign", "none",
         "--pilar-sell", "SAL:1.25", "--pilar-from-tick", "668", "--pilar-until-tick", "838"]
 
 

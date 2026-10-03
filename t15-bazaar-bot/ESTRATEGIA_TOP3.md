@@ -60,3 +60,20 @@ Reglas propias: solo jugadas dentro de RULES.md. No se usan claves ajenas ni fal
 3. 14:55 → 17:13: vender SAL a Pilar con escalera tipo t14 (abrir alto y bajar de 2 en 2 hasta 19-20 × 1,25).
 4. 17:40 (Duelos II hacia las 17:49–18:30): parar el coordinador. Duelos II con `python3 duel_runner.py --execute --days --ladder --reconcile --verify-accept` (PR #6 + #7).
 5. 21:00: vigilar el Market Test difícil con v15 a 0 bps.
+
+## 5. Nuestro inventario: ventas concretas (`/api/me`, tick ~600)
+
+Caja: 118 P. El ladder solo necesita **3 tratos negociados por dealer**, y para eso vender es más barato que comprar.
+
+| Activo | Nuestro valor | Comprador | Precio esperado | Ganancia | Nota |
+|---|---|---|---|---|---|
+| **LAV-08** poco común ×2 | 4,4 | **Pilar** | 19 (final), hasta 25 pidiendo 33-40 y bajando | +15 a +20 c/u | 2 tratos de nivel 3 **ya** |
+| **SAL-06, SAL-07** poco comunes | 12,5 | **Pilar en la fiebre** (≈14:55-17:13) | 19-25 × 1,25 ≈ 24-31 | +12 a +18 c/u | 3.er-4.º trato de nivel 3 |
+| **LAV-10** rara | 49 | Pilar (paga por encima de libro) o el Chato | por medir: pedir alto | ? | Solo si la oferta final supera 49 |
+| Duplicadas comunes: LAT-05, LAV-01, LAV-02, LAV-03, MAL-01, MAL-02, MAL-05 | 1,8-3,2 | **Abuela** | 6 (su final), pedir 15 y bajar de 1 en 1 como t10 | +3 a +4 c/u | 3 tratos de nivel 1 |
+| **sobre_plata sin abrir** | — | abrirlo | — | — | t04 sacó una épica (LAT-11) de un sobre_plata y **Pilar paga 140 por épicas** |
+| LAT-09, LAT-10 raras | 177 | **no vender** | — | — | La página LAT está completa (page_guard) |
+
+**Faroles de Pilar:** cuando dice «my final courtesy» o «my last gesture» sin `final: true`, todavía sube 1-2 P (3 casos medidos). Hay que seguir regateando hasta `final: true`.
+
+No hay mentiras denunciables: de 1.811 mensajes de dealers con precio, el número del texto coincide con la oferta en el 100 %. El detector `intel/lies.py` vigila los dealers nuevos del domingo.
