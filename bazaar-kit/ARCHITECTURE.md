@@ -12,6 +12,7 @@ observar ─► reconciliar ─► candidatas ─► seleccionar ─► enviar �
 | Módulo | Papel |
 |---|---|
 | `trading.py` | Valoración marginal (con bono de página), comisiones, lectura de ofertas (venta, compra, swap, lote ≤ 4), recursos comprometidos, valor de sobres, caducidad, ofertas propias inseguras, reconciliación. Sin red. |
+| `campaigns.py` | Campañas de negociación directa con equipos: descubrimiento de contrapartes con ID publicado, oportunidades (completar, vender duplicados, trueque), propuestas estructuradas, máquina de estados por negociación. Sin red. |
 | `negotiation.py` | Estado de una conversación reconstruido desde el hilo; política por vendedor (`dealer_policy`, `decide_dealer`); validación estructural; registro y bloqueo de instancia. Sin red. |
 | `coordinator.py` | Bucle único, presupuesto compartido, idempotencia, etapas visibles en consola. |
 | `market_agent.py` | Motor de mercado independiente (v2 usa `trading.py`; v1 se conserva). |
@@ -37,6 +38,9 @@ observar ─► reconciliar ─► candidatas ─► seleccionar ─► enviar �
 | Las ofertas liquidadas aparecen con `status: "settled"` en el hilo y como evento `settlement` en `/api/feed` | hilos 123, 130, 135, 139 y 143 |
 | `expires_in_ticks` se divide por 4 a 60 s/tick (4→1, 8→2, 20→5); el valor por defecto del SDK (40) da 10 en el tablón | ofertas 1458, 2092 y 1688; 19 ofertas a 10 ticks en el tablón |
 | `my_offers` incluye ofertas de otros equipos dirigidas a nosotros: hay que filtrar por `maker` | ofertas 1648 (t18) y 1853 (t05), tick 138 |
+| `collection_value` incluye los sobres sin abrir con su `your_value` | tick 158: 661,7 = 622,9 de cartas + 38,8 de un sobre |
+| Entre equipos, la propuesta va en `offer` = {give, want} de un mensaje en un hilo `kind: team` sobre un mercado; la acepta la otra parte | hilo #135 (t04 → t15, oferta 1092 liquidada) |
+| El feed publica `offer.listed` con el ID real del equipo; el tablón muestra alias | tick 145; los alias nunca se usan para contactar |
 
 Lo que **no** está verificado: la base del bono master; la comisión de un swap sin efectivo (se asume 1 P por carta); la equivalencia en ticks de 30 s y 15 s (hipótesis: ticks de 15 s); qué tratos con vendedores cuentan exactamente para la escalera más allá de «no a precio de apertura».
 
@@ -59,4 +63,69 @@ Lo que **no** está verificado: la base del bono master; la comisión de un swap
 
 ## Resultados
 
-Este coordinador no se ha ejecutado todavía en real, así que no hay resultados observados que atribuirle. Hay 97 pruebas offline en verde (`python3 -m unittest test_coordinator test_trading test_market test_negotiation`). Las simulaciones de `sim.py` usan vendedores sintéticos y no son una medida del juego real. Cada operación real queda en `data/coordinator_ledger.json` con sus métricas privadas antes y después, para evaluarla después sin ajustar políticas a una sola observación.
+Hay 118 pruebas offline en verde (`python3 -m unittest test_campaigns test_coordinator test_trading test_market test_negotiation`). El coordinador sin campañas se ha ejecutado en real (tick 155: score 10,35, `neg_points` +37, La Latina completa), pero esa variación coincide con operaciones de otros clientes y con el refresco del leaderboard, así que su atribución es incierta. Las campañas entre equipos no se han ejecutado en real. Las simulaciones de `sim.py` usan vendedores sintéticos y no son una medida del juego real. Cada operación real queda en `data/coordinator_ledger.json` con sus métricas privadas antes y después, para evaluarla después sin ajustar políticas a una sola observación.
+
+## Campañas de negociación entre equipos
+
+Las campañas son un módulo más del coordinador, no un proceso aparte: comparten efectivo, reserva, activos comprometidos y límites de la API.
+
+- **Contrapartes:** solo IDs que publica el servidor (leaderboard; `maker`/`actor` del feed; ofertas dirigidas a nosotros). Lo que es aceptable tal cual lo acepta el módulo de mercado sin conversar.
+- **Tipos:** completar colección (comprar una carta ausente a quien la ofrece), monetizar duplicados (a quien la pide) y trueque en una sola oferta estructurada (dar un duplicado y recibir una ausente, con efectivo si hace falta).
+- **Estados:** detectada → contactada → propuesta → esperando → contraoferta → aceptada → liquidada, además de abandonada y ambigua. Se reconstruyen desde el hilo al reiniciar.
+- **Política:**
+  - Apertura defendible: 85 % de su precio al comprar, 115 % de su puja al vender.
+  - Concesiones del 50 % de la distancia restante, sin cruzar nunca la reserva privada.
+  - Como máximo 3 propuestas y 6 ticks por negociación, y 2 negociaciones activas.
+  - Un solo contacto por contraparte y objetivo.
+  - El silencio no es un rechazo.
+  - No se contacta si nuestra reserva queda por debajo del 60 % de su precio, ni si no hay efectivo libre para la primera propuesta.
+- **Exclusión:** la misma carta no se persigue por dos vías (campaña, puja pública, vendedor) y la misma copia no se compromete dos veces. Las propuestas antiguas que siguen abiertas se cancelan explícitamente.
+- **Fin de campaña:** deja de abrir conversaciones, retira las propuestas abiertas, cierra los hilos e informa de las obligaciones que siguen activas.
+
+## DAY 2 STRATEGY · inteligencia de mercado multi-venue
+
+`market_intel.py` (lógica pura) se apoya en la valoración verificada de `trading.py`, sin sustituirla. El coordinador la usa por defecto (`--engine intel`) y sigue siendo la única autoridad de escritura y presupuesto.
+
+```
+CLOCK → SNAPSHOT (me, catálogo, /api/venues, /api/venues/{id}/offers de CADA venue, /api/me/offers, feed, hilos)
+      → RECONCILE → MARKET INTELLIGENCE (libros, estados por carta, estimaciones, historial)
+      → CANDIDATAS (aceptar, publicar venta, puja pública/dirigida, trueque, reprecio, vendedores, campañas)
+      → SELECT (1 aceptación, 1 mensaje por conversación, hasta --max-posts publicaciones por tick) → ACT → wait_tick()
+```
+
+**Cinco valores por carta, separados.**
+
+| Valor | Origen | Etiqueta |
+|---|---|---|
+| Privado | `Valuation` | VERIFIED |
+| De colección (ganancia o pérdida marginal, con bono de página una sola vez) | `Valuation` | VERIFIED |
+| De mercado | ejecuciones > microprecio bid/ask > percentil 25 de los asks (limitado a 1,5 × catálogo: **un ask no es un valor**) > percentil 75 de los bids > catálogo | ESTIMATE, con confianza HIGH/MEDIUM/LOW/UNKNOWN |
+| De trading | ΔU exacto de una operación en un venue | VERIFIED; solo la probabilidad de ejecución es HEURISTIC |
+| De liquidez (demanda, oferta, escasez, spread) | señales del libro | HEURISTIC |
+
+**Regla dura.** Ninguna puntuación estratégica justifica una operación con ΔU < margen. La puntuación para ordenar es la siguiente: para lo inmediato, ΔU más un bono estratégico; para publicaciones, P(ejecución) × excedente − coste de oportunidad − capital inmovilizado − activo bloqueado.
+
+**Venues y comisiones.** Se leen de `/api/venues` en cada ciclo, junto con la comisión anunciada (`pending_fee`) si es mayor. Nunca se fijan en el código. El enrutado compara el **coste total para el comprador** y el **neto para el vendedor**, no el precio nominal. Comisiones a cargo de quien acepta:
+
+| Venue | Comisión verificada (Day 2, tick 162) |
+|---|---|
+| El Rastro | 5 % + 1 P por carta |
+| v03 | 1 % |
+| v01, v02, v04, v05, v06 | 0 |
+
+**El Duende (v02).** Publicaciones con `expires_in_ticks = 120` (`--duende-expiry`, recomendación oficial, configurable). A igual utilidad se prefiere v02, pero nunca por ser v02: si otro venue deja más ΔU esperado, gana el otro.
+
+**Ventas competitivas.** El suelo es la pérdida de colección más el margen. El precio objetivo es el coste del rival más barato para el comprador menos un paso adaptativo (3-10 % del precio, mínimo 1 P, acotado por el spread). Sin comisión podemos cobrar más que el precio nominal de un rival de El Rastro y seguir siendo más baratos para el comprador. No se compite bajo el suelo. Para evitar guerras de precios: como máximo 2 reprecios por carta, edad mínima de 3 ticks, mejora mínima de 2 P y parada si el precio queda a menos del 15 % sobre el suelo.
+
+**Pujas.** Reserva = mín(ganancia − margen, máximo por carta, capital libre). La puja abre al 60 % del ancla de mercado (o un paso sobre la puja rival) y sube en escalera un 15 % de la distancia restante, más deprisa cerca del cierre según `/api/clock`. Normalmente queda por debajo de la reserva, y no se puja si la reserva no llega al 50 % del ancla.
+- **Puja dirigida (`to`)** solo con evidencia publicada de que el equipo tiene la carta: `offer.listed` del feed u ofertas dirigidas. La propiedad se etiqueta OBSERVED.
+
+**Trueques.**
+- Se aceptan los del tablón cuando ΔU ≥ margen. La comisión de un trueque sin efectivo es 0 en v02 y v03, y 2 P (1 P por carta) en El Rastro.
+- Se publican (`give: {assets: [id]}, want: {cards: [ref]}`) con el coste de oportunidad del duplicado: la mejor venta inmediata o esperada que se pierde.
+
+**Exclusión.** La misma carta no se persigue por dos vías en un tick, y la misma copia no se compromete dos veces. Las reservas salen de las ofertas abiertas en el servidor.
+
+**Historial.** `data/market_history.jsonl` guarda resumen del libro por venue y carta, y liquidaciones deduplicadas, con ventana de 240 ticks y poda automática. La tendencia (UP/DOWN/STABLE) solo se calcula con al menos 6 puntos en 5 o más ticks; con menos, UNKNOWN.
+
+**Arbitraje entre venues.** Se informa, no se ejecuta: las dos patas no son atómicas.

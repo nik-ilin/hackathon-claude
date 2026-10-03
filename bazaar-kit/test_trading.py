@@ -94,6 +94,14 @@ class Valuation(unittest.TestCase):
         self.assertEqual(round(v.next_copy(have, "LAT-10"), 1), 177.1)
         self.assertEqual(round(v.next_copy(have, "LAT-03"), 1), 3.2)
 
+    def test_sealed_packs_count_in_collection_value(self):  # tick 158: 661.7 = 622.9 de cartas + sobre de 38.8
+        s = snap([asset(1, "LAT-01")])
+        s["me"]["assets"].append({"id": 538, "kind": "pack", "ref": "sobre_bienvenida", "your_value": 38.8})
+        s["me"]["collection_value"] = round(13.0 + 38.8, 2)
+        pl = tr.plan(s, tr.Config())
+        self.assertTrue(pl["valuation_verified"])
+        self.assertEqual(pl["model_value"], 51.8)
+
     def test_model_matches_collection_value_and_mismatch_blocks(self):
         assets = [asset(1, "LAT-01"), asset(2, "LAT-01")]
         self.assertTrue(tr.plan(snap(assets), tr.Config())["valuation_verified"])

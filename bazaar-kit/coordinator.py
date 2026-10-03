@@ -25,7 +25,9 @@ import time
 from collections import Counter
 from pathlib import Path
 
+import campaigns as cp
 import market_agent as ma
+import market_intel as mi
 import negotiation as neg
 import trading as tr
 from bazaar_sdk import Bazaar, BazaarError
@@ -39,7 +41,9 @@ EXPIRY_EVIDENCE = [{"requested": 4, "effective": 1, "tick_seconds": 60.0, "sourc
                    {"requested": 20, "effective": 5, "tick_seconds": 60.0, "source": "motor v2, oferta 1688"},
                    {"requested": 8, "effective": 2, "tick_seconds": 60.0, "source": "motor v2, oferta 2092"}]
 CLASSES = {"accept": "aceptar", "dealer_accept": "aceptar", "dealer_counter": "mensaje", "list": "publicar",
-           "bid": "publicar", "cancel": "publicar", "dealer_open": "conversación", "dealer_close": "conversación"}
+           "bid": "publicar", "cancel": "publicar", "dealer_open": "conversación", "dealer_close": "conversación",
+           "team_accept": "aceptar", "team_propose": "mensaje", "team_open": "conversación", "team_cancel": "publicar",
+           "team_close": "cierre", "swap_list": "publicar"}
 QUOTA = {"persona_quota", "cooloff", "sold_out", "locked"}
 
 
@@ -51,7 +55,7 @@ def load_ledger(team):
         raise ValueError("El registro del coordinador pertenece a otro equipo")
     led.setdefault("team", team)
     for k, v in (("actions", []), ("spent_confirmed", 0), ("cash_received", 0), ("expiry_obs", []),
-                 ("blocked", {}), ("class_tick", {}), ("threads", [])):
+                 ("blocked", {}), ("class_tick", {}), ("threads", []), ("negotiations", {}), ("campaign", None)):
         led.setdefault(k, v)
     return led
 
@@ -72,6 +76,14 @@ def metrics(s):
 
 def snapshot(reader):
     s = ma.snapshot_v2(reader)
+    s["leaderboard"] = reader.call("leaderboard")  # IDs de equipo válidos para abrir conversaciones
+    s["boards"] = {"rastro": s["board"]}
+    for v in (s.get("venues") or {}).get("venues", []):  # El Duende (v02) y demás: GET /api/venues/{id}/offers
+        if v.get("status") == "open" and v.get("venue") != "rastro" and v.get("owner") != s["me"]["id"]:
+            try:
+                s["boards"][v["venue"]] = reader.call("board", v["venue"])
+            except BazaarError:
+                s["boards"][v["venue"]] = {"offers": []}
     ids = set(s["me"].get("unlocked") or [])
     for lv in (s.get("levels") or {}).get("levels", []):
         if lv.get("kind") == "persona" and lv.get("open_to_all"):
@@ -101,7 +113,7 @@ def reconcile(led, s, journal):
     """Pone al día las acciones con evidencia del servidor. Devuelve (nuevas liquidadas, ambiguas que bloquean)."""
     team, tick = s["me"]["id"], s["clock"]["tick"]
     sets = tr.settlements_for(s["feed"].get("events", []), team)
-    market = [a for a in led["actions"] if a["type"] in ("accept", "list", "bid")]
+    market = [a for a in led["actions"] if a["type"] in ("accept", "list", "bid", "team_accept", "swap_list")]
     view = {"actions": market, "spent_confirmed": led["spent_confirmed"], "cash_received": led["cash_received"]}
     before = {id(a): a["status"] for a in led["actions"]}
     ma.reconcile_v2(view, s, sets)
@@ -160,7 +172,19 @@ def candidates(s, led, args, journal):
     cfg = tr.Config(reserve=args.reserve, margin=args.margin, per_card=args.per_card, max_spend=args.max_spend,
                     listing_ticks=args.listing_ticks, fill_prior=args.fill_prior,
                     allow_last_copy=frozenset(x for x in args.allow_last_copy.split(",") if x))
-    pl = tr.plan(s, cfg, pendings=pend, spent=led["spent_confirmed"])
+    if getattr(args, "engine", "basic") == "intel":
+        icfg = mi.IntelConfig(reserve=args.reserve, margin=args.margin, per_card=args.per_card, max_spend=args.max_spend,
+                              allow_last_copy=cfg.allow_last_copy, duende_venue=args.duende_venue,
+                              duende_expiry_ticks=args.duende_expiry, target_expiry_ticks=args.listing_ticks,
+                              history_window_ticks=args.history_window)
+        ratio, _ = tr.expiry_ratio(led["expiry_obs"] + EXPIRY_EVIDENCE, s["clock"].get("tick_seconds") or 60.0)
+        hist = mi.History(str(DATA / "market_history.jsonl"), args.history_window).load(s["clock"]["tick"])
+        pl = mi.plan(s, icfg, pendings=pend, spent=led["spent_confirmed"], actions=led["actions"], history=hist,
+                     expiry_ratio=ratio)
+        books, _ = mi.build_books(s, mi.venues_from(s))
+        hist.record(s["clock"]["tick"], books, mi.public_settlements(s["feed"].get("events", [])), time.time())
+    else:
+        pl = tr.plan(s, cfg, pendings=pend, spent=led["spent_confirmed"])
     cap = max(0, min(pl["free_cash"], pl["budget_left"]))
     out = []
     # 1. Seguridad: publicaciones propias que venden la última copia o por debajo del valor.
@@ -168,9 +192,15 @@ def candidates(s, led, args, journal):
         c.update(module="seguridad", du=0.0, score=10 ** 6, blockers=[] if args.cancel_unsafe else
                  ["requiere --cancel-unsafe (puede ser una oferta de un compañero)"])
         out.append(c)
-    # 2. Mercado entre equipos.
+    # 2. Mercado entre equipos (sin duplicar lo que una negociación de campaña activa ya persigue).
+    camp_in = {n.get("receive") for n in led.get("negotiations", {}).values() if n["state"] in cp.ACTIVE} - {None}
+    camp_out = {n.get("deliver") for n in led.get("negotiations", {}).values() if n["state"] in cp.ACTIVE} - {None}
     for o in pl["opportunities"]:
         o = dict(o, module="mercado")
+        gets = set(o.get("receive") or {}) | ({o["ref"]} if o["type"] == "bid" else set())
+        gives = set(o.get("deliver") or {}) | ({o["ref"]} if o["type"] == "list" else set())
+        if gets & camp_in or gives & camp_out:
+            o["blockers"] = list(o["blockers"]) + ["la campaña ya negocia esa carta con un equipo"]
         if o["type"] == "accept":
             o["score"] = 10 ** 4 + o["du"]
         out.append(o)
@@ -241,16 +271,174 @@ def candidates(s, led, args, journal):
     return out, pl, exposure
 
 
-def select(cands, led, tick):
-    """Como mucho una acción por clase de límite y tick; dentro de cada clase, la de mayor prioridad."""
-    chosen, used = [], set()
+def campaign_cfg(args):
+    kinds = ("collect", "sell", "swap") if args.campaign in ("all", "none") else (args.campaign,)
+    return cp.CampaignConfig(kinds=kinds, ticks=args.campaign_ticks, budget=args.campaign_budget,
+                             max_proposals=args.max_proposals, negotiation_ticks=args.negotiation_ticks,
+                             max_conversations=args.max_conversations, margin=args.margin)
+
+
+def counterparty(t, team):
+    return t.get("team") if t.get("with") == team else t.get("with")
+
+
+def campaign_candidates(s, led, args, pl, execute):
+    """Candidatas de la campaña activa (o una vista previa en análisis) y líneas de estado para la consola."""
+    team, tick = s["me"]["id"], s["clock"]["tick"]
+    if args.campaign == "none" and not led.get("campaign"):
+        return [], []
+    cfg = campaign_cfg(args)
+    camp = led.get("campaign")
+    if camp is None or camp.get("closed"):
+        if args.campaign == "none":
+            return [], []
+        camp = {"id": f"c{tick}", "kinds": list(cfg.kinds), "start_tick": tick, "end_tick": tick + cfg.ticks,
+                "budget": cfg.budget, "spent": 0, "received": 0, "before": metrics(s), "closed": False,
+                "stats": {"contacts": 0, "replies": 0, "proposals": 0, "accepted": 0, "settled": 0, "cards_in": [],
+                          "dups_sold": [], "surplus_est": 0.0, "ticks_to_close": []}}
+        if execute:
+            led["campaign"] = camp
+    negs = led["negotiations"]
+    val, counts = tr.Valuation(s["catalog"], s["me"].get("affinity") or {}), tr.counts_of(s["me"]["assets"])
+    res = tr.resources(s["offers"].get("offers", []), team, [])
+    team_threads = {t["id"]: t for t in s["threads"]["open"] + s["threads"]["deal"] if t.get("kind") == "team"}
+    lines = []
+    for n in negs.values():
+        if n["state"] == "ambigua" and not n.get("thread"):  # ¿se abrió la conversación aunque se perdiera la respuesta?
+            t = next((t for t in team_threads.values() if counterparty(t, team) == n["team"]
+                      and (t.get("topic") or {}).get("card") in (n.get("receive"), n.get("deliver"))
+                      and t.get("created_tick", 0) >= n["start_tick"]), None)
+            if t:
+                n["thread"] = t["id"]
+        change = cp.sync(n, team_threads.get(n.get("thread")), team, tick) if n["state"] not in ("liquidada",) else None
+        if change:
+            lines.append(f"NEGOCIACIÓN {n['kind']} con {n['team']} ({n.get('receive') or n.get('deliver')}, "
+                         f"hilo #{n.get('thread')}): {change}")
+            if n["state"] == "contraoferta":
+                camp["stats"]["replies"] += 1
+            if n["state"] == "liquidada" and not n.get("counted"):
+                n["counted"] = True
+                camp["stats"]["settled"] += 1
+                camp["stats"]["ticks_to_close"].append(tick - n["start_tick"])
+                camp["stats"]["surplus_est"] += n.get("du_est", 0)
+                if n.get("receive"):
+                    camp["stats"]["cards_in"].append(n["receive"])
+                if n.get("deliver"):
+                    camp["stats"]["dups_sold"].append(n["deliver"])
+                if n.get("settled_maker") == team:  # aceptaron NUESTRA propuesta: ellos pagan la comisión
+                    paid = int((n.get("settled_give") or {}).get("cash") or 0)
+                    got = int((n.get("settled_want") or {}).get("cash") or 0)
+                    led["spent_confirmed"] += paid
+                    led["cash_received"] += got
+                    camp["spent"] += paid
+                    camp["received"] += got
+                lines.append(f"LIQUIDADA  [campaña] {n['kind']} con {n['team']} · oferta #{n.get('settled_offer')} · "
+                             f"RESULTADO OBSERVADO {observed({'before': camp['before']}, s, [])}")
+    for a in led["actions"]:  # aceptaciones nuestras liquidadas: suman al gasto de la campaña una sola vez
+        if a["type"] == "team_accept" and a["status"] == "settled" and not a.get("campaign_counted"):
+            a["campaign_counted"] = True
+            camp["spent"] += a.get("cost") or 0
+    ending = tick >= camp["end_tick"] or camp["spent"] >= camp["budget"]
+    mine_threads = {n["thread"] for n in negs.values() if n.get("thread")}
+    committed = sum(int((o.get("give") or {}).get("cash") or 0) for o in res.open_offers if o.get("thread") in mine_threads)
+    camp_left = camp["budget"] - camp["spent"] - committed
+    out = []
+    locked = set(res.locked_assets)
+    for n in negs.values():
+        if n["state"] not in cp.ACTIVE:
+            continue
+        a = cp.step(n, team_threads.get(n.get("thread")), s, val, counts, locked, cfg, camp_left, pl["free_cash"], ending)
+        if a:
+            a["score"] = 10 ** 5 + (1000 if a["type"] == "team_accept" else 0)
+            out.append(a)
+    obligations = [o["id"] for o in res.open_offers if o.get("thread") in mine_threads]
+    if ending:
+        if not any(n["state"] in cp.ACTIVE for n in negs.values()) and execute and not camp.get("closed"):
+            camp["closed"] = True
+        lines.append(f"CAMPAÑA {camp['id']} terminando (tick {tick} / fin {camp['end_tick']}, gastado {camp['spent']}/"
+                     f"{camp['budget']} P): no abre conversaciones; ofertas propias aún abiertas: {obligations or 'ninguna'}")
+    else:
+        active = [n for n in negs.values() if n["state"] in cp.ACTIVE]
+        slots = min(cfg.max_conversations - len(active),
+                    s["clock"]["limits"].get("max_open_threads_per_team", 6) - len(s["threads"]["open"]))
+        acceptable = {o.get("offer") for o in pl["opportunities"] if o["type"] == "accept"}
+        busy_refs = {n.get("receive") for n in active} | {n.get("deliver") for n in active} | \
+            set(res.buying_refs) | set(res.selling_refs)
+        busy_assets = {n.get("asset") for n in active if n.get("asset")}
+        for o in cp.opportunities(s, val, counts, locked | busy_assets, cfg, acceptable):
+            nid = cp.neg_id(o)
+            blockers = []
+            if nid in negs:
+                continue  # un solo contacto por contraparte y objetivo
+            if (o.get("receive") and o["receive"] in busy_refs) or (o.get("deliver") and o["deliver"] in busy_refs):
+                blockers.append("ya hay una negociación activa por esa carta")
+            if o.get("asset") in busy_assets:
+                blockers.append("esa copia ya está comprometida")
+            need = o.get("first_cash", 0)
+            if need > min(camp_left, pl["free_cash"]):
+                blockers.append(f"sin efectivo libre para la primera propuesta ({need} P; libre {pl['free_cash']} P, "
+                                f"campaña {camp_left} P): no se contacta para no hacer perder el tiempo")
+            if slots <= 0 and not blockers:
+                blockers.append(f"sin capacidad: máximo {cfg.max_conversations} negociaciones de campaña a la vez "
+                                "(contando las abiertas en este ciclo)")
+            if not blockers:
+                slots -= 1
+                busy_refs |= {o.get("receive"), o.get("deliver")}
+            out.append({"type": "team_open", "module": "campaña", "kind": f"{o['kind']} con {o['team']}",
+                        "team": o["team"], "ref": o.get("receive") or o.get("deliver"), "price": o["anchor"],
+                        "du": o["du_est"], "score": 10 ** 3 + o["score"], "blockers": blockers, "opp": o,
+                        "reason": "; ".join(o["notes"]) + f" · reserva privada {o['reserve']} P (no se revela) · "
+                                  f"cercanía reserva/precio {o['fit']} · prob. de respuesta {cfg.contact_prior:.0%} = "
+                                  "SUPUESTO"})
+    if not pl["valuation_verified"]:
+        for c in out:
+            c["blockers"] = list(c.get("blockers") or []) + ["valoración no verificada contra collection_value"]
+    st = camp["stats"]
+    lines.append(f"CAMPAÑA {camp['id']} ({','.join(camp['kinds'])}) ticks {camp['start_tick']}-{camp['end_tick']} · "
+                 f"presupuesto {camp['budget']} P (gastado {camp['spent']}, comprometido {committed}) · contactos "
+                 f"{st['contacts']} · respuestas {st['replies']} · propuestas {st['proposals']} · aceptadas "
+                 f"{st['accepted']} · liquidadas {st['settled']} · cartas {st['cards_in']} · duplicados vendidos "
+                 f"{st['dups_sold']} · cobrado {camp['received']} P" + ("" if execute else " · (vista previa)"))
+    return out, lines
+
+
+def _cards_of(c):
+    """Cartas que una candidata adquiere o entrega (para no perseguir la misma por dos vías)."""
+    if c["type"] in ("cancel", "team_cancel", "team_close", "dealer_close", "info"):
+        return set()
+    out = set(c.get("receive") or {}) | set(c.get("deliver") or {})
+    o = c.get("opp") or {}
+    out |= {o.get("receive"), o.get("deliver")} - {None}
+    if c["type"] in ("bid", "list", "dealer_open", "swap_list") and c.get("ref"):
+        out.add(c["ref"].split(":")[-1])
+    if c.get("give_ref"):
+        out.add(c["give_ref"])
+    return out
+
+
+def select(cands, led, tick, max_posts=1):
+    """Como mucho una acción por clase de límite y tick (publicar: hasta `max_posts`, acotado por el servidor);
+    dentro de cada clase, la de mayor puntuación."""
+    chosen, used, posts = [], set(), 0
+    done = led.get("class_count", {})
     for c in sorted((c for c in cands if not c.get("blockers") and c["type"] in CLASSES),
                     key=lambda c: -c.get("score", 0)):
         cls = CLASSES[c["type"]]
-        if cls in used or led["class_tick"].get(cls) == tick:
+        if cls == "mensaje":  # el límite es un mensaje por conversación y tick
+            cls = f"mensaje:{c.get('thread')}"
+        if cls == "publicar":
+            prev = done.get(cls, [None, 0])
+            if posts + (prev[1] if prev[0] == tick else 0) >= max_posts:
+                continue
+        elif cls in used or led["class_tick"].get(cls) == tick:
             continue
+        if c.get("thread") and any(x.get("thread") == c["thread"] for x in chosen):
+            continue  # una sola acción por conversación y tick
+        if _cards_of(c) & set().union(*(_cards_of(x) for x in chosen)) if chosen else False:
+            continue  # la misma carta no se persigue por dos vías en el mismo tick
         chosen.append(c)
         used.add(cls)
+        posts += cls == "publicar"
     return chosen
 
 
@@ -275,22 +463,38 @@ def send(reader, led, s, c, args, journal):
            "dealer": c.get("dealer"), "item": c.get("item"), "opening": c.get("opening"), "ceiling": c.get("ceiling"),
            "reason": c.get("reason") or "; ".join(c.get("notes") or c.get("why") or []), "before": metrics(s),
            "version": VERSION}
-    if c["type"] == "accept":
-        o = next((x for x in s["board"].get("offers", []) + s["offers"].get("offers", []) if x.get("id") == c["offer"]), {})
+    if c.get("neg") and c["neg"] in led["negotiations"]:
+        led["negotiations"][c["neg"]]["prev_state"] = led["negotiations"][c["neg"]]["state"]
+    if c["type"] in ("accept", "team_accept"):
+        pool = s["board"].get("offers", []) + s["offers"].get("offers", []) + \
+            [o for t in s["threads"]["open"] for o in t.get("standing_offers") or []]
+        o = next((x for x in pool if x.get("id") == c["offer"]), {})
         rec["receive_assets"] = [x["id"] for x in (o.get("give") or {}).get("assets") or [] if isinstance(x, dict)]
+    rec["venue"] = c.get("venue") or ("rastro" if c["type"] in ("list", "bid", "accept") else None)
+    rec["to"] = c.get("to")
     led["actions"].append(rec)
-    led["class_tick"][CLASSES[c["type"]]] = tick
+    cls = CLASSES[c["type"]]
+    led["class_tick"][cls] = tick
+    cc = led.setdefault("class_count", {}).get(cls, [None, 0])
+    led["class_count"][cls] = [tick, (cc[1] if cc[0] == tick else 0) + 1]
     save(led)  # antes de escribir en red
     ratio, basis = tr.expiry_ratio(led["expiry_obs"] + EXPIRY_EVIDENCE, s["clock"].get("tick_seconds") or 60.0)
     try:
         if c["type"] == "accept":
             resp = reader.api.accept(c["offer"], assets=c.get("assets") or None)
-        elif c["type"] in ("list", "bid"):
-            req = tr.listing_request(args.listing_ticks, ratio)
-            rec["requested_ticks"], rec["expiry_basis"] = req, basis
-            give, want = ({"assets": [c["asset"]]}, {"cash": c["price"]}) if c["type"] == "list" else \
-                ({"cash": c["price"]}, {"cards": [c["ref"]]})
-            resp = reader.api.list_offer(give, want, venue="rastro", expires_in_ticks=req)
+        elif c["type"] in ("list", "bid", "swap_list"):
+            req = c.get("expires_in") or tr.listing_request(args.listing_ticks, ratio)
+            rec["requested_ticks"] = req
+            rec["expiry_basis"] = "recomendación del venue (configurable)" if c.get("expires_in") and \
+                c.get("venue") == getattr(args, "duende_venue", "v02") else basis
+            if c["type"] == "list":
+                give, want = {"assets": [c["asset"]]}, {"cash": c["price"]}
+            elif c["type"] == "swap_list":
+                give, want = {"assets": [c["asset"]]}, {"cards": [c["ref"]]}
+            else:
+                give, want = {"cash": c["price"]}, {"cards": [c["ref"]]}
+            resp = reader.api.list_offer(give, want, venue=c.get("venue") or "rastro", to=c.get("to"),
+                                         expires_in_ticks=req)
             if resp.get("expires_tick") and resp.get("created_tick") is not None:
                 eff = resp["expires_tick"] - resp["created_tick"]
                 rec["effective_ticks"] = eff
@@ -310,6 +514,36 @@ def send(reader, led, s, c, args, journal):
                                         "mode": f"coord-{args.mode}"})
         elif c["type"] == "dealer_close":
             resp = reader.api.close_thread(c["thread"])
+        elif c["type"] == "team_open":
+            neg = cp.new_negotiation(c["opp"], tick, campaign_cfg(args))
+            neg["state"] = "ambigua"  # hasta saber si la conversación se abrió
+            led["negotiations"][neg["id"]] = neg
+            save(led)
+            topic = {"campaign": neg["kind"], "card": neg.get("receive") or neg.get("deliver")}
+            resp = reader.api.open_thread(c["team"], topic=topic, venue="rastro")
+            neg.update(thread=resp.get("id"), state="contactada", last_tick=tick)
+            rec["thread"] = resp.get("id")
+            led["campaign"]["stats"]["contacts"] += 1
+        elif c["type"] == "team_propose":
+            neg = led["negotiations"][c["neg"]]
+            assert cp.text_matches(c["offer"], c["text"]), "el texto no coincide con la estructura"
+            neg["state"] = "ambigua"
+            save(led)
+            resp = reader.api.say(c["thread"], c["text"], offer=c["offer"])
+            g, w = c["offer"]["give"], c["offer"]["want"]
+            neg["last_price"] = int(g.get("cash") or 0) if neg["kind"] != "sell" else int(w.get("cash") or 0)
+            neg["proposals"].append({"tick": tick, "offer": c["offer"], "text": c["text"]})
+            neg.update(state="propuesta", last_tick=tick)
+            led["campaign"]["stats"]["proposals"] += 1
+        elif c["type"] == "team_accept":
+            resp = reader.api.accept(c["offer"], assets=c.get("assets") or None)
+            led["negotiations"][c["neg"]]["state"] = "aceptada"
+            led["campaign"]["stats"]["accepted"] += 1
+        elif c["type"] == "team_cancel":
+            resp = reader.api.cancel(c["offer"])
+        elif c["type"] == "team_close":
+            resp = reader.api.close_thread(c["thread"])
+            led["negotiations"][c["neg"]]["state"] = "abandonada"
         else:  # dealer_open
             kind, ref = c["ref"].split(":", 1)
             resp = reader.api.open_thread(c["dealer"], topic={"buy": {kind: ref}})
@@ -318,13 +552,18 @@ def send(reader, led, s, c, args, journal):
     except BazaarError as e:
         rec["status"] = "rejected" if 400 <= e.status < 500 else "ambiguous"
         rec["error"] = f"{e.code}: {e.message}"
+        if c.get("neg") and c["neg"] in led["negotiations"]:
+            n = led["negotiations"][c["neg"]]
+            n["state"] = "ambigua" if rec["status"] == "ambiguous" else ("abandonada" if c["type"] == "team_open"
+                                                                         else n.get("prev_state", "contactada"))
         if e.code in QUOTA and c.get("dealer"):
             led["blocked"][c["dealer"]] = e.extra.get("until_tick") or tick + 20
         save(led)
         print(f"   RECHAZADA  {describe(c)} · {rec['error']}" if rec["status"] == "rejected" else
               f"   AMBIGUA    {describe(c)} · {rec['error']} · no se reenvía hasta reconciliar")
         return rec
-    rec.update(status="submitted" if c["type"] not in ("dealer_open", "dealer_close") else "settled",
+    rec.update(status="submitted" if c["type"] not in ("dealer_open", "dealer_close", "team_open", "team_close",
+                                                       "team_propose") else "settled",
                response={k: resp.get(k) for k in ("id", "status", "queued", "offer", "created_tick", "expires_tick",
                                                    "settles_at_tick") if k in resp},
                offer_id=resp.get("id") if c["type"] in ("list", "bid") else c.get("offer"))
@@ -367,6 +606,8 @@ def cycle(reader, args, led, journal, execute):
               f"tick {a.get('settled_tick', tick)}")
         print(f"   RESULTADO OBSERVADO {observed(a, s, flags)}")
     cands, pl, exposure = candidates(s, led, args, journal)
+    camp_cands, camp_lines = campaign_candidates(s, led, args, pl, execute)
+    cands += camp_cands
     m = metrics(s)
     print(f"\n[{VERSION} · tick {tick} · ronda {m['round']}] efectivo {m['cash']} P · libre {pl['free_cash']} P · "
           f"reservado en ofertas {pl['reserved_cash']} P · pendiente {pl['pending_cash'] - exposure} P · expuesto con "
@@ -375,6 +616,8 @@ def cycle(reader, args, led, journal, execute):
           f"{pl['model_value']}/{pl['server_value']} {'OK' if pl['valuation_verified'] else 'NO VERIFICADO'}")
     if flags:
         print("   AVISO actividad no registrada por este ordenador: " + "; ".join(flags))
+    for line in camp_lines:
+        print(f"   {line}")
     shown = sorted(cands, key=lambda c: (bool(c.get("blockers")), -c.get("score", 0)))
     for c in shown[:args.show]:
         tag = "CANDIDATA " if not c.get("blockers") else "descartada"
@@ -382,9 +625,17 @@ def cycle(reader, args, led, journal, execute):
               + (f" · BLOQUEO: {'; '.join(c['blockers'])}" if c.get("blockers") else ""))
     if len(shown) > args.show:
         print(f"   … {len(shown) - args.show} más en data/coordinator_report.json")
-    ma.save(DATA / "coordinator_report.json", {"tick": tick, "metrics": m, "plan": pl, "candidates": cands,
+    pl_json = {k: v for k, v in pl.items() if k != "states"}
+    if pl.get("states") is not None:
+        pl_json["states"] = {r: st.short() for r, st in pl["states"].items() if st.bids or st.asks or st.copies != 1}
+    ma.save(DATA / "coordinator_report.json", {"tick": tick, "metrics": m, "plan": pl_json, "candidates": cands,
                                                "flags": flags})
-    chosen = select(cands, led, tick)
+    if pl.get("states") is not None and getattr(args, "intel", 0):
+        print(mi.intel_report(pl, limit=args.intel))
+    max_posts = min(getattr(args, "max_posts", 1), s["clock"].get("limits", {}).get("offers_per_team_per_tick", 1))
+    chosen = select(cands, led, tick, max_posts)
+    for c in cands:
+        c.pop("opp", None) if c.get("type") != "team_open" else None
     if ambiguous:
         print(f"   BLOQUEADO: {len(ambiguous)} escritura(s) ambigua(s) sin reconciliar; no se envía nada")
         return 0
@@ -427,6 +678,20 @@ def main():
     p.add_argument("--cancel-unsafe", action="store_true", help="cancelar publicaciones propias que violan la política")
     p.add_argument("--allow-concurrent", action="store_true", help="operar aunque haya actividad no registrada")
     p.add_argument("--show", type=int, default=12, help="candidatas a mostrar por tick")
+    p.add_argument("--engine", choices=["intel", "basic"], default="intel",
+                   help="intel: inteligencia de mercado multi-venue (Day 2); basic: solo El Rastro (anterior)")
+    p.add_argument("--duende-venue", default="v02", help="venue de El Duende")
+    p.add_argument("--duende-expiry", type=int, default=120, help="expires_in_ticks en El Duende (recomendación oficial)")
+    p.add_argument("--max-posts", type=int, default=4, help="publicaciones/cancelaciones por tick (≤ límite del servidor)")
+    p.add_argument("--intel", type=int, default=6, help="cartas a detallar en el informe de inteligencia (0 = ninguno)")
+    p.add_argument("--history-window", type=int, default=240, help="ventana del historial de mercado en ticks")
+    p.add_argument("--campaign", choices=["none", "all", "collect", "sell", "swap"], default="none",
+                   help="campaña de negociación directa con equipos: abre conversaciones, envía propuestas y acepta")
+    p.add_argument("--campaign-ticks", type=int, default=30, help="duración de la campaña en ticks")
+    p.add_argument("--campaign-budget", type=int, default=60, help="efectivo máximo de la campaña (P)")
+    p.add_argument("--max-proposals", type=int, default=3, help="propuestas nuestras por conversación")
+    p.add_argument("--negotiation-ticks", type=int, default=6, help="ticks máximos por negociación")
+    p.add_argument("--max-conversations", type=int, default=2, help="negociaciones de campaña activas a la vez")
     args = p.parse_args()
     if not 1 <= args.ticks <= 120:
         p.error("--ticks entre 1 y 120")

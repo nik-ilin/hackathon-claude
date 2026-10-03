@@ -453,7 +453,7 @@ def reconcile_v2(led, s, sets):
             ids_in, ids_out = {i[2] for i in x["in"]}, {i[2] for i in x["out"]}
             refs_in = [i[1] for i in x["in"]]
             if (set(a.get("assets") or []) & ids_out or set(a.get("receive_assets") or []) & ids_in
-                    or (a["type"] == "list" and a.get("asset") in ids_out)
+                    or (a["type"] in ("list", "swap_list") and a.get("asset") in ids_out)
                     or (a["type"] == "bid" and a.get("ref") in refs_in and x["price"] == a.get("price"))):
                 hit = x
                 break
@@ -464,13 +464,13 @@ def reconcile_v2(led, s, sets):
             elif hit["cash_direction"] == "cobramos":
                 led["cash_received"] += hit["price"] - (hit["fee"] if a["type"] == "accept" else 0)
             continue
-        if a["type"] in ("list", "bid"):
+        if a["type"] in ("list", "bid", "swap_list"):
             if a.get("offer_id") in mine_open:
                 a["status"] = "submitted"
                 continue
             if a["status"] != "submitted":  # respuesta perdida: ¿se publicó?
                 twin = next((o for o in mine_open.values() if o.get("created_tick", 0) >= a["tick"] and
-                             ((a["type"] == "list" and any((x.get("id") if isinstance(x, dict) else x) == a.get("asset")
+                             ((a["type"] in ("list", "swap_list") and any((x.get("id") if isinstance(x, dict) else x) == a.get("asset")
                                                            for x in o["give"].get("assets") or [])) or
                               (a["type"] == "bid" and f"card:{a.get('ref')}" in (o["want"].get("types") or [])))), None)
                 if twin:

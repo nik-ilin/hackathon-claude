@@ -20,7 +20,8 @@ U = 13.0
 
 def args(**kw):
     base = dict(mode="score", max_spend=80, reserve=100, per_card=60, margin=2.0, listing_ticks=10, fill_prior=0.3,
-                allow_last_copy="", cancel_unsafe=False, allow_concurrent=False, show=0)
+                allow_last_copy="", cancel_unsafe=False, allow_concurrent=False, show=0, campaign="none",
+                campaign_ticks=30, campaign_budget=60, max_proposals=3, negotiation_ticks=6, max_conversations=2)
     base.update(kw)
     return Namespace(**base)
 
@@ -166,7 +167,7 @@ class FakeAPI:
         self.calls.append(("accept", oid))
         return {"queued": True, "offer": oid}
 
-    def list_offer(self, give, want, venue=None, expires_in_ticks=None):
+    def list_offer(self, give, want, venue=None, expires_in_ticks=None, to=None):
         self.calls.append(("list", expires_in_ticks))
         return {"id": 900, "status": "open", "created_tick": 50, "expires_tick": 50 + expires_in_ticks // 4}
 

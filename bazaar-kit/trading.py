@@ -294,7 +294,11 @@ def plan(snap: dict, cfg: Config, *, pendings: list = (), spent: int = 0) -> dic
     team = me["id"]
     val = Valuation(catalog, me.get("affinity") or {})
     counts = counts_of(me["assets"])
-    ok, model = val.calibrate(counts, me.get("collection_value"))
+    # collection_value incluye activos que no son cartas (sobres sin abrir) con su your_value (verificado, tick 158)
+    other = round(sum(float(a.get("your_value") or 0) for a in me["assets"] if a.get("kind") != "card"), 2)
+    server = me.get("collection_value")
+    ok, model = val.calibrate(counts, None if server is None else float(server) - other)
+    model = round(model + other, 2)
     venue = next((v for v in (snap.get("venues") or {}).get("venues", []) if v.get("venue") == "rastro"), None)
     own_venue = (me.get("venue") or {}).get("venue") if isinstance(me.get("venue"), dict) else me.get("venue")
     my_offers = (snap.get("offers") or {}).get("offers", [])

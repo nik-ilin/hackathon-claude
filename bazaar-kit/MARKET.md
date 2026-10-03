@@ -74,3 +74,20 @@ Las pruebas usan escenarios locales. El dry-run valida lecturas y cálculos con 
 - la puntuación, con aviso de retraso del leaderboard y de operaciones de otros clientes.
 
 El excedente no es una conversión a puntos.
+
+## Day 2 (coordinador con `--engine intel`)
+
+El mercado entre equipos ya lo opera el **coordinador** (`./run.sh coord`) con la inteligencia multi-venue de `market_intel.py`. `market_agent.py` sigue funcionando por sí solo para El Rastro, pero no debe ejecutarse a la vez que el coordinador (comparten bloqueo).
+
+```bash
+./run.sh coord --intel 8 --show 20                                   # análisis Day 2, solo lecturas
+./run.sh coord --execute --ticks 120 --max-posts 4 --max-spend 200 --reserve 100 --per-card 60 --margin 2
+python3 sim_day2.py                                                  # simulación local de los casos de Day 2
+```
+
+Novedades:
+- Lee el libro de **todos** los venues abiertos y las ofertas dirigidas a nosotros.
+- Elige el venue por coste total del comprador o neto del vendedor, con las comisiones leídas de la API.
+- Publica en El Duende (v02) con 120 ticks, rebaja sin bajar del suelo y para las guerras de precios.
+- Repuja en escalera, publica trueques sin efectivo y pujas dirigidas con evidencia, y reprecia sus propias ofertas.
+- Detalles completos en ARCHITECTURE.md → «DAY 2 STRATEGY».
