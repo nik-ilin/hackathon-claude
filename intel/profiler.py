@@ -159,6 +159,9 @@ def team_profiles(q, hs, dealer_prof):
         for v in json.loads(payload):
             venues.setdefault(v.get("owner"), []).append(v)
 
+    # score deltas are only comparable inside a round: measure since the current round started
+    rs = q("SELECT max(tick) FROM events WHERE type='round.started'")
+    round_tick = rs[0][0] if rs and rs[0][0] is not None else 0
     prof = {}
     for team in set(teams) | set(lb):
         if not team or team in DEALERS or team.startswith("m"):     # skip dealers and pseudonyms
@@ -166,7 +169,7 @@ def team_profiles(q, hs, dealer_prof):
         t = teams[team]
         traj = lb.get(team, [])
         cur = traj[-1] if traj else {}
-        hour_ago = next((x for x in traj if x["ts"] >= time.time() - 3600), cur)
+        hour_ago = next((x for x in traj if x["tick"] is not None and x["tick"] >= round_tick), cur)
         interest = collections.Counter()
         for s, r, u, rel, v in t["bought"]:
             interest[s] += 1
@@ -228,7 +231,7 @@ def render(dealer_prof, team_prof, rmed, recs, q):
     if clock:
         L.append(f"Ronda: {json.loads(clock[0][0]).get('round_name')}")
     L += ["", "## Clasificación y perfil de equipos", "",
-          "| # | Equipo | Score | Δ1h | Neg | MM | Nivel | Álbum | Dealer: tratos/hilos | Captura rango | Apertura vs dealer | Paso | P2P compra/venta | Compra vs mercado | Venta vs mercado | Le interesa | Le sobra | Mercado propio |",
+          "| # | Equipo | Score | Δronda | Neg | MM | Nivel | Álbum | Dealer: tratos/hilos | Captura rango | Apertura vs dealer | Paso | P2P compra/venta | Compra vs mercado | Venta vs mercado | Le interesa | Le sobra | Mercado propio |",
           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for team, p in sorted(team_prof.items(), key=lambda kv: kv[1]["rank"] or 99):
         L.append(f"| {p['rank']} | {p['name'] or team} ({team}) | {p['score']} | {p['score_delta_1h']} | {p['neg']} | {p['mkt']} | "
