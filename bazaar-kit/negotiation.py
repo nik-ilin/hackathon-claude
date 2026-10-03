@@ -99,12 +99,28 @@ class NegState:
 
 
 def item_of(topic: Optional[dict]) -> Optional[str]:
-    buy = (topic or {}).get("buy") or {}
+    """Identifica el artículo de una conversación. Los topics de VENTA ({"sell": {"assets": [...]}}) devuelven
+    "sell:<id>,<id>"; antes devolvían None y el hilo se descartaba entero, así que no había canal de venta a
+    vendedores: justo el que llena la escalera."""
+    t = topic or {}
+    buy = t.get("buy") or {}
     if "card" in buy:
         return f"card:{buy['card']}"
     if "pack" in buy:
         return f"pack:{buy['pack']}"
+    sell = t.get("sell") or {}
+    assets = sell.get("assets") or []
+    if assets:
+        return "sell:" + ",".join(str(a) for a in assets)
     return None
+
+
+def is_sell(item: Optional[str]) -> bool:
+    return bool(item) and item.startswith("sell:")
+
+
+def sell_assets(item: Optional[str]) -> list:
+    return [int(x) for x in item[5:].split(",") if x] if is_sell(item) else []
 
 
 def sell_assets_of(topic: Optional[dict]) -> list:
@@ -415,30 +431,113 @@ class DealerPolicy:
     accept_gap: int = 1
     min_viable_frac: float = 0.8     # si nuestro máximo < 80 % de su precio, mejor otro artículo
     secure: bool = False             # SECURE: cerrar un trato negociado válido en cuanto exista (ver ladder_mode)
+    sell_open_mult: float = 2.0      # VENTA: primera petición = múltiplo de su primera puja
+    sell_gap_frac: float = 0.35      # VENTA: cada concesión nuestra cierra esta fracción de la brecha, bajando
+
+
+# Rasgos leídos de /api/dealers el 2026-10-03 (patience / shrewdness / memory). La paciencia manda en cuántas
+# rondas aguanta antes de romper el hilo; la memoria, en si romperlo es recuperable.
+#   abuela  0.85 / 0.20 / 0.15   paciente y poco astuta  -> aguanta, se le puede abrir lejos
+#   chato   0.35 / 0.85 / 0.30   impaciente y astuto     -> pocas rondas, pasos grandes
+#   pilar   0.60 / 0.75 / 0.15   recíproca (cede 1:1 en 20 observaciones del feed)
+#   picaros 0.40 / 0.70 / 0.30   impaciente; ofertas con truco -> validar siempre los assets
+DEALER_TRAITS = {
+    "abuela":  dict(open_frac=0.45, gap_frac=0.30, max_counteroffers=3, max_ticks=8,
+                    sell_open_mult=2.4, sell_gap_frac=0.25),
+    "chato":   dict(open_frac=0.55, gap_frac=0.40, max_counteroffers=2, max_ticks=5,
+                    sell_open_mult=1.8, sell_gap_frac=0.40),
+    "pilar":   dict(open_frac=0.50, gap_frac=0.35, max_counteroffers=3, max_ticks=6,
+                    sell_open_mult=2.2, sell_gap_frac=0.30),
+    "picaros": dict(open_frac=0.50, gap_frac=0.40, max_counteroffers=2, max_ticks=5,
+                    sell_open_mult=2.0, sell_gap_frac=0.35),
+}
 
 
 def dealer_policy(dealer: str, mode: str = "score") -> DealerPolicy:
-    """abuela: paciente y generosa -> concesiones significativas, varias rondas, sin pasos de 1 P.
-    chato: impaciente, estricto y con memoria -> apertura cercana a su precio y una sola contraoferta.
-    Desconocido: la versión prudente del Chato."""
-    allow = mode != "score"
-    if dealer == "abuela":
-        return DealerPolicy("abuela", 0.65, 0.40, 3, 8, accept_on_concession=not (mode == "score"),
-                            allow_opening_price=allow)
-    if dealer == "chato":
-        return chato_policy(mode)
-    return DealerPolicy(dealer, 0.90, 0.50, 1, 4, accept_on_concession=True, allow_opening_price=allow)
+    """Una política por vendedor, derivada de sus rasgos publicados.
 
+    La versión anterior tenía la asignación INVERTIDA: daba la política paciente a la abuela (que ya es la blanda)
+    y metía a chato, pilar y picaros en un fallback de `open_frac=0.90` con UNA sola contraoferta. Abrir al 90 % de
+    su precio captura ~10 % del rango, y la escalera paga precisamente cuota de rango capturada: de ahí los 0.356
+    puntos de negociación por trato de t15 frente a los 0.939 de t01 (leaderboard tick 820).
 
-def chato_policy(mode: str = "score") -> DealerPolicy:
-    """Política específica para Chato: negociación corta y precio siempre rentable.
-
-    El máximo económico se calcula fuera, en coordinator.py, con el valor marginal privado,
-    margen mínimo, presupuesto por carta y reserva de efectivo. En modo score no se acepta
-    el precio de apertura, para que el cierre quede por debajo de su ancla.
+    `accept_on_concession` se mantiene en False en modo score para todos: aceptar la primera rebaja cierra el trato
+    en la parte baja del rango y gasta una de las 3 casillas que puntúan en ese nivel.
     """
-    return DealerPolicy("chato", 0.90, 0.50, 1, 4, accept_on_concession=True,
-                        allow_opening_price=mode != "score")
+    allow = mode != "score"
+    t = DEALER_TRAITS.get(dealer)
+    if t is None:  # vendedor nuevo: prudente, pero nunca a precio de apertura
+        t = dict(open_frac=0.55, gap_frac=0.40, max_counteroffers=2, max_ticks=5,
+                 sell_open_mult=1.9, sell_gap_frac=0.35)
+    return DealerPolicy(dealer, t["open_frac"], t["gap_frac"], t["max_counteroffers"], t["max_ticks"],
+                        accept_on_concession=mode != "score", allow_opening_price=allow,
+                        sell_open_mult=t["sell_open_mult"], sell_gap_frac=t["sell_gap_frac"])
+
+
+def price_floor(value_lost: float, margin: float = 0.0) -> int:
+    """VENTA: precio mínimo aceptable = valor privado que entregamos + margen, redondeado arriba.
+
+    `value_lost` sale de Valuation.delta(counts, add=0, remove={ref: 1}) en valor absoluto, así que ya incluye el
+    bono de página que se rompería. Un suelo por encima del bono es lo que impide vender una carta de una página
+    completa sin querer."""
+    return int(math.ceil(abs(value_lost) + margin))
+
+
+def decide_dealer_sell(st: NegState, pol: DealerPolicy, floor: int, conv_ticks_left: int,
+                       total_ticks_left: int = 10 ** 9) -> Decision:
+    """Lado VENDEDOR: su precio es una PUJA, así que queremos el máximo y concedemos bajando.
+
+    Simétrico a decide_dealer: nunca por debajo del suelo, nunca repite ni sube una petición ya hecha, y en modo
+    score nunca cierra a su puja de apertura (su apertura es su puja más BAJA: aceptarla captura rango ~0)."""
+    live, n = st.live, st.turns
+
+    def valid(price: int) -> bool:
+        return price >= floor and (pol.allow_opening_price or st.opening is None or price > st.opening)
+
+    def take(why: str) -> Decision:
+        note = f" ({OPENING_NOTE})" if st.opening is not None and live.price <= st.opening else ""
+        return Decision("accept", why + note, live.price, live.offer_id)
+
+    if live and live.final:
+        return take(f"puja final de {live.price} P aceptable (suelo {floor} P)") if valid(live.price) else \
+            Decision("abandon", f"puja final de {live.price} P por debajo del suelo {floor} P "
+                                f"(apertura {st.opening} P)")
+    if st.current is None:
+        return Decision("wait" if conv_ticks_left > 0 else "abandon", "aún no ha pujado")
+    if st.awaiting_reply:
+        return Decision("wait", "esperando su respuesta")
+    out_of_time = conv_ticks_left <= 0 or total_ticks_left <= 0
+    last = st.rounds[-1] if st.rounds else None
+    conceded = bool(last and last.reply is not None and last.before is not None and last.reply > last.before)
+    if live and valid(live.price):
+        if pol.accept_on_concession and conceded:
+            return take(f"ha subido de {last.before} P a {last.reply} P")
+        if st.last_ours is not None and st.last_ours - live.price <= pol.accept_gap:
+            return take(f"brecha de {st.last_ours - live.price} P")
+        if n >= pol.max_counteroffers or out_of_time:
+            return take(("contraofertas agotadas" if n >= pol.max_counteroffers else "plazo agotado")
+                        + f": {live.price} P por encima del suelo {floor} P")
+    if out_of_time:
+        return Decision("abandon", f"plazo agotado y su puja no supera el suelo de {floor} P")
+    if n >= pol.max_counteroffers:
+        return Decision("abandon", f"{n} contraofertas hechas y su puja ({st.ref_ask} P) sigue bajo el suelo "
+                                   f"de {floor} P")
+    bid = st.ref_ask
+    lo = max(floor, bid + 1)  # pedir su puja o menos no tiene sentido: entonces se acepta
+    if n == 0:
+        p = max(int(pol.sell_open_mult * bid + 0.5), lo)
+        return Decision("counter", f"primera petición: {pol.sell_open_mult:.1f}x su puja de {bid} P, "
+                                   f"con suelo {floor} P", p)
+    p = max(st.last_ours - math.ceil(pol.sell_gap_frac * (st.last_ours - bid)), lo)
+    if p >= st.last_ours:
+        p = st.last_ours - 1
+    if p < lo:
+        if live and valid(live.price):
+            return take(f"no queda petición nueva por encima del suelo; {live.price} P es válido")
+        return Decision("abandon", f"no queda petición entre {bid} P y nuestra última de {st.last_ours} P "
+                                   f"sin bajar del suelo {floor} P")
+    return Decision("counter", f"mantiene {bid} P: cerramos el {pol.sell_gap_frac:.0%} de la brecha bajando, "
+                               f"con suelo {floor} P", p)
 
 
 def decide_dealer(st: NegState, pol: DealerPolicy, ceiling: int, conv_ticks_left: int,

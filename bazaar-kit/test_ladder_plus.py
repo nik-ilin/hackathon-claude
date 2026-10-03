@@ -441,7 +441,7 @@ class LadderFill(unittest.TestCase):
         s["clock"]["tick"] = 41
         price = lambda **kw: next(c for c in cands(s, led0(threads=[7]), **kw)[0]
                                   if c["type"] == "dealer_counter")["price"]
-        self.assertEqual(price(), 8, "por defecto: 65 % de 12")
+        self.assertEqual(price(), 5, "por defecto (política corregida de dealer_policy, PR #24): 45 % de 12")
         self.assertEqual(price(dealer_ladder=True), 7, "#8: 60 % de 12")
         self.assertEqual(price(ladder_fill=True), 6, "ESTRATEGIA_TOP3: abrir 5-7")
 

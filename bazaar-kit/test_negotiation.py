@@ -491,5 +491,85 @@ class FirstPurchaseAgent(unittest.TestCase):
         self.assertEqual(fake.assets[0]["ref"], "LAT-09")
 
 
+class DealerSellTest(unittest.TestCase):
+    """Lado VENDEDOR: el canal que llena la escalera y que antes no existía (item_of devolvía None)."""
+
+    @staticmethod
+    def state(opening, current=None, ours=None, live=True, final=False, reply=None):
+        st = neg.NegState(item="sell:7")
+        st.opening = opening
+        price = current if current is not None else opening
+        st.current = neg.Ask(price=price, offer_id=99, final=final, live=live, tick=1)
+        if ours is not None:
+            st.rounds.append(neg.Round(ours=ours, before=opening, tick=1,
+                                       reply=price if reply is None else reply))
+        return st
+
+    def test_item_of_reconoce_topic_de_venta(self):
+        self.assertEqual(neg.item_of({"sell": {"assets": [7, 8]}}), "sell:7,8")
+        self.assertTrue(neg.is_sell("sell:7,8"))
+        self.assertEqual(neg.sell_assets("sell:7,8"), [7, 8])
+        self.assertFalse(neg.is_sell("card:SAL-08"))
+        self.assertEqual(neg.item_of({"buy": {"card": "SAL-08"}}), "card:SAL-08")
+
+    def test_ningun_vendedor_abre_al_90_por_ciento(self):
+        # el fallback anterior metía a chato, pilar y picaros en open_frac=0.90 con UNA contraoferta
+        for d in ("chato", "pilar", "picaros", "desconocido"):
+            with self.subTest(dealer=d):
+                pol = neg.dealer_policy(d)
+                self.assertLessEqual(pol.open_frac, 0.60)
+                self.assertGreaterEqual(pol.max_counteroffers, 2)
+
+    def test_las_rondas_siguen_a_la_paciencia_publicada(self):
+        self.assertEqual(neg.dealer_policy("abuela").max_ticks, 8)   # patience 0.85: aguanta
+        self.assertEqual(neg.dealer_policy("chato").max_ticks, 5)    # patience 0.35: rompe el hilo
+
+    def test_modo_score_no_acepta_la_primera_rebaja_ni_la_apertura(self):
+        for d in ("abuela", "chato", "pilar", "picaros"):
+            with self.subTest(dealer=d):
+                pol = neg.dealer_policy(d, "score")
+                self.assertFalse(pol.accept_on_concession)
+                self.assertFalse(pol.allow_opening_price)
+        self.assertTrue(neg.dealer_policy("abuela", "acquire").accept_on_concession)
+
+    def test_price_floor_incluye_el_bono_de_pagina(self):
+        self.assertEqual(neg.price_floor(-12.5, 2.0), 15)   # SAL-08: 12.5 P privados + margen
+        self.assertEqual(neg.price_floor(-110.0), 110)      # común de página completa: suelo inalcanzable
+
+    def test_primera_peticion_es_multiplo_de_su_puja(self):
+        d = neg.decide_dealer_sell(self.state(opening=10), neg.dealer_policy("pilar"), 13, 6)
+        self.assertEqual((d.action, d.price), ("counter", 22))   # 2.2x de 10
+
+    def test_nunca_cierra_a_su_puja_de_apertura(self):
+        st = self.state(opening=20, current=20, ours=44, reply=20)
+        d = neg.decide_dealer_sell(st, neg.dealer_policy("pilar"), 13, 6)
+        self.assertNotEqual(d.action, "accept")   # 20 == apertura -> rango capturado 0
+
+    def test_acepta_por_encima_de_la_apertura_y_del_suelo(self):
+        st = self.state(opening=20, current=25, ours=26)
+        d = neg.decide_dealer_sell(st, neg.dealer_policy("pilar"), 15, 6)
+        self.assertEqual((d.action, d.price), ("accept", 25))   # brecha 1 <= accept_gap
+
+    def test_abandona_si_su_puja_no_llega_al_suelo(self):
+        st = self.state(opening=5, current=5, ours=6)
+        st.rounds.append(neg.Round(ours=6, before=5, tick=2, reply=5))
+        st.rounds.append(neg.Round(ours=6, before=5, tick=3, reply=5))
+        self.assertEqual(neg.decide_dealer_sell(st, neg.dealer_policy("chato"), 110, 5).action, "abandon")
+
+    def test_concede_bajando_y_nunca_sube_su_peticion(self):
+        st = self.state(opening=10, current=12, ours=24)
+        d = neg.decide_dealer_sell(st, neg.dealer_policy("abuela"), 13, 8)
+        self.assertEqual(d.action, "counter")
+        self.assertTrue(13 <= d.price < 24, d.price)
+
+    def test_puja_final_por_debajo_del_suelo_se_abandona(self):
+        st = self.state(opening=4, current=4, final=True)
+        self.assertEqual(neg.decide_dealer_sell(st, neg.dealer_policy("picaros"), 13, 5).action, "abandon")
+
+    def test_espera_si_aun_no_ha_pujado(self):
+        st = neg.NegState(item="sell:7")
+        self.assertEqual(neg.decide_dealer_sell(st, neg.dealer_policy("pilar"), 13, 6).action, "wait")
+
+
 if __name__ == "__main__":
     unittest.main()

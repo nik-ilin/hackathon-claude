@@ -562,6 +562,50 @@ def candidates(s, led, args, journal):
                             "notes": [f"valor {value:.1f} P (con bono si completa página)",
                                       "precio real desconocido hasta su primera oferta",
                                       f"escalera {n_q}/{neg.LADDER_SLOTS}: cuenta solo si cerramos por debajo de su apertura"]})
+        # 4b. --dealer-sell-menu (opt-in): abrir una VENTA de un excedente que ellos compran según su propio menú.
+        # Es el canal que llena la escalera (paga cuota del rango capturado, no valor privado) y el único que no
+        # necesita capital. Sin el flag no cambia nada (evita competir con --dealer-sell-dups/--pilar-sell/
+        # --ladder-calibrated, que ya cubren la venta de duplicados con su propia calibración).
+        for row in (dealer.get("menu") or {}).get("buys", []) if getattr(args, "dealer_sell_menu", False) else ():
+            rarity = row.get("rarity")
+            if not rarity:
+                continue
+            ok_sets = row.get("sets")
+            for a in me["assets"]:
+                ref = a.get("ref")
+                if a.get("kind") != "card" or not ref:
+                    continue
+                c = val.cards.get(ref)
+                if not c or c["rarity"] != rarity:
+                    continue
+                if isinstance(ok_sets, list) and ref.split("-")[0] not in ok_sets:
+                    continue
+                lost, page_notes = val.delta(counts, Counter(), Counter({ref: 1}))
+                floor = neg.price_floor(lost, args.margin)
+                blockers = []
+                if any("ROMPERÍA" in n for n in page_notes) and ref not in cfg.allow_last_copy:
+                    blockers.append(f"rompería una página completa: suelo {floor} P "
+                                    f"(usa --allow-last-copy {ref} si de verdad interesa)")
+                if not unlocked:
+                    u = dealer.get("unlock") or {}
+                    blockers.append(f"{did} no disponible aún (abre a todos en {u.get('open_to_all_at')}; antes con "
+                                    f"{u.get('early_min_deals')} tratos negociados con {u.get('early_deals_with')})")
+                if did in busy:
+                    blockers.append(f"ya hay una conversación abierta con {did}")
+                if led["blocked"].get(did, 0) > tick:
+                    blockers.append(f"{did} bloqueado hasta el tick {led['blocked'][did]} (cupo o enfriamiento)")
+                if open_count >= s["clock"]["limits"].get("max_open_threads_per_team", 6):
+                    blockers.append("sin conversaciones libres")
+                notes = [f"entregamos {abs(lost):.1f} P de valor privado: suelo {floor} P",
+                         f"nivel {dealer.get('level')}: la escalera sólo cuenta los 3 mejores tratos de cada nivel",
+                         "cuenta para la escalera sólo si cerramos por encima de su puja de apertura"] + page_notes
+                if did == "picaros":
+                    notes.append("ofertas con truco: validar los assets de cada oferta antes de aceptar (POST /api/flags)")
+                out.append({"type": "dealer_sell_open", "module": "vendedores", "kind": f"vender {ref} a {did}",
+                            "dealer": did, "ref": f"sell:{a['id']}", "asset": a["id"], "card": ref,
+                            "price": None, "ceiling": floor, "du": 0.0,
+                            "score": 10 ** 3 + (dealer.get("level") or 0) * 100 - abs(lost),
+                            "blockers": blockers, "notes": notes})
         if did not in diag:
             opens = [c for c in out if c["type"] == "dealer_open" and c["dealer"] == did]
             best = max(opens, key=lambda c: (not c["blockers"], c["score"]), default=None)
@@ -2184,6 +2228,10 @@ def main():
                         "pasos de 1 y apertura 0,60; poco comunes enrutadas a la Abuela; vendedores nuevos prudentes)")
     g.add_argument("--dealer-sell-dups", action="store_true",
                    help="vender duplicados comunes a la Abuela (pide 10, baja de 1 en 1; final ~6 P) sin romper páginas")
+    g.add_argument("--dealer-sell-menu", action="store_true",
+                   help="vender a cualquier vendedor que anuncie esa rareza en su menú (dealer['menu']['buys']): "
+                        "suelo = valor privado + margen; se añade a --dealer-sell-dups/--pilar-sell/"
+                        "--ladder-calibrated (no los sustituye, así que puede competir con sus propias aperturas)")
     g.add_argument("--dedupe-bids", action="store_true",
                    help="no pujar (y cancelar la puja abierta) por una carta que ya negociamos con un vendedor")
     g.add_argument("--ladder-new-open", dest="ladder_new_open", type=float, default=None,
