@@ -7,6 +7,7 @@
 #   ./run.sh coord                    -> coordinador único: análisis (solo lectura); --execute para operar
 #   ./run.sh market                   -> análisis de colección y mercado (solo lectura)
 #   ./run.sh market --execute --cycles 8 -> operación entre equipos, máximo una acción por ciclo
+#   ./run.sh celestina [--loop]       -> casamentera de v15: imprime el anuncio (dry run); --execute para publicarlo
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -28,6 +29,7 @@ case "${1:-}" in
   memory) shift; exec python3 memory_coordinator.py "$@" ;;
   coord)  shift; exec python3 coordinator.py "$@" ;;
   market) shift; exec python3 market_agent.py "$@" ;;
+  celestina) shift; exec python3 celestina.py "$@" ;;
   broker) exec python3 starter_broker.py ;;
   agent)  shift; exec python3 starter_agent.py "$@" ;;
   *)      exec python3 starter_agent.py "$@" ;;
