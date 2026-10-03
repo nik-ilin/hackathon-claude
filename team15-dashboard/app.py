@@ -25,9 +25,11 @@ KIT = HERE.parent / "bazaar-kit"
 sys.path.insert(0, str(KIT))
 import dashboard as public_dashboard
 
+import charts
+import history
 import scoring
 from planner import build_rank
-from radio import interpret, radio_event
+from radio import interpret, news_item, radio_summary, radio_event
 
 URL = os.environ.get("BAZAAR_URL", "https://bazaar.causaprima.ai").rstrip("/")
 
@@ -102,6 +104,7 @@ class Model:
     def __init__(self, reader: Reader, team: str = "t15", reserve: int = 100,
                  feed_root: Path = KIT):
         self.reader, self.team, self.reserve = reader, team, reserve
+        self.history_path = Path(feed_root) / "data" / "score_history.jsonl"
         self.public = public_dashboard.Builder(public_dashboard.ReadOnlyClient(reader.url),
                                                team=team, root=feed_root)
         self.lock = threading.Lock()
@@ -110,19 +113,40 @@ class Model:
         self.catalog = None
         self.radio_tail = public_dashboard.Tail()
         self.radio_news = {}
+        self._dealer_cache = None
+
+    def _dealers(self) -> dict:
+        if self._dealer_cache is None:
+            try:
+                self._dealer_cache = {p['id']: p for p in (self.reader.get('/api/dealers')
+                                                           .get('personas') or []) if p.get('id')}
+            except Exception:
+                self._dealer_cache = {}
+        return self._dealer_cache
 
     def _read_radio(self) -> list[dict]:
+        """GET /api/news es la fuente completa: las tres fuentes y `at_hours` para los plazos.
+
+        El feed se sigue leyendo porque llega en vivo, pero sólo trae `news.posted` de los
+        ticks recogidos: con el almacén parado daba 1 noticia de 8."""
+        try:
+            for raw in self.reader.get('/api/news').get('news') or []:
+                item = news_item(raw)
+                if item['id'] is not None:
+                    self.radio_news[item['id']] = item
+        except Exception:
+            pass  # el historial local sigue disponible durante un fallo de red
         events = []
         for path in self.public.stores:
             events.extend(self.radio_tail.read(path))
         try:
             events.extend(self.reader.get('/api/feed?limit=500').get('events') or [])
         except Exception:
-            pass  # El historial local puede seguir disponible durante un fallo de red.
+            pass
         for event in events:
             item = radio_event(event)
             if item and item['id'] is not None:
-                self.radio_news[item['id']] = item
+                self.radio_news.setdefault(item['id'], item)
         return list(self.radio_news.values())
 
     def snapshot(self, max_age: float = 12.0) -> dict:
@@ -179,8 +203,13 @@ class Model:
                           market_refs={ref: {"fair": card.fair, "confidence": card.confidence}
                                        for ref, card in public.oracle.cards.items()})
         enrich_catalog_market(rank.get('catalog_rows') or [], self.catalog or {}, public.oracle.cards)
+        holdings = {r['ref']: r.get('stock') for r in (rank.get('catalog_rows') or [])
+                    if r.get('ref') and r.get('stock')}
         rank['radio'] = interpret(self._read_radio(), self.catalog or {}, rank.get('sale_guide') or [],
-                                  int(public.clock.get('tick') or 0))
+                                  int(public.clock.get('tick') or 0),
+                                  t_hours=public.clock.get('t_hours'), holdings=holdings,
+                                  dealers=self._dealers())
+        rank['radio_summary'] = radio_summary(rank['radio'])
         rank["warnings"] = warnings + public.errors + rank["warnings"]
         rank["board_count"] = sum(map(len, boards.values()))
         rank["venue_count"] = len(boards)
@@ -192,13 +221,21 @@ class Model:
         rank["scoring"] = scoring.scoring_block(rank.get("score") or {}, public.leaderboard, self.team)
         rank["peers"] = scoring.peers_block(public.leaderboard, self.team)
         rank["feed_health"] = scoring.feed_health(self.public.stores, tick_now)
-        dealers = {}
-        try:
-            dealers = {p["id"]: p for p in (self.reader.get("/api/dealers").get("personas") or []) if p.get("id")}
-        except Exception as exc:
-            warnings.append(f"Vendedores: {type(exc).__name__}")
-        rank["ladder"] = scoring.ladder_block(dealers, settled_by_dealer(self.public.stores, self.team),
+        rank["ladder"] = scoring.ladder_block(self._dealers(), settled_by_dealer(self.public.stores, self.team),
                                               me.get("unlocked") or [])
+        if tick_now:
+            try:
+                history.append(self.history_path,
+                               history.sample(tick_now, public.clock.get("t_hours"),
+                                              rank.get("score") or {}, public.leaderboard,
+                                              cash=rank.get("cash"),
+                                              collection_value=rank.get("collection_value"),
+                                              team=self.team))
+            except OSError as exc:
+                warnings.append(f"Historia: {type(exc).__name__}")
+        rank["history"] = history.load(self.history_path)
+        rank["history_summary"] = history.summary(rank["history"], self.team)
+        rank["rank_race"] = history.rank_race(rank["history"], self.team)
         if rank["feed_health"].get("status") != "fresh":
             rank["warnings"].append(
                 "El almacén del feed no está al día: los precios, los rivales y el playbook se calculan sobre él. "
@@ -290,6 +327,41 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid 
 .slot .sub{margin:0;font-size:.8rem}
 .waste{display:inline-block;margin-top:6px;color:#ffb347;font-size:.78rem}
 @media (max-width:640px){.monitor{padding:16px}.comps{grid-template-columns:1fr}}
+
+.charts{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));margin:18px 0}
+.chart{margin:0;padding:14px 16px;border:1px solid var(--line);border-radius:14px;background:var(--surface)}
+.chart figcaption{font-weight:700;font-size:13px;margin-bottom:8px;color:var(--ink-2)}
+.chart svg{width:100%;height:170px;display:block}
+.chart .grid{stroke:#e3eaec;stroke-width:1}
+.chart .baseline{stroke:#d98c1f;stroke-width:1.4;stroke-dasharray:4 3}
+.chart .tick{font-size:9.5px;fill:var(--muted)}
+.chart .tick.base{fill:#d98c1f;font-weight:700}
+.chart-keys{display:flex;gap:12px;flex-wrap:wrap;margin-top:9px;font-size:11px;color:var(--muted)}
+.chart-keys .key i{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px}
+.chart-keys b{color:var(--ink-2)}
+.chart-note{margin:8px 0 0;font-size:11px;color:var(--muted);line-height:1.45}
+.chart.empty{opacity:.65}
+.attrib{width:100%;border-collapse:collapse;font-size:12px;margin:6px 0 0}
+.attrib th{text-align:left;font-weight:600;padding:6px 10px 6px 0;border-bottom:1px solid var(--line);color:var(--muted)}
+.attrib td{padding:6px 10px 6px 0;border-bottom:1px solid #eef3f4;font-variant-numeric:tabular-nums}
+.attrib .up{color:#1f8a76;font-weight:700}
+.attrib .down{color:#c0392b;font-weight:700}
+
+.verdict-row{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 14px}
+.verdict-chip{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:.02em}
+.verdict-chip.act{background:#d8f3ec;color:#116b58}
+.verdict-chip.verify{background:#fdf0d5;color:#8a5d06}
+.verdict-chip.ignore{background:#f8e0dd;color:#a3271b}
+.verdict-chip.expired{background:#eceff1;color:#5b6770}
+.verdict-chip.noise{background:#eef2f3;color:#6b767d}
+.radio-top{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:2px}
+.radio-item.act{border-left:3px solid #1f8a76}
+.radio-item.verify{border-left:3px solid #d98c1f}
+.radio-item.ignore{border-left:3px solid #c0392b;opacity:.82}
+.radio-item.expired,.radio-item.noise{opacity:.62}
+.radio-refs{margin:6px 0 0;font-size:12px}
+.radio-refs code{background:#eef3f4;border-radius:5px;padding:1px 6px;margin-right:5px;font-size:11px}
+.attrib caption{text-align:left;font-weight:700;font-size:13px;padding:12px 0 4px;color:var(--ink-2)}
 """
 
 CSS += r"""
@@ -772,6 +844,94 @@ def render_monitor(data: dict) -> str:
     return ''.join(parts)
 
 
+VERDICT_LABEL = {"act": ("Actuar", "act"), "verify": ("Verificar", "verify"),
+                 "ignore": ("Ignorar", "ignore"), "expired": ("Plazo vencido", "expired"),
+                 "noise": ("Sin efecto", "noise")}
+
+
+def render_trend(data: dict) -> str:
+    """Trayectoria: de dónde venimos, qué subió los puntos y la carrera con los vecinos.
+
+    Las gráficas están elegidas por lo que deciden, no por lo que se ve bien:
+      1. score y puesto, para saber si vamos hacia arriba
+      2. los dos componentes sobre su escala real de 0 a 30, donde se ve que 7.50 de
+         mercado es el suelo y no una cifra normal
+      3. negociación por trato, con la referencia del mejor del juego: es la métrica que
+         paga la escalera, y la que nos tiene en el puesto 11
+      4. la carrera contra el equipo de arriba y el de abajo, que son los que mueven el puesto
+    """
+    rows = data.get('history') or []
+    summary = data.get('history_summary') or {}
+    race = data.get('rank_race') or {}
+    peers = data.get('peers') or {}
+    if summary.get('status') != 'ok':
+        return ('<section id="tendencia" class="monitor"><div class="section-head"><div>'
+                '<h2>Trayectoria</h2><p class="sub">Hace falta más de una muestra. '
+                'El panel guarda una por tick en <code>bazaar-kit/data/score_history.jsonl</code>; '
+                'déjalo abierto y la serie se llena sola.</p></div></div></section>')
+
+    best_eff = (peers.get('efficiency_ranking') or [{}])[0]
+    cards = [
+        charts.line_chart({'score': history.series(rows, 'score')},
+                          title='Score', caption=(
+                              f'De {fmt(summary.get("score_from"))} a {fmt(summary.get("score_to"))} '
+                              f'en {esc(summary.get("span_ticks"))} ticks. '
+                              f'Tendencia reciente: {fmt(summary.get("recent_trend"))} por muestra.')),
+        charts.line_chart({'puesto': history.series(rows, 'rank')}, invert=True, value_fmt='{:.0f}',
+                          title='Puesto en el ranking',
+                          caption=f'Del {esc(summary.get("rank_from"))} al {esc(summary.get("rank_to"))}. '
+                                  'Eje invertido: arriba es mejor.'),
+        charts.line_chart({'negociación': history.series(rows, 'negotiating'),
+                           'mercado': history.series(rows, 'market')}, lo=0, hi=30,
+                          baseline=7.5, baseline_label='suelo de mercado',
+                          title='Los dos componentes, sobre 30',
+                          caption='30 puntos cada uno. Un venue sin trades puntúa 7.50 sea board o auto, '
+                                  'así que una línea plana en 7.50 es el suelo, no un resultado.'),
+        charts.line_chart({'nuestra': history.efficiency_series(rows)}, value_fmt='{:.2f}',
+                          baseline=best_eff.get('negotiating_per_deal'),
+                          baseline_label=f'mejor: {esc(best_eff.get("team"))}',
+                          title='Puntos de negociación por trato',
+                          caption='Lo que paga la escalera es la cuota del rango capturada. '
+                                  'Sube regateando mejor, no cerrando más tratos.'),
+    ]
+    if race.get('series'):
+        cards.append(charts.line_chart(race['series'], title='Carrera con los vecinos',
+                                       caption='El de arriba y el de abajo son los que mueven el puesto. '
+                                               'Elegidos por el estado actual, no por el inicial.'))
+
+    parts = ['<section id="tendencia" class="monitor"><div class="section-head"><div>',
+             '<h2>Trayectoria</h2>',
+             f'<p class="sub">{esc(summary.get("samples"))} muestras guardadas, una por tick, '
+             'en <code>bazaar-kit/data/score_history.jsonl</code>.</p>',
+             '</div></div><div class="charts">', *cards, '</div>']
+
+    moves = [m for m in history.deltas(rows, 'score', window=0) if m['delta']]
+    if moves:
+        parts += ['<table class="attrib"><caption>Qué movió los puntos</caption><thead><tr>',
+                  '<th>ticks</th><th>score</th><th>tratos</th><th>por trato</th><th>caja</th><th>colección</th>',
+                  '</tr></thead><tbody>']
+        for m in list(reversed(moves))[:8]:
+            cls = 'up' if m['delta'] > 0 else 'down'
+            ppd = m.get('points_per_deal')
+            parts.append(
+                f'<tr><td>{esc(m["from_tick"])} → {esc(m["to_tick"])}</td>'
+                f'<td class="{cls}">{m["delta"]:+.2f}</td>'
+                f'<td>{esc(m.get("delta_deals") or "—")}</td>'
+                f'<td class="{cls if ppd else ""}">{(f"{ppd:+.2f}" if ppd else "—")}</td>'
+                f'<td>{esc(m.get("delta_cash") or "—")}</td>'
+                f'<td>{esc(m.get("delta_collection_value") or "—")}</td></tr>')
+        parts.append('</tbody></table>')
+        best = summary.get('best_deal')
+        if best and best.get('points_per_deal'):
+            parts.append('<p class="chart-note">Mejor intervalo: '
+                         f'{esc(best["from_tick"])} → {esc(best["to_tick"])}, '
+                         f'{best["delta"]:+.2f} puntos en {esc(best.get("delta_deals"))} trato(s) = '
+                         f'{best["points_per_deal"]:+.2f} por trato. '
+                         'La atribución junta todo lo que pasó en el intervalo: no aísla una causa.</p>')
+    parts.append('</section>')
+    return ''.join(parts)
+
+
 def render(data: dict) -> str:
     tick = data.get("tick")
     live = data.get("live")
@@ -788,7 +948,7 @@ def render(data: dict) -> str:
              f'<div class="metric"><small>Valor de colección</small><strong>{fmt(data.get("collection_value"))} P</strong></div>',
              f'<div class="metric"><small>{"Puntos propios en vivo" if live else "Puntos del leaderboard (con retraso)"}</small><strong>{fmt(score.get("score"))}</strong></div>',
              f'<div class="metric"><small>Ofertas visibles · venues</small><strong>{data.get("board_count",0)} · {data.get("venue_count",0)}</strong></div>',
-             '</div><nav class="jump"><a href="#monitor">Monitor de ranking</a><a href="#guide">Venta rápida</a><a href="#radio">Radio y decisión</a><a href="#ranking">Ranking</a><a href="#estrategia-ranking">Estrategia</a><a href="#catalogo">Catálogo completo</a></nav>', render_monitor(data), render_dashboard_overview(data), render_rank_strategy(data)]
+             '</div><nav class="jump"><a href="#monitor">Monitor de ranking</a><a href="#tendencia">Trayectoria</a><a href="#guide">Venta rápida</a><a href="#radio">Radio y decisión</a><a href="#ranking">Ranking</a><a href="#estrategia-ranking">Estrategia</a><a href="#catalogo">Catálogo completo</a></nav>', render_monitor(data), render_trend(data), render_dashboard_overview(data), render_rank_strategy(data)]
     for warning in data.get("warnings") or []:
         parts.append('<div class="warning">' + esc(warning) + '</div>')
     guide = data.get("sale_guide") or []
@@ -820,14 +980,45 @@ def render(data: dict) -> str:
             parts.append('<span class="label">Ningún equipo pidió esta carta en el feed reciente.</span>')
         parts.append('</div></article>')
     parts.append('</div></section>')
-    parts += ['<section id="radio" class="radio"><h2>Radio: qué hacer con cada señal</h2>',
-              '<p class="sub">La radio publica rumores. Una noticia no confirma el precio ni la voluntad de compra: contrástala con una oferta o cotización real.</p><div class="radio-list">']
+    summary = data.get('radio_summary') or {}
+    counts = summary.get('by_verdict') or {}
+    parts += ['<section id="radio" class="radio"><div class="section-head"><div>',
+              '<h2>Radio: qué hacer con cada señal</h2>',
+              '<p class="sub">Tres fuentes con fiabilidad distinta. El <b>Boletín del Bazar</b> es oficial: '
+              'lo que anuncia ocurre. <b>Radio Rastro</b> son rumores, normalmente con plazo. '
+              '<b>El Tablón</b> es cebo, y actuar sobre él puede provocar un enfriamiento con el vendedor.</p>',
+              '</div></div>']
+    if counts:
+        chips = []
+        for key in ('act', 'verify', 'expired', 'noise', 'ignore'):
+            if counts.get(key):
+                label, cls = VERDICT_LABEL[key]
+                chips.append(f'<span class="verdict-chip {cls}">{esc(label)} · {esc(counts[key])}</span>')
+        parts.append('<div class="verdict-row">' + ''.join(chips) + '</div>')
+    parts.append('<div class="radio-list">')
     if not data.get('radio'):
-        parts.append('<div class="guide-empty">Aún no hay noticias de radio en el feed disponible.</div>')
+        parts.append('<div class="guide-empty">Aún no hay noticias en /api/news.</div>')
     for news in data.get('radio') or []:
-        parts += [f'<article class="radio-item"><small>{esc(news["source"])} · tick {esc(news["tick"])}</small>',
-                  f'<h3>{esc(news["headline"])}</h3><p>{esc(news["body"])}</p>',
-                  f'<p class="radio-action">{esc(news["action"])}</p></article>']
+        label, cls = VERDICT_LABEL.get(news.get('verdict'), VERDICT_LABEL['noise'])
+        win = news.get('window') or {}
+        meta = [esc(news['source']), esc(news.get('reliability'))]
+        if news.get('at_hours') is not None:
+            meta.append(f'hora {news["at_hours"]:.2f}')
+        if win.get('declared'):
+            meta.append(('plazo vencido' if news.get('expired') else f'plazo {esc(win["declared"])}')
+                        + (f' (hasta {win["expires_at_hours"]:.2f})'
+                           if win.get('expires_at_hours') is not None else ''))
+        ours = news.get('ours') or []
+        parts += [f'<article class="radio-item {cls}"><div class="radio-top">'
+                  f'<small>{" · ".join(meta)}</small>'
+                  f'<span class="verdict-chip {cls}">{esc(label)}</span></div>',
+                  f'<h3>{esc(news["headline"])}</h3>']
+        if news.get('body'):
+            parts.append(f'<p>{esc(news["body"])}</p>')
+        if ours:
+            parts.append('<p class="radio-refs">Toca nuestras: '
+                         + ''.join(f'<code>{esc(r)}</code>' for r in ours) + '</p>')
+        parts.append(f'<p class="radio-action">{esc(news["action"])}</p></article>')
     parts += ['</div></section><div id="ranking" class="layout"><aside class="sidebar"><h2>Compradores</h2><div class="teams">',
               '<button class="team-button" data-team="all" aria-pressed="true">Todos <small>↗</small></button>']
     for team in teams:
