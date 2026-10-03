@@ -300,6 +300,28 @@ def render(dealer_prof, team_prof, rmed, recs, q):
               + " → seguir regateando", ""]
     except Exception as e:  # analysis only: never break the report
         L += ["## Mala fe de dealers", "", f"- error: {e!r}", ""]
+    # announcements (new levels, venue ads) and offers that touch us (directed to t15 or listed on our venue)
+    try:
+        ev = q("SELECT tick, type, actor, payload FROM events WHERE type IN ('level.announced','venue.announcement') "
+               "ORDER BY id DESC LIMIT 8")
+        offs = q("SELECT tick, payload FROM events WHERE type='offer.listed' AND "
+                 "(payload LIKE '%\"to\": \"t15\"%' OR payload LIKE '%\"venue\": \"v15\"%') ORDER BY id DESC LIMIT 6")
+        if ev or offs:
+            L += ["## Anuncios y ofertas que nos tocan", ""]
+            for tick, typ, actor, p in ev:
+                d = json.loads(p)
+                txt = (f"nivel «{d.get('name')}» ({d.get('kind')}): {d.get('teaser')}" if typ == "level.announced"
+                       else f"{actor} «{d.get('name')}»: {(d.get('text') or '')[:120]}")
+                L.append(f"- t{tick} {txt}")
+            for tick, p in offs:
+                o = json.loads(p)["offer"]
+                side = lambda s: ([a["ref"] for a in s.get("assets", [])] + list(s.get("types", [])) +
+                                  ([f"{s['cash']}P"] if s.get("cash") else []))
+                L.append(f"- t{tick} oferta {o['id']} {o['maker']}→{o.get('to') or 'todos'} en {o['venue']}: "
+                         f"da {side(o['give'])} pide {side(o['want'])} (caduca t{o.get('expires_tick')})")
+            L.append("")
+    except Exception as e:  # analysis only: never break the report
+        L += ["## Anuncios y ofertas que nos tocan", "", f"- error: {e!r}", ""]
     # venue changes over the last ~hour of snapshots (fee cuts, new venues, first trades)
     vs = q("SELECT tick, payload FROM json_snapshots WHERE kind='venues' ORDER BY snap_ts DESC LIMIT 7")
     if len(vs) > 1:
