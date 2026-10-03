@@ -47,7 +47,8 @@ def build_rank(me: dict, catalog: dict, clock: dict, venues: list[dict], boards:
                                 "offered": rv.get("duplicates_offered") or [],
                                 "sample": rv.get("sample") or 0})
     if not me.get("id") or not catalog.get("sets"):
-        result["warnings"].append("Faltan datos privados del equipo o catálogo; no se calculan operaciones.")
+        if not catalog.get("sets"):
+            result["warnings"].append("No se pudo leer el catálogo; no se calculan operaciones.")
         return result
     val = tr.Valuation(catalog, me.get("affinity") or {})
     assets, locked = _cash_and_assets(me, own_offers)
