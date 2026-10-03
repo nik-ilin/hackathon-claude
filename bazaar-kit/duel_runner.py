@@ -219,6 +219,13 @@ def _learn(learner, done: list, tick: int) -> None:
         log({"event": "learn_error", "tick": tick, "error": f"{type(e).__name__}: {e}"})
 
 
+def merge_done(history: list, newly_done: list) -> list:
+    """Retain the full confirmed cohort after a settlement; the latest server row wins."""
+    by_id = {d["duel"]: d for d in (history or []) + (newly_done or [])
+             if d.get("duel") is not None and d.get("status") in ("deal", "no_deal")}
+    return list(by_id.values())
+
+
 def reconcile_accepted(b, awaiting: dict, tick: int, stats: dict) -> Optional[list]:
     """Tras aceptar, en el tick siguiente se relee el duelo y se registra su estado FINAL (deal/no_deal, precio, días, rol,
     deadline) con la predicción hecha antes de aceptar. `sent: true` solo prueba que se envió la acción."""
@@ -295,7 +302,10 @@ def run(b, execute, feed_file: Path | None = None, reconcile=False, verify_accep
                 if awaiting:
                     done_now = reconcile_accepted(b, awaiting, tick, stats)
                     if done_now is not None:
-                        _learn(learner, [d for d in done_now if d.get("status") in ("deal", "no_deal")], tick)
+                        # El modelo representa TODOS los duelos terminados. Ajustarlo sólo con
+                        # los recién reconciliados borraría temporalmente la evidencia anterior.
+                        history = merge_done(history, done_now)
+                        _learn(learner, history, tick)
                     snap = score_snapshot(b, tick, prev_score)
                     if snap:
                         log({"event": "score_snapshot", "label": "tras reconciliar", **snap,

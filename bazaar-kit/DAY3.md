@@ -23,6 +23,60 @@ El sábado, v15 `auto` tenía 0 tratos reales pero 7,5 de mercado; el test sint�
    antes de agotar el plazo y escalonar aceptaciones (una por tick). `--day3` activa días, perfiles, ladder para mudos,
    reconciliación y verificación de oferta. `--learn` y `--logroll` siguen opt-in.
 
+## Auditoría del cierre del sábado (tick 1445, API pausada)
+
+Lectura privada de Team 15: **485 P** de caja, **23,91** puntos de servidor, puesto **13/18**,
+negociación **16,41/30**, mercado **7,50/30**, `mm_points=0` y **0 tratos en v15**. La caja
+observada concuerda aproximadamente con los «~480 P» del equipo; el número operativo es el de
+`/api/me` al reabrir, después de ofertas y la asignación del domingo. `duel_points=28,18` es
+un acumulado de excedente, no puntos directos de leaderboard. La escalera aporta sólo `0,27`
+en el desglose privado. El juego está cerrado hasta el **domingo 4 de octubre a las 09:00 de
+Madrid** según `/api/clock`; la API del domingo manda sobre cualquier hora escrita aquí.
+
+Se descargaron **136 duelos terminados** de `/api/duels?done=true`: 34 de práctica sin puntos,
+34 de sesión 2 (18 acuerdos) y 68 de sesión 3 (48 acuerdos). Entre los cierres puntuables hay
+11 con `result` negativo. El log local del ejecutor no cubre ninguno de esos duelos, por lo que
+no se puede atribuir con seguridad qué persona o política los cerró. En replay temporal, entrenando
+con 52 y validando/probando con 18+18, `duel_learning` cambió **0 decisiones** frente a la política
+base. Esto no prueba que el módulo esté roto: prueba que todavía no hay evidencia de una mejora
+de política. El runner conserva toda la cohorte al actualizarse tras cada liquidación y detecta
+correcciones del servidor aunque el número de duelos no cambie. `--learn` continúa opt-in hasta
+que el laboratorio muestre una mejora fuera de la muestra de entrenamiento.
+
+El preset `./run.sh day3` pasa ahora por `memory_coordinator.py`. Esto importa el feed histórico
+en SQLite, registra decisiones y entrega comparables al coordinador en cada ciclo, manteniendo
+sus límites, valoraciones, protección de páginas y bloqueo. La memoria no reescribe por sí sola
+la política: si el dashboard marca memoria atrasada o sin integrar, verificar el proceso antes
+de confiar en sus comparables.
+
+### Acuerdo con t05 y grupo de siete
+
+El acuerdo relatado es una **intención del equipo**, no un contrato ni una oferta confirmada en
+la API. Preparar listas de necesidades y duplicados para los siete, pero evaluar cada oferta
+con el valor marginal privado actual, comisión, pérdida de página, capital reservado y resultado
+del servidor. Una recomendación del algoritmo de otro equipo es una pista; no es nuestra
+valoración. El preset del domingo no veta a t05, de modo que puede considerar tratos rentables.
+t05 estaba tercero con 30,49 puntos al cierre: al elegir entre dos tratos propios de valor
+similar, preferir el que no regale más mejora al rival directo. No forzar un intercambio sólo
+por pertenecer al grupo.
+
+Para el **market-making** de v15, buscar de forma especial parejas de dos equipos del grupo
+que tengan duplicados y faltantes complementarios. Darles un motivo concreto para usar v15:
+precio/trueque acordado, cero comisión y una carta que complete página. Las órdenes vistas en
+otro venue se tienen que volver a publicar en v15; un anuncio o una coincidencia potencial no
+puntúan. Medir `mm_points`, liquidaciones entre terceros y los dos valores netos positivos
+confirmados, no el número de mensajes ni de publicaciones. `celestina --leads` genera
+invitaciones verificables sin afirmar que ya existe la otra parte.
+
+### Decisión de infraestructura de mercado
+
+Con 485 P y 0 comprometidos, la caja supera el umbral de preflight de `board` (390 P con
+reserva de 100 P), pero el cambio requiere broker vivo, autotest, recuperación de clave y
+ventana suficiente antes del Market Test. `board` busca mejorar la fracción de 22,5 puntos
+del test; la casamentera busca la parte de 7,5 de tratos reales y funciona con el puesto
+`auto`. Son dos palancas independientes. No abrir `board` sólo para atraer usuarios: un
+broker caído pierde cruces sintéticos y ningún mecanismo crea demanda orgánica por sí solo.
+
 El nuevo fixture de **23 duelos de Duelos II** registra 19 tratos, de ellos **7 con `result` negativo**, y 4 sin
 trato. No es una tasa general de la competición: es la muestra guardada de Team 15. El error de signo de días ya se
 corrigió en `duels.py` y se comprobó contra resultados del servidor. Para compradores, cada día resta `peso·día`;

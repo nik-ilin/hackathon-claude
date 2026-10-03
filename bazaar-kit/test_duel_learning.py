@@ -326,6 +326,23 @@ class Runner(unittest.TestCase):
             runner._learn(Mock(model=None, update=Mock(side_effect=ValueError("x"))), improving_history(2), 5)
         self.assertEqual(logs[0]["event"], "learn_error")
 
+    def test_new_settlement_keeps_previous_training_cohort(self):
+        prior = improving_history(12)
+        new = done(13, status="deal", price=71, result=29.0)
+        merged = runner.merge_done(prior, [new, dict(prior[0], result=31.0)])
+        self.assertEqual(len(merged), 13)
+        self.assertEqual(merged[0]["result"], 31.0)
+        learner = L.Learner()
+        self.assertTrue(learner.update(merged))
+        self.assertEqual(learner.model.n_duels, 13)
+
+    def test_same_count_with_corrected_result_refits(self):
+        learner = L.Learner()
+        first = [done(1, status="deal", price=71, result=29.0)]
+        self.assertTrue(learner.update(first))
+        self.assertTrue(learner.update([dict(first[0], result=25.0)]))
+        self.assertFalse(learner.update([dict(first[0], result=25.0)]))
+
 
 if __name__ == "__main__":
     unittest.main()

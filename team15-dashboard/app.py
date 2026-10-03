@@ -30,6 +30,7 @@ import charts
 import history
 import operations
 import scoring
+import strategy_health
 from planner import build_rank
 
 # El kit también tiene radio.py; cargar el módulo del panel por ruta evita que
@@ -137,6 +138,8 @@ class Model:
         self.radio_tail = public_dashboard.Tail()
         self.radio_news = {}
         self._dealer_cache = None
+        self.done_cache = []
+        self.done_at = 0.0
 
     def _dealers(self) -> dict:
         if self._dealer_cache is None:
@@ -254,6 +257,14 @@ class Model:
                                                 offers=own_offers, reserve=self.reserve,
                                                 venues=venues, feed_health=rank["feed_health"],
                                                 verified=bool(rank.get("verified")), team=self.team)
+        if me and time.time() - self.done_at >= 60:
+            try:
+                self.done_cache = self.reader.get('/api/duels?done=true', private=True).get('duels') or []
+                self.done_at = time.time()
+            except Exception:
+                warnings.append('Historial de duelos: lectura privada no disponible; se conserva la última muestra.')
+        rank['strategy_health'] = strategy_health.build(
+            self.done_cache, (self.public.root, KIT), tick_now)
         rank["ladder"] = scoring.ladder_block(self._dealers(), settled_by_dealer(self.public.stores, self.team),
                                               me.get("unlocked") or [])
         if tick_now:
@@ -595,6 +606,7 @@ def strategy_export(data: dict) -> dict:
         'peers': data.get('peers') or {},
         'feed_health': data.get('feed_health') or {},
         'operations': data.get('operations') or {},
+        'strategy_health': data.get('strategy_health') or {},
         'opportunities': opportunities,
         'kpis': {
             'published_cards': len(released), 'catalog_cards': len(rows),
@@ -1034,6 +1046,19 @@ header{background:var(--surface);color:var(--ink);border:1px solid var(--line);b
 @media(prefers-reduced-motion:reduce){html,body{scroll-behavior:auto}*{transition-duration:.01ms!important;animation-duration:.01ms!important}}
 """
 
+CSS += """
+/* Team 15 · Sunday visual pass: rounded instruments, restrained depth and one night-market gradient. */
+:root{--canvas:#edf3f4;--canvas-end:#f8faf9;--card:#fff;--night:#143542;--night-2:#214d58;--market:#33a79b;--amber:#edb25b;--coral:#ca695a;--lavender:#8d89c5;--slate:#9bb1ba;--card-shadow:0 10px 28px rgba(24,59,71,.065)}
+body{background:linear-gradient(180deg,var(--canvas),var(--canvas-end) 520px);background-attachment:fixed}.wrap{max-width:1580px}
+header{border-radius:18px;background:var(--card);box-shadow:var(--card-shadow);padding:22px 28px}.jump{border:1px solid var(--line);border-radius:13px;background:rgba(255,255,255,.96);margin:12px 0 16px;padding:6px;box-shadow:0 5px 18px rgba(24,59,71,.04);backdrop-filter:blur(12px)}.jump a{border-radius:9px}.jump a:hover,.jump a:focus-visible{background:var(--blue)}
+.command-deck{border-radius:22px;background:linear-gradient(125deg,var(--night) 0%,var(--night-2) 60%,#246b6d 100%);box-shadow:0 18px 36px rgba(14,48,58,.17);overflow:hidden}.deck-decision{background:rgba(255,255,255,.075)}.deck-decision>a{border-radius:10px;background:var(--amber)}.deck-track,.race-track{border-radius:20px;overflow:hidden}.deck-track i,.race-track i{border-radius:20px}.deck-race p,.deck-capital p{color:#d3e4e4}
+.pulse{margin:0 0 16px}.pulse-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin:0 2px 13px}.pulse-head h2{margin:0 0 4px}.pulse-head p,.pulse-head>span{font-size:12px;color:var(--muted);margin:0}.pulse-head>span{text-align:right;max-width:42ch}.pulse-grid{display:grid;grid-template-columns:1.25fr .9fr .95fr;gap:14px}.pulse-card{min-width:0;background:var(--card);border:1px solid var(--line);border-radius:18px;padding:20px 21px;box-shadow:var(--card-shadow);display:flex;flex-direction:column}.pulse-card-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:17px}.pulse-card-head h3{font-size:16px;margin:0}.pulse-card-head>strong{font-size:22px;color:var(--ink);font-variant-numeric:tabular-nums}.pulse-card-head small{font-size:12px;color:var(--muted);font-weight:400}.session-row{margin:0 0 14px}.session-row>div:first-child{display:flex;align-items:baseline;justify-content:space-between;gap:8px;font-size:12px}.session-row b{font-size:13px}.session-row span{color:var(--muted);text-align:right}.session-track{height:10px;display:flex;border-radius:50px;overflow:hidden;background:var(--soft);margin-top:7px}.session-track span{height:100%;display:block}.session-track .won,.session-key i.won{background:var(--market)}.session-track .flat{background:var(--slate)}.session-track .lost,.session-key i.lost{background:var(--coral)}.session-track .missed,.session-key i.missed{background:var(--amber)}.session-key{display:flex;flex-wrap:wrap;gap:11px;color:var(--muted);font-size:11px;margin:5px 0}.session-key span{display:inline-flex;align-items:center;gap:5px}.session-key i{width:8px;height:8px;display:inline-block;border-radius:2px}.pulse-note{font-size:12px;color:var(--muted);line-height:1.5;margin:auto 0 0;padding-top:13px}.pulse-empty{font-size:12px;color:var(--muted)}.market-pulse{background:linear-gradient(160deg,#fff 48%,#eaf6f4 100%)}.market-hero{display:flex;align-items:baseline;gap:10px;margin:0 0 12px}.market-hero b{font-size:47px;line-height:1;color:var(--teal);letter-spacing:-.06em}.market-hero span{font-size:12px;color:var(--muted);max-width:16ch}.market-pulse>a{font-size:12px;margin-top:12px;font-weight:700;text-underline-offset:3px}.system-pulse{background:linear-gradient(160deg,#fff 55%,#f1f4fb 100%)}.system-mark{color:var(--market)!important;font-size:13px!important}.system-line{display:flex;justify-content:space-between;gap:8px;padding:10px 0;border-top:1px solid var(--line);font-size:12px}.system-line b{text-align:right;color:var(--ink-2);font-size:11px}.system-line span{color:var(--muted)}
+.ops,.monitor,.viz-card,.chart,.sale-card,.radio-item,.panel,.trade,.slot,.rank-strategy,.catalog-brief,.set-card,.action-card,.sidebar{border-radius:17px;box-shadow:var(--card-shadow)}.ops,.monitor{padding:23px 26px}.viz-card,.chart{border-radius:18px}.chart svg{border-radius:10px}.sale-card{border-top-width:4px}.radio-item{border-left-width:4px}.rank-strategy{border-radius:20px}.rank-opportunity{border-radius:12px}.catalog-toolbar{border-radius:12px}.set-card:hover,.set-card:focus-visible{transform:translateY(-2px)}.bar-track,.coverage-track,.headroom-bars span,.headroom-bars i,.cash-stack,.duel-track,.set-track{border-radius:50px}.chart .baseline{stroke:var(--amber)}
+@media(max-width:1040px){.pulse-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.system-pulse{grid-column:1/-1}}
+@media(max-width:700px){.pulse-head{display:block}.pulse-head>span{display:block;text-align:left;margin-top:5px}.pulse-grid{grid-template-columns:1fr}.system-pulse{grid-column:auto}}
+@media(max-width:620px){header{padding:18px;border-radius:15px}.command-deck{border-radius:17px}.pulse-card{padding:18px;border-radius:16px}.pulse-head{padding:0 3px}.ops,.monitor{border-radius:16px}.session-row>div:first-child{display:block}.session-row span{display:block;text-align:left;margin-top:2px}}
+"""
+
 
 def render_operations(data: dict) -> str:
     op = data.get('operations') or {}
@@ -1153,6 +1178,59 @@ def render_command_deck(data: dict) -> str:
             '</section>')
 
 
+def render_strategy_health(data: dict) -> str:
+    state = data.get('strategy_health') or {}
+    duels = state.get('duels') or {}
+    memory = state.get('memory') or {}
+    learner = state.get('duel_learning') or {}
+    market = ((data.get('operations') or {}).get('market') or {})
+    score = data.get('scoring') or {}
+    sessions = []
+    for row in duels.get('sessions') or []:
+        total = max(1, row['total'])
+        segments = ''.join(
+            f'<span class="{cls}" style="width:{row[key] / total * 100:.1f}%"></span>'
+            for key, cls in (('positive', 'won'), ('zero_deal', 'flat'),
+                             ('negative', 'lost'), ('no_deal', 'missed')))
+        sessions.append(f'<div class="session-row"><div><b>Sesión {esc(row["session"])}</b>'
+                        f'<span>{row["positive"]} rentables · {row["negative"]} negativas · '
+                        f'{row["no_deal"]} sin trato</span></div>'
+                        f'<div class="session-track" role="img" aria-label="Sesión {row["session"]}: '
+                        f'{row["positive"]} rentables, {row["negative"]} negativas, '
+                        f'{row["no_deal"]} sin trato">{segments}</div></div>')
+    memory_text = {
+        'fresh': 'Evidencia reciente', 'stale': 'Memoria atrasada',
+        'database_only': 'Base creada; falta informe', 'not_started': 'Aún no integrada',
+    }.get(memory.get('status'), 'Sin confirmar')
+    learner_text = ('Modelo actualizado con ' + fmt(learner.get('duels_done')) + ' duelos'
+                    if learner.get('status') == 'updated' else 'Modelo de duelos sin iniciar')
+    return ('<section id="pulso" class="pulse"><div class="pulse-head"><div>'
+            '<h2>Seguimiento de la estrategia</h2><p>Resultados confirmados y estado real de los agentes.</p>'
+            '</div><span>La API decide el resultado; el historial local explica la ejecución</span></div>'
+            '<div class="pulse-grid"><article class="pulse-card duel-pulse"><div class="pulse-card-head">'
+            '<h3>Duelos cerrados</h3><strong>' + fmt(duels.get('settled')) + '</strong></div>'
+            + (''.join(sessions) or '<p class="pulse-empty">Aún no hay resultados privados de duelos.</p>') +
+            '<div class="session-key"><span><i class="won"></i>Rentable</span><span><i class="lost"></i>Pérdida</span>'
+            '<span><i class="missed"></i>Sin trato</span></div>'
+            f'<p class="pulse-note">{fmt(duels.get("negative"))} cierres negativos y '
+            f'{fmt(duels.get("no_deal"))} sin acuerdo en sesiones puntuables. '
+            'La práctica queda fuera.</p></article>'
+            '<article class="pulse-card market-pulse"><div class="pulse-card-head"><h3>Mercado propio</h3>'
+            f'<strong>{fmt(score.get("market"))}<small> / 30</small></strong></div>'
+            f'<div class="market-hero"><b>{fmt(market.get("trades"))}</b><span>tratos de terceros en '
+            f'{esc(market.get("venue") or "nuestro venue")}</span></div>'
+            f'<p class="pulse-note">Valor creado entre terceros: {fmt(score.get("mm_points"))} P. '
+            'Invitar parejas con demanda real a publicar y cerrar aquí; el tráfico bruto no puntúa.</p>'
+            '<a href="#ranking">Ver oportunidades de negociación</a></article>'
+            '<article class="pulse-card system-pulse"><div class="pulse-card-head"><h3>Sistema de decisión</h3>'
+            '<strong class="system-mark">●</strong></div>'
+            f'<div class="system-line"><span>Memoria del coordinador</span><b>{memory_text}</b></div>'
+            f'<div class="system-line"><span>Evidencia reciente</span><b>{fmt(memory.get("events_in_window"))} eventos</b></div>'
+            f'<div class="system-line"><span>Aprendizaje de duelos</span><b>{learner_text}</b></div>'
+            '<p class="pulse-note">El laboratorio temporal aún no ha demostrado mejora de decisiones. '
+            'Mantener la política base y evaluar el modelo antes de activarlo.</p></article></div></section>')
+
+
 def render(data: dict) -> str:
     tick = data.get("tick")
     live = data.get("live")
@@ -1163,7 +1241,7 @@ def render(data: dict) -> str:
              '<header><div><h1>Mesa de mando · Team 15</h1><p class="sub">Puntos, duelos, caja y mercado para decidir durante el último día.</p></div>',
              '<div class="status"><span class="flag ', 'live' if live else 'warn', '">',
              'Equipo conectado' if live else 'Sólo feed público', '</span><span class="clock">Tick ', esc(tick), '</span></div></header>',
-             '<nav class="jump" aria-label="Secciones"><a href="#operacion">Operación</a><a href="#monitor">Puntos</a><a href="#tendencia">Trayectoria</a><a href="#guide">Ventas</a><a href="#radio">Señales</a><a href="#ranking">Oportunidades</a><a href="#estrategia-ranking">Ranking</a><a href="#catalogo">Catálogo</a></nav>', render_command_deck(data), render_operations(data), render_monitor(data), render_trend(data), render_dashboard_overview(data), render_rank_strategy(data)]
+             '<nav class="jump" aria-label="Secciones"><a href="#pulso">Seguimiento</a><a href="#operacion">Operación</a><a href="#monitor">Puntos</a><a href="#tendencia">Trayectoria</a><a href="#guide">Ventas</a><a href="#radio">Señales</a><a href="#ranking">Oportunidades</a><a href="#estrategia-ranking">Ranking</a><a href="#catalogo">Catálogo</a></nav>', render_command_deck(data), render_strategy_health(data), render_operations(data), render_monitor(data), render_trend(data), render_dashboard_overview(data), render_rank_strategy(data)]
     for warning in data.get("warnings") or []:
         parts.append('<div class="warning">' + esc(warning) + '</div>')
     guide = data.get("sale_guide") or []

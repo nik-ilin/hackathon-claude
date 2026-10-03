@@ -36,7 +36,7 @@ case "${1:-}" in
   market) shift; exec python3 market_agent.py "$@" ;;
   celestina) shift; exec python3 celestina.py "$@" ;;
   market-switch) shift; exec python3 venue_switch.py "$@" ;;
-  day3)   shift; exec python3 coordinator.py --profile fast-close --selector economic \
+  day3)   shift; exec python3 memory_coordinator.py --profile fast-close --selector economic \
             --reserve 40 --per-card 95 --margin 2 --max-posts 2 \
             --no-rival-venues --duende-venue rastro \
             --dealer-sell-dups --ladder-fill --ladder-calibrated --chato-mirror auto \
