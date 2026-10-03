@@ -29,12 +29,20 @@ está documentado (el SDK dice ask <= precio <= bid). Un rechazo no cuesta nada,
 rechazos sin ningún acierto.
 
 Las funciones son puras (sin red) y las usa tal cual el banco de pruebas `sim_bench.py`.
+
+**Robustez frente a la API real.** No hay ningún `GET /api/broker/book` real guardado: el formato es el de
+starter_broker.py (código oficial). Por eso `clean_book` normaliza el libro antes de planificar (cantidades a int, `give`
+o `want` ausentes, ids raros) y descarta lo que no sabría leer, y el bucle no se cae nunca por un error inesperado (un
+libro con otra forma, un fallo de red fuera del SDK): un broker caído deja el venue `board` sin cruzar nada. Solo sale,
+con código EXIT_FATAL, si la clave es rechazada (reintentar no arreglaría nada). `--heartbeat FICHERO` toca un fichero
+tras cada lectura buena del libro para que un supervisor (venue_switch.py) detecte un proceso colgado.
 """
 from __future__ import annotations
 
 import argparse
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 
@@ -50,9 +58,42 @@ PRIOR_WEIGHT = 2      # peso del prior de sombreado frente a cada oferta relajad
 RELAX_DONE = 0.85     # fracción media del sombreado que ha recorrido una oferta relajada al irse
 MIN_SHADE = 0.05      # con al menos MIN_MOVES ofertas relajadas observadas y menos sombreado, vuelve al puesto
 MIN_MOVES = 4
+MAX_SHADE = 0.9       # tope del sombreado aprendido: con 1 o más, el límite estimado del comprador diverge
+EXIT_FATAL = 3        # la clave no vale: el supervisor no debe relanzar
+FATAL_CODES = {"bad_key", "unauthorized", "forbidden", "invalid_key"}
 
 
 # ---------------------------------------------------------------------------------------------------- lectura del libro
+def _int(x) -> int:
+    return int(x or 0)
+
+
+def clean_book(book) -> dict:
+    """El libro con la forma que leen las funciones de abajo: cantidades a int, comisiones presentes y solo las ofertas
+    del banco legibles (id 'bN-M', exactamente un lado con dinero). Lo descartado se ignora en vez de tumbar el broker."""
+    if not isinstance(book, dict):
+        return {"bench_offers": [], "offers": [], "fee_bps": 0, "fee_per_card": 0}
+    bench = []
+    for o in book.get("bench_offers") or []:
+        try:
+            give, want = o.get("give") or {}, o.get("want") or {}
+            bid, ask = _int(give.get("cash")), _int(want.get("cash"))
+            exp = o.get("expires_tick")
+            exp = None if exp is None else int(exp)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        oid = o.get("id")
+        if not isinstance(oid, str) or "-" not in oid or (bid > 0) == (ask > 0) or min(bid, ask) < 0:
+            continue
+        bench.append({**o, "give": {**give, "cash": bid}, "want": {**want, "cash": ask}, "expires_tick": exp})
+    offers = book.get("offers") if isinstance(book.get("offers"), list) else []
+    try:
+        fees = {"fee_bps": _int(book.get("fee_bps")), "fee_per_card": _int(book.get("fee_per_card"))}
+    except (TypeError, ValueError):
+        fees = {"fee_bps": 0, "fee_per_card": 0}
+    return {**book, **fees, "bench_offers": bench, "offers": offers}
+
+
 def fee_fn(book: dict):
     """Comisión del venue sobre un precio, como la cobra (redondeada hacia arriba), la paga el comprador."""
     bps, per_card = book.get("fee_bps") or 0, book.get("fee_per_card") or 0
@@ -108,7 +149,8 @@ class Tracker:
 
     @property
     def shade(self) -> float:
-        return (sum(self.moves) / RELAX_DONE + PRIOR_WEIGHT * self.prior) / (len(self.moves) + PRIOR_WEIGHT)
+        s = (sum(self.moves) / RELAX_DONE + PRIOR_WEIGHT * self.prior) / (len(self.moves) + PRIOR_WEIGHT)
+        return min(max(s, 0.0), MAX_SHADE)
 
     def update(self, book: dict, tick: int, matched=frozenset()) -> None:
         live = set()
@@ -361,38 +403,84 @@ class BenchBroker:
 
 
 # ---------------------------------------------------------------------------------------------------- bucle real
-def main() -> None:
+def fatal(e) -> bool:
+    """Un rechazo que ningún reintento arregla: la clave no vale (venue cerrado, clave de otro venue, mal copiada)."""
+    return getattr(e, "code", "") in FATAL_CODES or getattr(e, "status", 0) in (401, 403)
+
+
+def beat(path: str | None, tick: int) -> None:
+    """Latido para el supervisor: solo tick y hora, nunca la clave."""
+    if not path:
+        return
+    try:
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(f"{tick} {time.time():.0f}\n")
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"no se puede escribir el latido ({e})")
+
+
+def step(broker, bb: BenchBroker, book: dict, tick: int, BazaarError) -> None:
+    """Un estado nuevo del libro: banco con el plan del broker (o el del puesto si el plan falla) y ofertas públicas."""
+    mode = bb.dog.mode
+    try:
+        plan = bb.plan(book, tick)
+    except Exception as e:  # noqa: BLE001 — fuera del try de smart_plan (seguimiento, vigilante): el puesto, nunca nada
+        bb.dog.errors += 1
+        bb.dog.trip(f"error fuera del planificador: {e!r}")
+        plan = [Match(s, b, p, "stall") for s, b, p in stall_plan(book)]
+    for m in plan:
+        try:
+            broker.match(m.sell, m.buy, m.price)
+            bb.feedback(m, True)
+        except BazaarError as e:
+            if fatal(e):
+                raise
+            bb.feedback(m, False)
+            print(f"tick {tick}: {m.kind} {m.sell} x {m.buy} a {m.price} rechazado ({e})")
+    if bb.dog.mode != mode:
+        print(f"tick {tick}: VIGILANTE → plan del puesto ({bb.dog.reason})")
+    try:
+        public = public_plan(book)
+    except Exception as e:  # noqa: BLE001 — una oferta pública con otra forma no debe parar el banco
+        print(f"tick {tick}: ofertas públicas ilegibles ({e!r})")
+        public = []
+    for sell, buy, price in public:
+        try:
+            broker.match(sell, buy, price)
+        except BazaarError as e:
+            if fatal(e):
+                raise
+            print(f"tick {tick}: {sell} x {buy} a {price} rechazado ({e})")
+
+
+def main(argv=None) -> None:
     from bazaar_sdk import BazaarError, Broker
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--mode", choices=["smart", "stall"], default="smart")
     ap.add_argument("--floor", choices=["cover", "count", "none"], default="cover")
     ap.add_argument("--probe", type=int, default=PROBE_MAX, help="sondeos por tick fuera de cotización (0 = ninguno)")
-    args = ap.parse_args()
+    ap.add_argument("--heartbeat", help="fichero que se toca tras cada lectura buena del libro (para un supervisor)")
+    args = ap.parse_args(argv)
     bb = BenchBroker(args.mode, args.floor, min(args.probe, PROBE_MAX))
     broker, seen = Broker(os.environ.get("BAZAAR_URL", "https://bazaar.causaprima.ai"), os.environ["BROKER_KEY"]), None
     while True:  # dos lecturas por segundo, como starter_broker
         try:
-            tick, book = broker.clock()["tick"], broker.book()
-            now = (tick, [o["id"] for o in (book.get("bench_offers") or []) + (book.get("offers") or [])])
+            tick, book = int(broker.clock()["tick"]), clean_book(broker.book())
+            beat(args.heartbeat, tick)
+            now = (tick, [o["id"] for o in book["bench_offers"]] + [o.get("id") for o in book["offers"]
+                                                                      if isinstance(o, dict)])
             if now != seen:
                 seen = now
-                mode = bb.dog.mode
-                for m in bb.plan(book, tick):
-                    try:
-                        broker.match(m.sell, m.buy, m.price)
-                        bb.feedback(m, True)
-                    except BazaarError as e:
-                        bb.feedback(m, False)
-                        print(f"tick {tick}: {m.kind} {m.sell} x {m.buy} a {m.price} rechazado ({e})")
-                if bb.dog.mode != mode:
-                    print(f"tick {tick}: VIGILANTE → plan del puesto ({bb.dog.reason})")
-                for sell, buy, price in public_plan(book):
-                    try:
-                        broker.match(sell, buy, price)
-                    except BazaarError as e:
-                        print(f"tick {tick}: {sell} x {buy} a {price} rechazado ({e})")
+                step(broker, bb, book, tick, BazaarError)
         except BazaarError as e:
+            if fatal(e):
+                print(f"clave de broker rechazada ({e.code}): salgo con código {EXIT_FATAL}")
+                sys.exit(EXIT_FATAL)
             print(f"no se puede leer el libro ({e}), reintento")
+        except Exception as e:  # noqa: BLE001 — libro con otra forma, red fuera del SDK...: el proceso no se cae
+            print(f"error inesperado ({type(e).__name__}: {e}), reintento")
         time.sleep(1.0)
 
 

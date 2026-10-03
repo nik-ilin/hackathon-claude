@@ -154,3 +154,13 @@ Novedades:
 - El tope de 10 cruces por tick de `broker_run.py` pierde un ~4 % en libros densos.
 
 Pruebas: `python3 -m unittest test_market_broker`.
+
+## Cambio a venue `board` propio (`venue_switch.py`)
+
+`BAZAAR_KEY=tk_... python3 venue_switch.py` (en seco, por defecto) comprueba con GET la caja (≥ 270 P + colchón), el nivel (≥ 2), que no haya un venue propio, el horario (sin sesión del Market Test en curso según el feed y al menos `--min-lead` min hasta la próxima según `/api/schedule`; si no se puede leer, `--next-bench-in MIN`) y el autotest de `market_broker`. Imprime el plan y el déficit de caja.
+
+Con `--execute [--announce]` abre `board` a 0 bps y 0 P por carta, toma la broker key de la respuesta solo en memoria y la pasa al entorno de `market_broker.py` (sin `BAZAAR_KEY`). Un supervisor relanza el broker si muere o si se para su latido (`data/venue_broker.heartbeat`, solo tick y hora). Tras 3 caídas en 10 min pasa a `starter_broker.py`, y si la clave es rechazada para. Cada incidencia lanza una ALERTA (`--alert-cmd` para notificar fuera). El anuncio solo se envía cuando el broker ya late. `--resume` relanza el supervisor con `BROKER_KEY` o con la clave de `/api/me`, si el servidor la expone.
+
+**Riesgo:** si el proceso cae, el venue no cruza nada. Además, la broker key solo se devuelve una vez. **Vuelta atrás:** cerrar el venue devuelve la fianza tras un cooldown, pero RULES.md no promete que vuelva el puesto, y sin venue la sesión cuenta 0. La vuelta atrás real es `--broker-mode stall`, que cruza como el puesto. Detalle en el docstring de `venue_switch.py`.
+
+Pruebas: `python3 -m unittest test_venue_switch test_market_broker`.
