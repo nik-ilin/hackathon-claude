@@ -3,6 +3,8 @@
 The Bazaar · Cromos de Madrid, a hackathon game hosted by Causa Prima.
 Welcome!
 
+Team 15's Sunday operation guide (market, broker and Duels III): [DAY3.md](DAY3.md).
+
 One file, standard library only: `bazaar_sdk.py`.
 Copy it next to your agent, or run from this folder.
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import importlib.util
 import json
 import os
 import statistics
@@ -22,14 +23,22 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 KIT = HERE.parent / "bazaar-kit"
-sys.path.insert(0, str(KIT))
+sys.path.append(str(KIT))  # los módulos locales (radio.py, scoring.py) deben ganar a los del kit
 import dashboard as public_dashboard
 
 import charts
 import history
+import operations
 import scoring
 from planner import build_rank
-from radio import interpret, news_item, radio_summary, radio_event
+
+# El kit también tiene radio.py; cargar el módulo del panel por ruta evita que
+# una importación previa del kit sustituya sus funciones en un proceso largo.
+_radio_spec = importlib.util.spec_from_file_location("team15_dashboard_radio", HERE / "radio.py")
+_radio = importlib.util.module_from_spec(_radio_spec)
+_radio_spec.loader.exec_module(_radio)
+interpret, news_item = _radio.interpret, _radio.news_item
+radio_summary, radio_event = _radio.radio_summary, _radio.radio_event
 
 URL = os.environ.get("BAZAAR_URL", "https://bazaar.causaprima.ai").rstrip("/")
 
@@ -119,9 +128,8 @@ class Model:
     def __init__(self, reader: Reader, team: str = "t15", reserve: int = 100,
                  feed_root: Path = KIT):
         self.reader, self.team, self.reserve = reader, team, reserve
-        self.public = public_dashboard.Builder(reader,
+        self.public = public_dashboard.Builder(reader, team=team, root=feed_root)
         self.history_path = Path(feed_root) / "data" / "score_history.jsonl"
-                                               team=team, root=feed_root)
         self.lock = threading.Lock()
         self.cached = None
         self.cached_at = 0.0
@@ -180,7 +188,7 @@ class Model:
                 self.catalog = self.reader.get("/api/catalog")
             except Exception as exc:
                 warnings.append(f"Catálogo: {type(exc).__name__}")
-        me, own_offers = {}, []
+        me, own_offers, live_duels, duel_error = {}, [], None, None
         if self.reader.key:
             try:
                 me = self.reader.get("/api/me", private=True)
@@ -189,6 +197,11 @@ class Model:
                     me = {}
                 else:
                     own_offers = self.reader.get("/api/me/offers", private=True).get("offers") or []
+                    try:
+                        live_duels = self.reader.get("/api/duels", private=True).get("duels") or []
+                    except Exception as exc:
+                        duel_error = f"{type(exc).__name__}: /api/duels"
+                        warnings.append("Duelos privados no disponibles; la cola de cierre queda desactivada.")
             except Exception as exc:
                 warnings.append(f"Equipo 15: {type(exc).__name__}. Comprueba BAZAAR_KEY.")
                 me = {}
@@ -236,6 +249,11 @@ class Model:
         rank["scoring"] = scoring.scoring_block(rank.get("score") or {}, public.leaderboard, self.team)
         rank["peers"] = scoring.peers_block(public.leaderboard, self.team)
         rank["feed_health"] = scoring.feed_health(self.public.stores, tick_now)
+        rank["operations"] = operations.build(duels=live_duels, duel_error=duel_error,
+                                                tick=tick_now, cash=rank.get("cash"),
+                                                offers=own_offers, reserve=self.reserve,
+                                                venues=venues, feed_health=rank["feed_health"],
+                                                verified=bool(rank.get("verified")), team=self.team)
         rank["ladder"] = scoring.ladder_block(self._dealers(), settled_by_dealer(self.public.stores, self.team),
                                               me.get("unlocked") or [])
         if tick_now:
@@ -403,6 +421,7 @@ CSS += r"""
 def render_dashboard_overview(data: dict) -> str:
     """Compact decision visualizations using the same live rows as the detailed views."""
     rows = data.get('catalog_rows') or []
+    verified = bool(data.get('verified'))
     released = [r for r in rows if r.get('released')]
     sold = sorted([r for r in released if r.get('sold_median') is not None], key=lambda r: r.get('sold_median') or 0, reverse=True)[:7]
     max_sold = max([r.get('sold_median') or 0 for r in sold] or [1])
@@ -417,18 +436,19 @@ def render_dashboard_overview(data: dict) -> str:
         pct = round(owned / len(available) * 100) if available else 0
         sets.append((name, pct, owned, len(available)))
     sets.sort(key=lambda x: x[1], reverse=True)
-    coverage = ''.join(f'<div class="coverage-item"><b>{esc(name)}</b><span class="coverage-track"><i style="width:{pct}%"></i></span><small>{owned}/{total}</small></div>' for name,pct,owned,total in sets[:8])
+    coverage = (''.join(f'<div class="coverage-item"><b>{esc(name)}</b><span class="coverage-track"><i style="width:{pct}%"></i></span><small>{owned}/{total}</small></div>' for name,pct,owned,total in sets[:8])
+                if verified else '<p class="sub">Conecta la clave y verifica la valoración para medir cobertura real.</p>')
     holders = sorted([r for r in released if r.get('held_by')], key=lambda r: len(r.get('held_by') or []), reverse=True)[:6]
     max_holders = max([len(r.get('held_by') or []) for r in holders] or [1])
     holder_bars = ''.join(f'<div class="bar-row"><span class="bar-label">{esc(r["ref"])}</span><span class="bar-track"><i class="bar-fill" style="width:{max(5, len(r.get("held_by") or [])/max_holders*100):.1f}%;background:linear-gradient(90deg,var(--saffron),#f0c96b)"></i></span><b class="bar-value">{len(r.get("held_by") or [])} equipos</b></div>' for r in holders) or '<p class="sub">Aún no hay posesiones observadas.</p>'
     free = [r for r in released if isinstance(r.get('free'), int) and r['free'] > 0]
-    missing = [r for r in released if r.get('stock') == 0]
+    missing = [r for r in released if r.get('stock') == 0] if verified else []
     scarce = sorted([r for r in released if r.get('minted') and r.get('print_run')], key=lambda r: r['minted']/r['print_run'])[:1]
     top_scarce = scarce[0] if scarce else None
     trades = data.get('trades') or []
     best_trade = trades[0] if trades else None
-    missing_value = sum((r.get('buy_ceiling') or 0) for r in released if r.get('stock') == 0)
-    sell_value = sum((r.get('sold_median') or 0) for r in free)
+    missing_value = sum((r.get('buy_ceiling') or 0) for r in missing) if verified else None
+    sell_value = sum((r.get('sold_median') or 0) for r in free) if verified else None
     sold_values = [r.get('sold_median') for r in released if r.get('sold_median') is not None]
     avg_sold = statistics.mean(sold_values) if sold_values else None
     demand_total = sum(len(r.get('wanted_by') or []) for r in released)
@@ -436,23 +456,23 @@ def render_dashboard_overview(data: dict) -> str:
     def action(icon, title, detail, kind=''):
         return f'<article class="action-card {kind}"><span class="action-icon">{icon}</span><div><strong>{title}</strong><span>{detail}</span></div></article>'
     analytics = ('<section class="analytics-grid" aria-label="KPIs estratégicos">'
-        f'<article class="analytics-card"><small>Capital potencial en faltantes</small><strong>{fmt(missing_value)} P</strong><span>Suma de topes de compra publicados</span></article>'
-        f'<article class="analytics-card"><small>Liquidez de duplicados</small><strong>{fmt(sell_value)} P</strong><span>Medianas vendidas de cartas libres</span></article>'
+        f'<article class="analytics-card"><small>Capital potencial en faltantes</small><strong>{fmt(missing_value)} P</strong><span>{"Suma de topes privados de compra" if verified else "Requiere valoración privada verificada"}</span></article>'
+        f'<article class="analytics-card"><small>Liquidez de duplicados</small><strong>{fmt(sell_value)} P</strong><span>{"Medianas vendidas de cartas libres" if verified else "Requiere inventario privado verificado"}</span></article>'
         f'<article class="analytics-card"><small>Precio mediano del mercado</small><strong>{fmt(avg_sold)} P</strong><span>Entre referencias con venta confirmada</span></article>'
         f'<article class="analytics-card"><small>Presión de demanda</small><strong>{demand_total} / {held_total}</strong><span>Pedidos frente a posesiones observadas</span></article></section>')
     priorities = ('<section class="priority-panel" aria-label="Lectura estratégica">'
-        f'<article class="priority-card"><span class="priority-value">{len(free)} cartas</span><h3>Vender primero</h3><p>Duplicados libres detectados. Empieza por las que tienen compradores y mediana ejecutada.</p></article>'
-        f'<article class="priority-card buy"><span class="priority-value">{len(missing)} cartas · {fmt(missing_value)} P</span><h3>Comprar con criterio</h3><p>Faltantes publicados. Ordena el catálogo por “valor al recibir” y respeta la caja disponible.</p></article>'
-        f'<article class="priority-card hold"><span class="priority-value">{len(released)-len(free)-len(missing)} cartas</span><h3>Proteger</h3><p>Cartas propias sin duplicado. Son el núcleo de colección; venderlas tiene coste de oportunidad.</p></article></section>')
+        f'<article class="priority-card"><span class="priority-value">{len(free) if verified else "—"} cartas</span><h3>Vender primero</h3><p>{"Duplicados libres detectados; priorizar comprador real." if verified else "Inventario privado necesario para confirmar copias libres."}</p></article>'
+        f'<article class="priority-card buy"><span class="priority-value">{len(missing) if verified else "—"} cartas · {fmt(missing_value)} P</span><h3>Comprar con criterio</h3><p>{"Ordena por valor al recibir y respeta la caja disponible." if verified else "La ausencia en el feed no prueba que falte en tu mano."}</p></article>'
+        f'<article class="priority-card hold"><span class="priority-value">{len(released)-len(free)-len(missing) if verified else "—"} cartas</span><h3>Proteger</h3><p>{"Últimas copias y páginas completas tienen coste marginal alto." if verified else "Conecta valoración privada para proteger últimas copias."}</p></article></section>')
     overview = (analytics + priorities + '<section class="dashboard-overview" aria-label="Resumen visual">'
 
         '<article class="viz-card"><div class="viz-head"><div><h2>Precios que ya se han pagado</h2><p class="viz-caption">Mediana de ventas individuales confirmadas en el feed</p></div>'
         f'<div class="mini-stat"><strong>{len(sold)}</strong><span>referencias con venta</span></div></div><div class="bar-chart">{sold_bars}</div><div class="chart-legend"><span><i class="dot"></i>Precio mediano ejecutado</span><span>Ordenado de mayor a menor</span></div></article>'
-        '<article class="viz-card"><div class="viz-head"><div><h2>Cobertura de colección</h2><p class="viz-caption">Cartas publicadas que ya tenemos por colección</p></div></div><div class="coverage-grid">'+(coverage or '<p class="sub">Sin colecciones publicadas.</p>')+'</div><div class="chart-legend"><span><i class="dot violet"></i>Más cobertura</span><span>Haz clic en una colección abajo para filtrar</span></div></article>'
+        '<article class="viz-card"><div class="viz-head"><div><h2>Cobertura de colección</h2><p class="viz-caption">Cartas publicadas que ya tenemos por colección</p></div></div><div class="coverage-grid">'+(coverage or '<p class="sub">Sin colecciones publicadas.</p>')+'</div><div class="chart-legend"><span><i class="dot violet"></i>Más cobertura</span><span>La vista requiere inventario privado verificado</span></div></article>'
         '<article class="viz-card"><div class="viz-head"><div><h2>Cartas más comunes</h2><p class="viz-caption">Equipos distintos en los que hemos observado cada referencia</p></div></div><div class="bar-chart">'+holder_bars+'</div><div class="chart-legend"><span><i class="dot gold"></i>Posesión observada</span><span>Más equipos = menos exclusividad</span></div></article></section>')
     actions = '<section class="action-strip" aria-label="Siguientes decisiones">'
-    actions += action('↗', f'{len(free)} duplicados libres', 'Revisa el precio de venta sugerido en Venta rápida', 'hot' if free else '')
-    actions += action('＋', f'{len(missing)} cartas faltantes', 'Prioriza las que tengan mayor valor al recibirlas', 'warn' if missing else '')
+    actions += action('↗', f'{len(free) if verified else "—"} duplicados libres', 'Revisa el precio de venta sugerido en Venta rápida' if verified else 'Requiere inventario privado', 'hot' if free else '')
+    actions += action('＋', f'{len(missing) if verified else "—"} cartas faltantes', 'Prioriza las que tengan mayor valor al recibirlas' if verified else 'Requiere valoración privada', 'warn' if missing else '')
     actions += action('◎', f'{"Escasez: "+top_scarce["ref"] if top_scarce else "Sin dato de tirada"}', f'{fmt(top_scarce["minted"])} de {fmt(top_scarce["print_run"])} acuñadas' if top_scarce else 'El feed aún no publica tiradas completas', '')
     actions += '</section>'
     return overview + actions
@@ -553,6 +573,7 @@ def strategy_export(data: dict) -> dict:
         'ladder': data.get('ladder') or {},
         'peers': data.get('peers') or {},
         'feed_health': data.get('feed_health') or {},
+        'operations': data.get('operations') or {},
         'opportunities': opportunities,
         'kpis': {
             'published_cards': len(released), 'catalog_cards': len(rows),
@@ -784,8 +805,9 @@ def render_monitor(data: dict) -> str:
     comps = block.get('components') or {}
     parts = ['<section id="monitor" class="monitor"><div class="section-head"><div>',
              '<h2>Monitor de ranking</h2>',
-             '<p class="sub">Los 60 puntos se reparten 30 de negociación y 30 de mercado. '
-             'El valor de colección y los bonos de página no son componentes del score.</p>',
+             '<p class="sub">El servidor aporta 60 puntos: 30 de negociación y 30 de mercado '
+             '(22,5 test + 7,5 tratos de terceros). Jueces aportan otros 40. '
+             'El valor de colección y los bonos de página no puntúan por tenencia.</p>',
              '</div></div>']
 
     if health.get('status') and health['status'] != 'fresh':
@@ -823,9 +845,9 @@ def render_monitor(data: dict) -> str:
 
     if ladder.get('levels'):
         parts += ['<div class="section-head"><div><h3>Casillas de escalera</h3>',
-                  f'<p class="sub">{esc(ladder.get("empty_slots_available"))} huecos disponibles '
+                  f'<p class="sub">Hasta {esc(ladder.get("empty_slots_available"))} huecos sin liquidación observada '
                   f'(peso {esc(ladder.get("empty_slots_weighted_by_level"))} contando el nivel). '
-                  'Una casilla vacía cuenta cero y los niveles altos pesan más.</p></div></div>',
+                  'El feed local puede estar incompleto; confirmar con score privado. Los niveles altos pesan más.</p></div></div>',
                   '<div class="ladder">']
         for level in ladder['levels']:
             state = 'off' if not level['available'] else ('done' if not level['slots_empty'] else 'open')
@@ -902,6 +924,17 @@ def render_trend(data: dict) -> str:
                           title='Los dos componentes, sobre 30',
                           caption='30 puntos cada uno. Un venue sin trades puntúa 7.50 sea board o auto, '
                                   'así que una línea plana en 7.50 es el suelo, no un resultado.'),
+        charts.line_chart({'duelos': history.series(rows, 'duel_points'),
+                           'dealers': history.series(rows, 'ladder_points'),
+                           'trades': history.series(rows, 'neg_points'),
+                           'terceros en v15': history.series(rows, 'mm_points')},
+                          title='Motores de puntos privados',
+                          caption='Serie sólo cuando /api/me entrega el desglose. Comparar cambios entre ticks; '
+                                  'un movimiento simultáneo no demuestra qué acción lo causó.'),
+        charts.line_chart({'caja': history.series(rows, 'cash'),
+                           'valor de colección': history.series(rows, 'collection_value')},
+                          title='Caja y colección',
+                          caption='Son recursos y riesgos operativos. Su nivel final no puntúa por sí mismo.'),
         charts.line_chart({'nuestra': history.efficiency_series(rows)}, value_fmt='{:.2f}',
                           baseline=best_eff.get('negotiating_per_deal'),
                           baseline_label=f'mejor: {esc(best_eff.get("team"))}',
@@ -947,6 +980,67 @@ def render_trend(data: dict) -> str:
     return ''.join(parts)
 
 
+CSS += """
+.ops{margin:0 0 22px;background:#fff;border:1px solid var(--line);border-radius:19px;padding:20px 22px;box-shadow:var(--shadow)}
+.ops-heading{display:flex;justify-content:space-between;gap:14px;align-items:baseline;border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:16px}
+.ops-heading h2{margin:0}.ops-heading p{color:var(--muted);margin:4px 0 0}.ops-heading>span{font-weight:700;color:var(--teal);white-space:nowrap}
+.ops-grid{display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:18px}.ops-grid article+article{border-left:1px solid var(--line);padding-left:18px}
+.ops-grid h3{margin:0 0 9px}.ops-grid p{color:var(--muted);font-size:12px;line-height:1.45;margin:8px 0}
+.ops-alerts{list-style:none;padding:0;margin:0;display:grid;gap:8px}.ops-alert{display:grid;gap:3px;border-left:3px solid var(--teal);padding:7px 9px;background:#f2f7f7}
+.ops-alert.critical{border-color:var(--red);background:#fff1ef}.ops-alert.high{border-color:var(--saffron);background:#fff8e9}
+.ops-alert b{font-size:13px}.ops-alert span{font-size:11px;color:var(--muted)}.ops-empty{border:1px dashed var(--line);padding:12px}
+.duel-lane{border-bottom:1px solid var(--line);padding:8px 0}.duel-lane>div:first-child{display:flex;justify-content:space-between;gap:8px;font-size:11px}.duel-lane b{font-size:12px}.duel-lane span,.duel-lane small{color:var(--muted)}
+.duel-track{height:5px;background:#e4edf0;border-radius:9px;overflow:hidden;margin:6px 0}.duel-track i{display:block;height:100%;background:var(--teal)}.duel-lane.close_now .duel-track i{background:var(--red)}.duel-lane.unsafe .duel-track i{background:var(--saffron)}
+.cash-stack{height:13px;background:#ccebe5;display:flex;border-radius:10px;overflow:hidden;margin:9px 0}.cash-stack i{height:100%;display:block}.cash-stack .committed{background:var(--red)}.cash-stack .reserved{background:var(--saffron)}
+@media(max-width:1050px){.ops-grid{grid-template-columns:1fr 1fr}.ops-primary{grid-column:1/-1}.ops-grid article+article{border-left:0;padding-left:0}.ops-detail:last-child{border-left:1px solid var(--line);padding-left:18px}}
+@media(max-width:680px){.ops-grid{display:block}.ops-grid article{padding:12px 0!important;border:0!important;border-bottom:1px solid var(--line)!important}.ops-heading{display:block}.ops-heading>span{display:block;margin-top:8px}}
+"""
+
+
+def render_operations(data: dict) -> str:
+    op = data.get('operations') or {}
+    duel, capital, market = (op.get('duels') or {}), (op.get('capital') or {}), (op.get('market') or {})
+    queue = op.get('queue') or []
+    alerts = ''.join(f'<li class="ops-alert {esc(item.get("priority"))}"><b>{esc(item.get("action"))}</b>'
+                     f'<span>{esc(item.get("evidence"))}</span></li>' for item in queue[:6])
+    if not alerts:
+        alerts = '<li class="ops-alert"><b>Sin alertas prioritarias</b><span>Seguir el reloj y confirmar la frescura de las fuentes.</span></li>'
+    duel_rows = []
+    for row in (duel.get('rows') or [])[:12]:
+        width = min(100, max(3, row['ticks_left'] / 12 * 100))
+        duel_rows.append(f'<div class="duel-lane {esc(row["state"])}">'
+                         f'<div><b>Duelo {esc(row["duel"])}</b><span>{esc(row["role"])} · '
+                         f'{esc(row["ticks_left"])} ticks · margen {fmt(row["total_margin"])} P</span></div>'
+                         f'<div class="duel-track"><i style="width:{width:.1f}%"></i></div>'
+                         f'<small>{esc(row["action"])}</small></div>')
+    if not duel_rows:
+        duel_rows.append('<p class="ops-empty">'
+                         + ('Lectura privada de duelos no disponible.' if duel.get('status') == 'unavailable'
+                            else 'No hay duelos vivos en este tick.') + '</p>')
+    cash = capital.get('cash')
+    cash_parts = ''
+    if isinstance(cash, (int, float)) and cash > 0:
+        committed = min(100, 100 * capital.get('open_bid_commitments', 0) / cash)
+        reserve = min(100 - committed, 100 * capital.get('operating_reserve', 0) / cash)
+        cash_parts = (f'<div class="cash-stack" role="img" aria-label="Caja comprometida {fmt(capital.get("open_bid_commitments"))} P, '
+                      f'reserva {fmt(capital.get("operating_reserve"))} P, gastable {fmt(capital.get("spendable_after_reserve"))} P">'
+                      f'<i class="committed" style="width:{committed:.1f}%"></i>'
+                      f'<i class="reserved" style="width:{reserve:.1f}%"></i></div>')
+    return ('<section id="operacion" class="ops"><div class="ops-heading"><div><h2>Mesa de mando</h2>'
+            '<p>Decisiones del tick actual. El panel observa; los agentes ejecutan con sus propios límites.</p></div>'
+            f'<span>Tick {esc(op.get("source_tick"))}</span></div><div class="ops-grid">'
+            '<article class="ops-primary"><h3>Atender ahora</h3><ul class="ops-alerts">' + alerts + '</ul></article>'
+            '<article class="ops-detail"><h3>Duelos vivos</h3><p>Una aceptación por tick. Releer antes de aceptar.</p>'
+            + ''.join(duel_rows) + '</article>'
+            '<article class="ops-detail"><h3>Capital y mercado</h3>'
+            f'<p><strong>{fmt(cash)} P</strong> en caja · {fmt(capital.get("open_bid_commitments"))} P comprometidas</p>'
+            + cash_parts + f'<p>Gastable tras reserva: <b>{fmt(capital.get("spendable_after_reserve"))} P</b></p>'
+            f'<p>Venue {esc(market.get("venue"))} · {esc(market.get("mechanism"))}; '
+            f'broker vivo: {"por verificar" if market.get("broker_required") else "no requerido"}</p>'
+            f'<p>Board: {"caja suficiente para preflight" if capital.get("board_cash_ready") else "caja insuficiente o privada no disponible"}. '
+            'La decisión final requiere autotest y supervisor.</p></article></div></section>')
+
+
 def render(data: dict) -> str:
     tick = data.get("tick")
     live = data.get("live")
@@ -955,7 +1049,7 @@ def render(data: dict) -> str:
     trades = data.get("trades") or []
     parts = ['<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
              '<title>Team 15 · mesa de trades</title><style>', CSS, '</style></head><body data-tick="' + esc(tick) + '"><div class="wrap">',
-             '<header><div><h1>Vender duplicados · Team 15</h1><p class="sub">Compradores concretos, precio razonado y valor neto para nuestra colección.</p></div>',
+             '<header><div><h1>Mesa de mando · Team 15</h1><p class="sub">Puntos, duelos, caja y mercado para decidir durante el último día.</p></div>',
              '<div class="status"><span class="flag ', 'live' if live else 'warn', '">',
              'Equipo conectado' if live else 'Sólo feed público', '</span><span class="clock">Tick ', esc(tick), '</span></div></header>',
              '<div class="summary">',
@@ -963,7 +1057,7 @@ def render(data: dict) -> str:
              f'<div class="metric"><small>Valor de colección</small><strong>{fmt(data.get("collection_value"))} P</strong></div>',
              f'<div class="metric"><small>{"Puntos propios en vivo" if live else "Puntos del leaderboard (con retraso)"}</small><strong>{fmt(score.get("score"))}</strong></div>',
              f'<div class="metric"><small>Ofertas visibles · venues</small><strong>{data.get("board_count",0)} · {data.get("venue_count",0)}</strong></div>',
-             '</div><nav class="jump"><a href="#monitor">Monitor de ranking</a><a href="#tendencia">Trayectoria</a><a href="#guide">Venta rápida</a><a href="#radio">Radio y decisión</a><a href="#ranking">Ranking</a><a href="#estrategia-ranking">Estrategia</a><a href="#catalogo">Catálogo completo</a></nav>', render_monitor(data), render_trend(data), render_dashboard_overview(data), render_rank_strategy(data)]
+             '</div><nav class="jump"><a href="#operacion">Mesa de mando</a><a href="#monitor">Monitor de ranking</a><a href="#tendencia">Trayectoria</a><a href="#guide">Venta rápida</a><a href="#radio">Radio y decisión</a><a href="#ranking">Ranking</a><a href="#estrategia-ranking">Estrategia</a><a href="#catalogo">Catálogo completo</a></nav>', render_operations(data), render_monitor(data), render_trend(data), render_dashboard_overview(data), render_rank_strategy(data)]
     for warning in data.get("warnings") or []:
         parts.append('<div class="warning">' + esc(warning) + '</div>')
     guide = data.get("sale_guide") or []

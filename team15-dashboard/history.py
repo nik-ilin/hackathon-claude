@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 FIELDS = ("score", "negotiating", "market", "rank", "cash", "collection_value",
-          "deals", "album_filled", "pages_complete", "ladder_points", "duel_points")
+          "deals", "album_filled", "pages_complete", "ladder_points", "duel_points",
+          "neg_points", "mm_points")
 
 
 def sample(tick: int, t_hours: Optional[float], score: dict, leaderboard: dict,

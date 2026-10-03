@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import os
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -208,13 +209,27 @@ def broker_selftest(mode: str = "smart", probe: int = 3, sessions: int = 12) -> 
 
 # ---------------------------------------------------------------------------------------------------- plan
 def preflight(team, args, selftest=broker_selftest) -> Plan:
-    plan = Plan(need=BOND + OPEN_FEE + args.cushion)
+    plan = Plan(need=BOND + OPEN_FEE + max(0, args.cushion) + max(0, args.operating_reserve))
     me = team.me()
     plan.cash, level = int(me.get("cash") or 0), int(me.get("level") or 0)
+    plan.checks.append(Check("reservas", args.cushion >= 0 and args.operating_reserve >= 0,
+                             f"colchón {args.cushion} P; operación {args.operating_reserve} P (ambos ≥ 0)"))
+    committed = 0
+    if args.operating_reserve:
+        try:
+            offers = team.my_offers()
+            offers = offers if isinstance(offers, list) else offers.get("offers") or []
+            committed = sum(int((o.get("give") or {}).get("cash") or 0) for o in offers
+                            if o.get("status") == "open" and o.get("maker") in (None, me.get("id")))
+            plan.need += committed
+            plan.checks.append(Check("compromisos", True, f"{committed} P en pujas abiertas"))
+        except Exception as e:  # no se puede arriesgar capital sin saber las obligaciones
+            plan.checks.append(Check("compromisos", False, f"no se pudieron leer las ofertas propias ({e})"))
     plan.venue = me.get("venue") if isinstance(me.get("venue"), dict) else None
     plan.checks.append(Check("caja", plan.cash >= plan.need,
                              f"{plan.cash} P; hacen falta {plan.need} P ({BOND} fianza + {OPEN_FEE} apertura + "
-                             f"{args.cushion} colchón)" + (f"; DÉFICIT {plan.deficit} P" if plan.deficit else "")))
+                             f"{args.cushion} colchón + {args.operating_reserve} operación + {committed} comprometido)"
+                             + (f"; DÉFICIT {plan.deficit} P" if plan.deficit else "")))
     plan.checks.append(Check("nivel", level >= MIN_LEVEL, f"nivel {level} (mínimo {MIN_LEVEL})"))
     v = plan.venue or {}
     own = bool(v) and not v.get("starter") and v.get("status", "open") == "open"
@@ -223,6 +238,12 @@ def preflight(team, args, selftest=broker_selftest) -> Plan:
                              f"{' (puesto gratuito)' if v.get('starter') else ''}"
                              + ("; ya tenemos venue propio: usar --resume" if own else "")))
     plan.checks.append(Check("nombre", 0 < len(args.name) <= NAME_MAX, f"«{args.name}» ({len(args.name)}/{NAME_MAX})"))
+    if args.key_file:
+        p = Path(args.key_file).expanduser()
+        parent = p.parent
+        writable = os.access(parent if parent.exists() else parent.parent, os.W_OK)
+        plan.checks.append(Check("recuperación de broker key", writable,
+                                 f"fichero local con permisos 0600: {p}"))
     plan.checks.append(timing(team, args))
     ok, detail = selftest(args.broker_mode, args.probe)
     plan.checks.append(Check("autotest market_broker", ok, detail))
@@ -272,7 +293,8 @@ def report(plan: Plan, args) -> str:
     lines += ["", "Plan" + (" (EN SECO: no se escribe nada)" if not args.execute else "") + ":",
               f"  1. POST /api/venues name=«{args.name}» fee_bps=0 fee_per_card=0 rules.mechanism=board "
               f"(cuesta {BOND}+{OPEN_FEE} P; reemplaza el puesto al instante)",
-              "  2. broker key solo en memoria → entorno de market_broker.py "
+              "  2. broker key " + ("en fichero 0600 y memoria" if args.key_file else "solo en memoria")
+              + " → entorno de market_broker.py "
               f"--mode {args.broker_mode} --probe {args.probe} (sin BAZAAR_KEY)",
               f"  3. supervisor: relanza si muere o si no hay latido en {args.stale:.0f} s; reserva starter_broker.py "
               f"tras {args.fallback_after} caídas en {WINDOW / 60:.0f} min",
@@ -371,6 +393,30 @@ def child_env(broker_key: str) -> dict:
     return env
 
 
+def save_broker_key(path: str, key: str) -> None:
+    """Guarda una clave de recuperación opt-in sin exponerla en salida ni dejar un temporal legible por otros."""
+    p = Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=".broker-key-", dir=p.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(key + "\n")
+        os.replace(temp, p)
+        os.chmod(p, 0o600)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def load_broker_key(path: str) -> str | None:
+    p = Path(path).expanduser()
+    if not p.is_file() or stat.S_IMODE(p.stat().st_mode) & 0o077:
+        return None
+    key = p.read_text(encoding="utf-8").strip()
+    return key if key.startswith("bk_") else None
+
+
 def heartbeat_path() -> str:
     d = HERE / "data"
     try:
@@ -411,6 +457,12 @@ def execute(team, args, plan: Plan, *, make_broker=None, supervise=None) -> int:
         alert_default("venue abierto pero SIN broker key en la respuesta ni en /api/me: el venue NO cruza. "
                       "Revisar a mano YA (o cerrar el venue: la fianza vuelve tras un cooldown)", args.alert_cmd)
         return 4
+    if args.key_file:
+        try:
+            save_broker_key(args.key_file, key)
+            print("Broker key recuperable en el fichero local 0600 configurado.")
+        except OSError as e:
+            alert_default(f"no se pudo guardar la broker key: {e}; mantener vivo este proceso", args.alert_cmd)
     return run_broker(key, args, venue=venue, announce=args.announce, make_broker=make_broker, supervise=supervise)
 
 
@@ -446,6 +498,9 @@ def parse(argv=None):
     ap.add_argument("--name", default=DEFAULT_NAME)
     ap.add_argument("--description", default=DEFAULT_DESC)
     ap.add_argument("--cushion", type=int, default=20, help="colchón de caja además de los 270 P")
+    ap.add_argument("--operating-reserve", type=int, default=0,
+                    help="P adicionales para dealers/P2P; también protege efectivo comprometido en pujas abiertas")
+    ap.add_argument("--key-file", help="fichero local opt-in 0600 para poder reanudar el broker tras una caída")
     ap.add_argument("--min-lead", type=float, default=3.0, help="minutos mínimos hasta el próximo Market Test")
     ap.add_argument("--next-bench-in", type=float, help="minutos hasta el próximo Market Test si /api/schedule falla")
     ap.add_argument("--allow-during-bench", action="store_true", help="abrir aunque haya una sesión en curso")
@@ -461,12 +516,12 @@ def main(argv=None, team=None) -> int:
     args = parse(argv)
     url = os.environ.get("BAZAAR_URL", "https://bazaar.causaprima.ai")
     if args.resume:
-        key = os.environ.get("BROKER_KEY")
+        key = os.environ.get("BROKER_KEY") or (load_broker_key(args.key_file) if args.key_file else None)
         if not key:
             from bazaar_sdk import Bazaar
             key = find_broker_key((team or Bazaar(url, os.environ["BAZAAR_KEY"])).me())
         if not key:
-            print("Sin broker key: ni BROKER_KEY en el entorno ni en /api/me.")
+            print("Sin broker key: ni BROKER_KEY, ni fichero seguro configurado, ni /api/me.")
             return 4
         return run_broker(key, args)
     if team is None:

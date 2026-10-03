@@ -126,7 +126,12 @@ def main() -> None:
     ap.add_argument("--learn", action="store_true",
                     help="opt-in: aprendizaje en línea con los duelos TERMINADOS (resultado del servidor): refina accept/wait y el ancla "
                          "de apertura solo con evidencia suficiente; sin ella, política base. Registra la razón de cada decisión")
+    ap.add_argument("--day3", action="store_true",
+                    help="preset Duelos III: --days --ladder --profiles --reconcile --verify-accept; "
+                         "--learn y --logroll siguen opt-in")
     a = ap.parse_args()
+    if a.day3:
+        a.days = a.ladder = a.profiles = a.reconcile = a.verify_accept = True
     dl.PARAMS["PLAY_DAYS"] = a.days
     if a.ladder:
         dl.PARAMS["LADDER"] = LADDER

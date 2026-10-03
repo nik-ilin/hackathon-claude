@@ -11,6 +11,8 @@
 #   ./run.sh celestina [--loop]       -> casamentera de v15: imprime el anuncio (dry run); --execute para publicarlo
 #   ./run.sh t15                      -> coordinador con la configuración decidida del equipo (ver T15_PLAN.md)
 #   ./run.sh t15 --execute --ticks 120 -> igual, operando
+#   ./run.sh day3                    -> preset prudente del domingo, análisis por defecto
+#   ./run.sh market-switch           -> preflight board, sin abrir por defecto
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -33,6 +35,12 @@ case "${1:-}" in
   coord)  shift; exec python3 coordinator.py "$@" ;;
   market) shift; exec python3 market_agent.py "$@" ;;
   celestina) shift; exec python3 celestina.py "$@" ;;
+  market-switch) shift; exec python3 venue_switch.py "$@" ;;
+  day3)   shift; exec python3 coordinator.py --profile fast-close --selector economic \
+            --reserve 40 --per-card 95 --margin 2 --max-posts 2 \
+            --no-rival-venues --duende-venue rastro \
+            --dealer-sell-dups --ladder-fill --ladder-calibrated --chato-mirror auto \
+            --dedupe-bids "$@" ;;
   t15)    shift; exec python3 coordinator.py --reserve 5 --per-card 95 --margin 2 \
             --no-rival-venues --duende-venue rastro \
             --deny-teams t05,t14,t12,t10,t18 --deny-margin 15 \
