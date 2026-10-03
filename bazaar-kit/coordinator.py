@@ -3,6 +3,7 @@
     ./run.sh coord                                            # análisis (por defecto): solo lecturas
     ./run.sh coord --execute --ticks 20 --max-spend 80 --reserve 100 --per-card 60
     ./run.sh coord --deny-teams t12,t13,t14 --deny-margin 15 --pilar-sell SAL:1.25 --pilar-last-copy --ladder-fill
+    ./run.sh coord ... --ladder-fill --ladder-calibrated [--ladder-profile perfil.json]   # escalera calibrada (opt-in)
 
 Cada tick: observa (una instantánea) -> reconcilia lo enviado con evidencia del servidor -> genera CANDIDATAS de todos
 los módulos (mercado entre equipos, vendedores, seguridad) -> SELECCIONA como mucho una acción por clase de límite
@@ -32,6 +33,7 @@ import market_agent as ma
 import market_intel as mi
 import negotiation as neg
 import intelligence as intel_mod
+import ladder_calibrated as lcal
 import ladder_plus as lplus
 import page_guard as pg
 import performance as perf
@@ -251,10 +253,27 @@ def deny_cfg(args):
     return lplus.parse_deny_teams(getattr(args, "deny_teams", "")), getattr(args, "deny_margin", None)
 
 
+def calibrated_on(args):
+    """--ladder-calibrated (opt-in): escalera calibrada con los hilos reales (ladder_calibrated.py)."""
+    return bool(getattr(args, "ladder_calibrated", False))
+
+
+_CAL_PROFILES = {}
+
+
+def cal_profiles(args):
+    """Perfiles medidos + --ladder-profile FICHERO.json (se lee una vez por ruta)."""
+    path = getattr(args, "ladder_profile", None)
+    if path not in _CAL_PROFILES:
+        _CAL_PROFILES[path] = lcal.load_profiles(path)
+    return _CAL_PROFILES[path]
+
+
 def pilar_cfg(args):
-    """--pilar-sell SET[:MULT] (opt-in); --ladder-fill sin --pilar-sell vende a Pilar cualquier barrio a precio mediano."""
+    """--pilar-sell SET[:MULT] (opt-in); --ladder-fill / --ladder-calibrated sin --pilar-sell venden a Pilar cualquier
+    barrio."""
     cfg = lplus.parse_pilar_sell(getattr(args, "pilar_sell", None))
-    if cfg is None and getattr(args, "ladder_fill", False):
+    if cfg is None and (getattr(args, "ladder_fill", False) or calibrated_on(args)):
         cfg = lplus.PilarConfig(sets=frozenset())
     if cfg is not None:
         cfg.from_tick, cfg.until_tick = getattr(args, "pilar_from_tick", None), getattr(args, "pilar_until_tick", None)
@@ -311,7 +330,8 @@ def candidates(s, led, args, journal):
     counts = tr.counts_of(me["assets"])
     ccfg = capital_cfg(args)
     fill = bool(getattr(args, "ladder_fill", False))
-    ladder_on = bool(getattr(args, "dealer_ladder", False)) or fill  # --ladder-fill usa la escalera de #8
+    cal = calibrated_on(args)
+    ladder_on = bool(getattr(args, "dealer_ladder", False)) or fill or cal  # --ladder-fill usa la escalera de #8
     lc = ladder_cfg(args)
     pend_actions = [a for a in led["actions"]
                     if a["type"] in ("accept", "dealer_accept", "team_accept") and a["status"] in ("intent", "ambiguous", "submitted")]
@@ -398,6 +418,8 @@ def candidates(s, led, args, journal):
     # 3. Vendedores: conversaciones abiertas que son nuestras (no se tocan las ajenas). SECURE/OPTIMIZE por escalera.
     diag = {}
     rel = ca.releasable(scored, ccfg)
+    cal_plan = ladder_plan(s, led, args, val, counts, ladder, view.free_dealer_cash + rel) if cal else None
+    planned = {(o.dealer, o.mode, o.ref) for o in (cal_plan or {}).get("picks", [])}
     for t in open_dealer:
         if t["id"] not in mine_threads:
             out.append({"type": "info", "module": "vendedores", "kind": "conversación ajena", "thread": t["id"],
@@ -417,8 +439,15 @@ def candidates(s, led, args, journal):
             pol = neg.ladder_profile(did, lc, args.mode)
             notes_mode = "escalera observada"
             rarity = val.cards.get(item[5:], {}).get("rarity") if item and item.startswith("card:") else None
-            left = pol.max_ticks - neg.conversation_ticks_used(t, tick)
-            d = neg.decide_ladder(st, pol, ceiling, left, rarity, tick)
+            if cal:  # --ladder-calibrated: apertura extrema, paso corto, paciencia hasta final:true
+                key, cp_ = lcal.profile_for(cal_profiles(args), did, "buy", rarity or (item or "")[5:])
+                left = cp_.max_ticks - neg.conversation_ticks_used(t, tick)
+                d = lcal.decide_buy(st, cp_, ceiling, left, tick, name=f"calibrada {key}")
+                notes_mode = f"escalera calibrada {key} ({cp_.obs})" + (
+                    " · FAROL: dice «final» sin final:true, seguimos regateando" if lcal.bluff_final(t, did) else "")
+            else:
+                left = pol.max_ticks - neg.conversation_ticks_used(t, tick)
+                d = neg.decide_ladder(st, pol, ceiling, left, rarity, tick)
         else:
             notes_mode = None
             left = pol.max_ticks - neg.conversation_ticks_used(t, tick)
@@ -497,7 +526,8 @@ def candidates(s, led, args, journal):
                             "dealer": did, "ref": f"card:{ref}", "price": lp, "ceiling": ceiling,
                             "du": round(value - (lp or 0), 2),
                             "score": 10 ** 3 + bonus + value - (lp or 0) +
-                            (lplus.fill_priority(did, c["rarity"]) if fill and n_q < neg.LADDER_SLOTS else 0),
+                            (lplus.fill_priority(did, c["rarity"]) if fill and n_q < neg.LADDER_SLOTS else 0) +
+                            (3 * 10 ** 4 if (did, "buy", ref) in planned else 0),
                             "blockers": blockers, "ladder_mode": mode,
                             "notes": [f"valor {value:.1f} P (con bono si completa página)",
                                       "precio real desconocido hasta su primera oferta",
@@ -542,12 +572,14 @@ def candidates(s, led, args, journal):
     # 8. Compras dirigidas ordenadas por un humano.
     out += directed_buys(s, led, args, val, counts, view)
     # 9. Escalera opt-in: vender duplicados comunes a un vendedor y no pujar por lo que ya negociamos con uno.
-    if getattr(args, "dealer_sell_dups", False):
+    if getattr(args, "dealer_sell_dups", False) and not cal:
         out += sell_open_candidates(s, led, args, lc, val, counts, busy, open_count)
+    if cal:  # --ladder-calibrated: ventas planificadas a la Abuela y al Chato (Pilar va por pilar_candidates)
+        out += calibrated_sell_opens(s, led, cal_plan, busy, open_count)
     if getattr(args, "dedupe_bids", False):
         out += dealer_bid_cancels(s, out, open_dealer, mine_threads)
     # 10. --pilar-sell / --ladder-fill (opt-in): abrir una venta a Pilar; la copia en venta no sale por otra vía.
-    pilar, pilar_report, selling_assets = pilar_candidates(s, led, args, val, counts, ladder)
+    pilar, pilar_report, selling_assets = pilar_candidates(s, led, args, val, counts, ladder, cal_plan)
     for c in out if selling_assets else ():
         if c["type"] not in pg.NON_DELIVERING and not str(c["type"]).startswith("dealer_sell") and \
                 set(pg.delivery_of(c, s)[1]) & selling_assets:
@@ -558,6 +590,10 @@ def candidates(s, led, args, journal):
     pl["ladder"] = {d: len(x) for d, x in ladder.items()}
     if pilar_report is not None:
         pl["pilar"] = pilar_report
+    if cal_plan is not None:
+        pl["ladder_cal"] = {"filled": cal_plan["filled"], "free": cal_plan["free"], "gain": cal_plan["gain"],
+                            "cash": cal_plan["cash"], "budget": cal_plan["budget"],
+                            "picks": [lcal.describe(o) for o in cal_plan["picks"]]}
     return out, pl, exposure
 
 
@@ -632,7 +668,8 @@ def sell_thread_candidates(s, t, args, lc, val, counts):
     base = {"module": "vendedores", "thread": t["id"], "dealer": did, "blockers": []}
     pc = pilar_cfg(args)
     pilar = pc is not None and did == pc.dealer  # --pilar-sell: escalera propia de Pilar (pedir alto, bajar de 2 en 2)
-    if not pilar and not getattr(args, "dealer_sell_dups", False):
+    cal = calibrated_on(args) and (pilar or did in lcal.LADDER_DEALERS)
+    if not pilar and not cal and not getattr(args, "dealer_sell_dups", False):
         return [dict(base, type="info", kind=f"{did}: venta", ref=str(t.get("topic")), du=0, score=-1,
                      blockers=["conversación de venta: requiere --dealer-sell-dups"])]
     ids = neg.sell_assets_of(t.get("topic"))
@@ -642,7 +679,12 @@ def sell_thread_candidates(s, t, args, lc, val, counts):
                      reason="la copia ya no está en nuestras manos")]
     asset_id, ref = ids[0], mine[ids[0]]["ref"]
     st = neg.state_from_thread(t, did, tick, neg.Config(), side="sell")
-    if pilar:
+    if cal:  # --ladder-calibrated: suelo = valor privado; objetivo = mejor trato observado; solo final:true cierra
+        loss, floor = pilar_floor(val, counts, ref)
+        key, cp_ = sell_profile(args, s, "pilar" if pilar else did, did, ref, val)
+        d = lcal.decide_sell(st, cp_, floor, cp_.max_ticks - neg.conversation_ticks_used(t, tick), tick,
+                             name=f"calibrada {key}")
+    elif pilar:
         loss, floor = pilar_floor(val, counts, ref)
         d = lplus.decide_sell(st, floor, lplus.first_ask(floor, pc), pc,
                               pc.max_ticks - neg.conversation_ticks_used(t, tick))
@@ -655,7 +697,14 @@ def sell_thread_candidates(s, t, args, lc, val, counts):
     c = dict(base, type=kind, kind=f"{did}: venta {d.action}", item=f"card:{ref}", ref=f"card:{ref}", price=d.price,
              offer=d.offer_id, opening=st.opening, floor=floor, du=round((d.price or 0) - loss, 2), score=10 ** 5,
              reason=d.reason, turns=st.turns, side="sell", notes=[f"venta escalera, suelo {floor} P"])
-    if pilar:
+    if cal:
+        c["notes"] = [f"--ladder-calibrated {key}: suelo = valor privado {loss:.1f} P → {floor} P; objetivo "
+                      f"{cp_.target_price(st.opening, 'sell') if st.opening else '?'} P; {cp_.obs}"]
+        if lcal.bluff_final(t, did):
+            c["notes"].append("FAROL: dice «final» sin final:true; seguimos regateando")
+        if kind == "dealer_sell_accept":
+            c["score"] = 3 * 10 ** 5
+    elif pilar:
         c["notes"] = [f"--pilar-sell: suelo = valor privado {loss:.1f} P → {floor} P; primera petición "
                       f"{lplus.first_ask(floor, pc)} P, pasos de {pc.step} P"]
         if kind == "dealer_sell_accept":
@@ -675,10 +724,107 @@ def pilar_floor(val, counts, ref):
     return loss, max(1, math.ceil(loss - 1e-9))
 
 
-def pilar_candidates(s, led, args, val, counts, ladder):
+def sell_profile(args, s, name, did, ref, val):
+    """Perfil calibrado de VENTA de `ref` a un vendedor (Pilar: variante SAL/RET según su menú)."""
+    card = val.cards.get(ref) or {}
+    fav = lcal.is_fav(name, card.get("set"), (s.get("dealers") or {}).get(did))
+    return lcal.profile_for(cal_profiles(args), name, "sell", card.get("rarity"), fav)
+
+
+def dealer_buys(dealer, rarity, set_id):
+    """¿Compra el vendedor esa rareza (y barrio, si su fila los enumera)?"""
+    for row in ((dealer or {}).get("menu") or {}).get("buys", []):
+        if row.get("rarity") == rarity and (not isinstance(row.get("sets"), list) or set_id in row["sets"]):
+            return True
+    return False
+
+
+def ladder_plan(s, led, args, val, counts, ladder, budget):
+    """--ladder-calibrated: qué tratos llenan mejor los huecos de la escalera (3 por vendedor; Pilar pesa más), con la
+    captura esperada al precio objetivo de cada perfil, el excedente a valores privados y la caja disponible."""
+    me, tick, cat = s["me"], s["clock"]["tick"], s["catalog"]
+    pc = pilar_cfg(args)
+    allow = {x.strip().upper() for x in str(getattr(args, "allow_last_copy", "") or "").split(",") if x.strip()}
+    committed = committed_ids(s, led)
+    selling = {a for t in s["threads"]["open"] if t.get("kind") == "persona" for a in neg.sell_assets_of(t.get("topic"))}
+    dealers = {d: (s.get("dealers") or {}).get(d) for d in lcal.LADDER_DEALERS}
+    usable = sorted(d for d, row in dealers.items() if row is not None and dealer_available(s, d)
+                    and led["blocked"].get(d, 0) <= tick)
+    opts = []
+    for ref in sorted(counts):
+        card = val.cards.get(ref) or {}
+        if card.get("hidden") or not card.get("rarity"):
+            continue
+        set_id = card.get("set", "")
+        free = [i for i in pg.tradeable_assets(ref, counts, cat, me["assets"], committed) if i not in selling]
+        if not free:
+            continue  # page_guard: mantiene una página completa (o ya está comprometida)
+        loss, floor = pilar_floor(val, counts, ref)
+        for d in usable:
+            if not dealer_buys(dealers[d], card["rarity"], set_id):
+                continue
+            if d == lplus.PILAR and pc and not pc.covers(set_id):
+                continue  # --pilar-sell SET: Pilar solo esos barrios
+            if counts[ref] < 2 and not (ref.upper() in allow or set_id.upper() in allow or (
+                    d == lplus.PILAR and pc and lplus.last_copy_allowed(ref.upper(), set_id.upper(), allow, pc))):
+                continue  # última copia: --allow-last-copy REF|SET (y a Pilar también --pilar-last-copy)
+            key, prof = sell_profile(args, s, d, d, ref, val)
+            price = prof.expected_price("sell")
+            if price >= floor:
+                opts.append(lcal.Option(d, "sell", ref, free[-1], price, 0, round(price - loss, 2),
+                                        prof.capture(int(prof.open_obs), price, "sell"), key))
+    for d in usable:
+        for row in (dealers[d].get("menu") or {}).get("sells", []):
+            if "rarity" not in row:
+                continue
+            key, prof = lcal.profile_for(cal_profiles(args), d, "buy", row["rarity"])
+            price = prof.expected_price("buy")
+            for ref, c in val.cards.items():
+                if not c["released"] or c["rarity"] != row["rarity"] or counts.get(ref) or c.get("hidden"):
+                    continue
+                value = val.next_copy(counts, ref)
+                if value - args.margin >= price and price <= args.per_card:
+                    opts.append(lcal.Option(d, "buy", ref, None, price, price, round(value - price, 2),
+                                            prof.capture(int(prof.open_obs), price, "buy"), key))
+    filled = {d: len(ladder.get(d, [])) for d in lcal.LADDER_DEALERS}
+    cash = int(getattr(args, "ladder_budget", None) if getattr(args, "ladder_budget", None) is not None else budget)
+    res = lcal.plan(opts, filled, cash, neg.LADDER_SLOTS)
+    res.update(filled=filled, budget=cash, options=len(opts))
+    return res
+
+
+def calibrated_sell_opens(s, led, cal_plan, busy, open_count):
+    """--ladder-calibrated: abrir la venta planificada a la Abuela o al Chato (una conversación por vendedor)."""
+    tick, out = s["clock"]["tick"], []
+    for o in (cal_plan or {}).get("picks", []):
+        if o.mode != "sell" or o.dealer == lplus.PILAR:
+            continue
+        blockers = []
+        if o.dealer in busy:
+            blockers.append(f"ya hay una conversación abierta con {o.dealer}")
+        if led["blocked"].get(o.dealer, 0) > tick:
+            blockers.append(f"{o.dealer} bloqueado hasta el tick {led['blocked'][o.dealer]} (cupo o enfriamiento)")
+        if open_count >= s["clock"]["limits"].get("max_open_threads_per_team", 6):
+            blockers.append("sin conversaciones libres")
+        if tick - int((led.get("pilar_sell") or {}).get(str(o.asset), -10 ** 9)) < 30:
+            blockers.append("esa copia ya se ofreció hace menos de 30 ticks")
+        out.append({"type": "dealer_sell_open", "module": "vendedores", "kind": f"vender a {o.dealer} [calibrada]",
+                    "dealer": o.dealer, "ref": f"card:{o.ref}", "asset": o.asset, "price": o.price,
+                    "du": o.du, "score": 10 ** 3 + 2000 + 100 * o.gain + o.du, "blockers": blockers,
+                    "notes": [f"--ladder-calibrated: {lcal.describe(o)}",
+                              "cuenta para la escalera si cobramos más que su primera puja"]})
+    return out
+
+
+def pilar_candidates(s, led, args, val, counts, ladder, cal_plan=None):
     """--pilar-sell: abrir UNA venta a Pilar (una carta por hilo) mientras falten tratos negociados con ella; los hilos
-    abiertos los lleva sell_thread_candidates. Devuelve (candidatas, informe, activos en ventas abiertas)."""
+    abiertos los lleva sell_thread_candidates. Devuelve (candidatas, informe, activos en ventas abiertas).
+    Con --ladder-calibrated: precio esperado del perfil medido (SAL/RET aparte) y, si el plan reparte cartas entre
+    vendedores, solo las que el plan asigna a Pilar."""
     cfg = pilar_cfg(args)
+    cal = calibrated_on(args)
+    planned = {o.ref for o in (cal_plan or {}).get("picks", []) if o.dealer == lplus.PILAR and o.mode == "sell"}
+    others = {o.ref for o in (cal_plan or {}).get("picks", []) if o.dealer != lplus.PILAR and o.mode == "sell"}
     if cfg is None:
         return [], None, set()
     did, tick, me = cfg.dealer, s["clock"]["tick"], s["me"]
@@ -722,7 +868,13 @@ def pilar_candidates(s, led, args, val, counts, ladder):
         if not free:
             continue  # page_guard: la copia mantiene una página completa (o ya está comprometida)
         loss, floor = pilar_floor(val, counts, ref)
-        exp = lplus.expected_price(card, cfg, next((r for r in rows if r["rarity"] == card.get("rarity")), None))
+        if cal:
+            if ref in others or (planned and ref not in planned):
+                continue  # el plan la reserva para otro vendedor (o Pilar ya tiene sus cartas planificadas)
+            _, cp_ = sell_profile(args, s, lplus.PILAR, did, ref, val)
+            exp = cp_.expected_price("sell")
+        else:
+            exp = lplus.expected_price(card, cfg, next((r for r in rows if r["rarity"] == card.get("rarity")), None))
         if exp < floor:
             continue
         if best is None or exp - loss > best[0]:
@@ -733,14 +885,20 @@ def pilar_candidates(s, led, args, val, counts, ladder):
                         "completa o precio esperado por debajo de nuestro valor privado")
     else:
         surplus, ref, aid, floor, exp, loss = best
-        report["next"] = {"ref": ref, "asset": aid, "floor": floor, "expected": exp,
-                          "first_ask": lplus.first_ask(floor, cfg)}
+        first = lplus.first_ask(floor, cfg)
+        if cal:
+            _, cp_ = sell_profile(args, s, lplus.PILAR, did, ref, val)
+            first = max(floor, int(cp_.first * cp_.open_obs + 0.5))
+        report["next"] = {"ref": ref, "asset": aid, "floor": floor, "expected": exp, "first_ask": first}
         bonus = 5000 if n_q == neg.LADDER_SLOTS - 1 else 2000
         out.append({"type": "dealer_sell_open", "module": "vendedores", "kind": f"vender a {did}", "dealer": did,
                     "ref": f"card:{ref}", "asset": aid, "price": exp, "floor": floor, "du": round(surplus, 2),
                     "score": 10 ** 3 + bonus + surplus, "blockers": blockers, "ladder_mode": neg.ladder_mode(n_q),
-                    "notes": [f"--pilar-sell: esperado ~{exp} P; pediremos {lplus.first_ask(floor, cfg)} P y bajaremos "
-                              f"de {cfg.step} en {cfg.step}; mínimo {floor} P (valor privado {loss:.1f} P)",
+                    "notes": [f"--pilar-sell: esperado ~{exp} P; pediremos {first} P y bajaremos "
+                              f"de {cfg.step} en {cfg.step}; mínimo {floor} P (valor privado {loss:.1f} P)" if not cal
+                              else f"--ladder-calibrated: esperado ~{exp} P (mejor trato observado); pediremos ~{first} "
+                                   f"P; solo final:true o el objetivo cierran; mínimo {floor} P (valor privado "
+                                   f"{loss:.1f} P)",
                               f"escalera {did} {n_q}/{cfg.target_deals}: cuenta solo si cobramos más que su apertura"]})
     report["blockers"] = blockers
     return out, report, selling
@@ -767,6 +925,13 @@ def ladder_fill_need(s, led, args, lc, val, counts, ladder, active):
                         best = min(econ, list_p) if best is None else min(best, econ, list_p)
         need += best or 0
     return need
+
+
+def ladder_cal_lines(r):
+    head = ("ESCALERA CALIBRADA · tratos que puntúan " +
+            " ".join(f"{d} {r['filled'].get(d, 0)}/{neg.LADDER_SLOTS}" for d in lcal.LADDER_DEALERS) +
+            f" · plan: +{r['gain']} (peso × captura) con {r['cash']} P de {r['budget']} P")
+    return [head] + [f"  · {x}" for x in r["picks"]] if r["picks"] else [head + " · nada planificable"]
 
 
 def pilar_line(r):
@@ -1486,6 +1651,9 @@ def cycle(reader, args, led, journal, execute, cache=None):
         print(f"   {line}")
     if pl.get("pilar"):
         print("   " + pilar_line(pl["pilar"]))
+    if pl.get("ladder_cal"):
+        for line in ladder_cal_lines(pl["ladder_cal"]):
+            print("   " + line)
     performance = perf.realized(led["actions"], {d: [None] * n for d, n in (pl.get("ladder") or {}).items()},
                                 sum(1 for o in s["offers"].get("offers", []) if o.get("maker") == team
                                     and o.get("status") == "open"))
@@ -1706,12 +1874,23 @@ def main():
     g.add_argument("--ladder-fill", action="store_true",
                    help="3 tratos negociados por vendedor desbloqueado (abuela, chato, pilar) antes que pujas pasivas: "
                         "--dealer-ladder con las aperturas de ESTRATEGIA_TOP3 y venta a Pilar")
+    g = p.add_argument_group("escalera calibrada (opt-in, ladder_calibrated.py; sin ellos nada cambia)")
+    g.add_argument("--ladder-calibrated", action="store_true",
+                   help="perfiles medidos en los hilos reales: apertura extrema, paso corto, paciencia hasta final:true "
+                        "(un «final» sin final:true es un farol), nunca por debajo del valor privado; plan de 3 tratos "
+                        "por vendedor (Abuela, Chato, Pilar) por puntos/P, incluidas ventas de duplicados")
+    g.add_argument("--ladder-profile", default=None, metavar="FICHERO.json",
+                   help="con --ladder-calibrated: sobrescribe campos de los perfiles ({\"chato|buy|rare\": {\"step\": 4}})")
+    g.add_argument("--ladder-budget", type=int, default=None,
+                   help="con --ladder-calibrated: caja máxima de las COMPRAS del plan (por defecto, la libre para vendedores)")
     args = p.parse_args()
     if not 1 <= args.ticks <= 120:
         p.error("--ticks entre 1 y 120")
     try:
         lplus.parse_pilar_sell(args.pilar_sell)
-    except ValueError as e:
+        if args.ladder_profile:
+            lcal.load_profiles(args.ladder_profile)
+    except (ValueError, OSError) as e:
         p.error(str(e))
     DATA.mkdir(exist_ok=True)
     # retries=3: el SDK solo reintenta lo seguro (rate_limited = rechazada sin ejecutar; fallos de red en LECTURAS).
