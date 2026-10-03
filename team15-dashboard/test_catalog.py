@@ -1,10 +1,29 @@
 import unittest
 from types import SimpleNamespace
 
-from app import enrich_catalog_market, render_catalog
+from app import enrich_catalog_market, render_catalog, render_dashboard_overview, render_command_deck
 
 
 class CatalogViewTest(unittest.TestCase):
+    def test_buy_margin_requires_verified_private_value_and_confirmed_sale(self):
+        row = {'ref': 'LAT-11', 'set': 'La Latina', 'released': True, 'stock': 0,
+               'free': 0, 'buy_ceiling': 232, 'sold_median': 160,
+               'held_by': [], 'wanted_by': [], 'minted': 2, 'print_run': 9}
+        public = render_dashboard_overview({'catalog_rows': [row], 'verified': False})
+        private = render_dashboard_overview({'catalog_rows': [row], 'verified': True})
+        self.assertIn('0/0</strong>', public)
+        self.assertIn('1/1</strong>', private)
+        self.assertIn('+72 P', private)
+
+    def test_race_gap_uses_public_score_when_private_score_is_newer(self):
+        html = render_command_deck({
+            'score': {'score': 30}, 'verified': True,
+            'leaderboard': {'teams': [{'team': 't04', 'score': 25},
+                                      {'team': 't15', 'score': 23}]},
+        })
+        self.assertIn('Faltan 2 puntos', html)
+        self.assertIn('30</strong>', html)
+
     def test_confirmed_sales_and_mint_counts_are_kept_distinct_from_limits(self):
         rows = [{'ref': 'LAV-01', 'set': 'Lavapiés', 'rarity': 'rare', 'released': True,
                  'stock': 0, 'free': 0, 'sell_floor': None, 'buy_ceiling': 20,

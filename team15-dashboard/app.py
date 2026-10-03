@@ -429,6 +429,22 @@ def render_dashboard_overview(data: dict) -> str:
         f'<div class="bar-row"><span class="bar-label">{esc(r["ref"])}</span><span class="bar-track"><i class="bar-fill" style="width:{max(5, (r["sold_median"] or 0)/max_sold*100):.1f}%"></i></span><b class="bar-value">{fmt(r["sold_median"])} P</b></div>'
         for r in sold
     ) or '<p class="sub">Todavía no hay liquidaciones individuales suficientes.</p>'
+    priced_missing = sorted(
+        (r for r in released if verified and r.get('stock') == 0
+         and isinstance(r.get('buy_ceiling'), (int, float))
+         and isinstance(r.get('sold_median'), (int, float))),
+        key=lambda r: r['buy_ceiling'] - r['sold_median'], reverse=True)
+    favorable = sum(r['buy_ceiling'] > r['sold_median'] for r in priced_missing)
+    compare_max = max((max(r['buy_ceiling'], r['sold_median']) for r in priced_missing[:6]), default=1)
+    headroom_rows = ''.join(
+        f'<div class="headroom-row"><b>{esc(r["ref"])}</b>'
+        f'<div class="headroom-bars"><span style="width:{r["buy_ceiling"] / compare_max * 100:.1f}%" '
+        f'title="Nuestro tope: {fmt(r["buy_ceiling"])} P"></span>'
+        f'<i style="width:{r["sold_median"] / compare_max * 100:.1f}%" '
+        f'title="Mediana liquidada: {fmt(r["sold_median"])} P"></i></div>'
+        f'<strong class="{"positive" if r["buy_ceiling"] > r["sold_median"] else "negative"}">'
+        f'{r["buy_ceiling"] - r["sold_median"]:+.0f} P</strong></div>'
+        for r in priced_missing[:6])
     sets = []
     for name, cards in _group_rows(rows, 'set').items():
         available = [r for r in cards if r.get('released')]
@@ -469,7 +485,12 @@ def render_dashboard_overview(data: dict) -> str:
         '<article class="viz-card"><div class="viz-head"><div><h2>Precios que ya se han pagado</h2><p class="viz-caption">Mediana de ventas individuales confirmadas en el feed</p></div>'
         f'<div class="mini-stat"><strong>{len(sold)}</strong><span>referencias con venta</span></div></div><div class="bar-chart">{sold_bars}</div><div class="chart-legend"><span><i class="dot"></i>Precio mediano ejecutado</span><span>Ordenado de mayor a menor</span></div></article>'
         '<article class="viz-card"><div class="viz-head"><div><h2>Cobertura de colección</h2><p class="viz-caption">Cartas publicadas que ya tenemos por colección</p></div></div><div class="coverage-grid">'+(coverage or '<p class="sub">Sin colecciones publicadas.</p>')+'</div><div class="chart-legend"><span><i class="dot violet"></i>Más cobertura</span><span>La vista requiere inventario privado verificado</span></div></article>'
-        '<article class="viz-card"><div class="viz-head"><div><h2>Cartas más comunes</h2><p class="viz-caption">Equipos distintos en los que hemos observado cada referencia</p></div></div><div class="bar-chart">'+holder_bars+'</div><div class="chart-legend"><span><i class="dot gold"></i>Posesión observada</span><span>Más equipos = menos exclusividad</span></div></article></section>')
+        '<article class="viz-card"><div class="viz-head"><div><h2>Cartas más comunes</h2><p class="viz-caption">Equipos distintos en los que hemos observado cada referencia</p></div></div><div class="bar-chart">'+holder_bars+'</div><div class="chart-legend"><span><i class="dot gold"></i>Posesión observada</span><span>Más equipos = menos exclusividad</span></div></article>'
+        '<article class="viz-card"><div class="viz-head"><div><h2>Margen de compra observado</h2><p class="viz-caption">Cartas faltantes: tope privado menos mediana histórica liquidada</p></div>'
+        f'<div class="mini-stat"><strong>{favorable}/{len(priced_missing)}</strong><span>con margen positivo</span></div></div>'
+        '<div class="headroom-chart">'+(headroom_rows or '<p class="sub">Aún no hay ventas individuales comparables con faltantes valorados.</p>')+'</div>'
+        '<div class="chart-legend"><span><i class="dot"></i>Tope nuestro</span><span><i class="dot gold"></i>Precio histórico</span></div>'
+        '<p class="chart-note">Una venta pasada no es una oferta activa. Antes de comprar, confirma precio, comisión, valor marginal y caja.</p></article></section>')
     actions = '<section class="action-strip" aria-label="Siguientes decisiones">'
     actions += action('↗', f'{len(free) if verified else "—"} duplicados libres', 'Revisa el precio de venta sugerido en Venta rápida' if verified else 'Requiere inventario privado', 'hot' if free else '')
     actions += action('＋', f'{len(missing) if verified else "—"} cartas faltantes', 'Prioriza las que tengan mayor valor al recibirlas' if verified else 'Requiere valoración privada', 'warn' if missing else '')
@@ -996,6 +1017,23 @@ CSS += """
 @media(max-width:680px){.ops-grid{display:block}.ops-grid article{padding:12px 0!important;border:0!important;border-bottom:1px solid var(--line)!important}.ops-heading{display:block}.ops-heading>span{display:block;margin-top:8px}}
 """
 
+CSS += """
+/* Hallmark · pre-emit critique: P5 H4 E4 S5 R4 V4
+ * macrostructure: Operations ledger · genre: modern-minimal · theme: Cobalt · tone: focused
+ * anchor hue: teal with restrained amber signal
+ */
+:root{--paper:#f3f5f4;--surface:#fff;--ink:#142b36;--ink-2:#294550;--line:#d7e0df;--muted:#5b7078;--teal:#087c7c;--saffron:#b77915;--red:#a8483c;--blue:#e7f1f0;--signal:#e9a83c;--night:#102d3a;--night-2:#1a4050;--soft:#eff5f4;--shadow:none}
+html,body{overflow-x:clip;scroll-behavior:smooth}body{background:var(--paper);color:var(--ink);font-family:Arial,Helvetica,sans-serif;letter-spacing:0}.wrap{max-width:1520px;padding:20px 28px 72px}
+header{background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:0;padding:18px 24px;box-shadow:none;align-items:center}header .sub{color:var(--muted);margin:5px 0 0}h1,h2,h3{font-family:Arial,Helvetica,sans-serif;letter-spacing:-.025em}h1{font-size:26px;font-weight:800}h2{font-size:22px}header .flag{border-radius:3px}.flag.live{background:var(--teal)}.clock{font-size:13px}
+.summary{display:none}.jump{position:sticky;top:0;z-index:8;margin:0 0 14px;padding:8px 2px;border-radius:0;background:var(--paper);border-bottom:1px solid var(--line);gap:2px;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:thin}.jump a{display:inline-flex;align-items:center;white-space:nowrap;padding:8px 12px;border-radius:3px;font-size:12px}.jump a:hover,.jump a:focus-visible{background:var(--blue)}
+.command-deck{background:var(--night);color:#fff;margin:0 0 16px;padding:25px 28px 20px;display:grid;gap:20px}.deck-lead{display:grid;grid-template-columns:minmax(260px,.75fr) minmax(330px,1.25fr);gap:28px;align-items:end}.deck-kicker{display:block;color:#b3d6d3;font-size:12px;font-weight:700;letter-spacing:.02em}.deck-score>strong{display:block;font-size:clamp(62px,8vw,112px);line-height:.94;letter-spacing:-.08em;font-variant-numeric:tabular-nums;margin:9px 0 3px}.deck-score-label{color:#b8d1d2;font-size:12px}.deck-rank{border-top:1px solid #42616d;margin-top:21px;padding-top:12px;font-size:14px}.deck-rank b{font-size:24px}.deck-rank span{display:block;color:#f3c775;font-size:12px;margin-top:3px}.deck-title{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:15px}.deck-title h2{font-size:16px;color:#fff;margin:0}.deck-title a{font-size:12px;color:#a8dbd5;text-decoration:underline;text-underline-offset:3px;white-space:nowrap}.deck-race{padding:5px 0 0}.race-row{display:grid;grid-template-columns:36px minmax(0,1fr) 45px;align-items:center;gap:11px;margin:10px 0;font-size:12px;font-variant-numeric:tabular-nums}.race-row b{text-align:right;font-size:13px}.race-row.self{color:#f3c775}.race-track{height:10px;background:#31515e}.race-track i{display:block;height:100%;background:#77949f}.race-row.self .race-track i{background:var(--signal)}.deck-race p{color:#a9c0c5;font-size:11px;margin:14px 0 0}.deck-lower{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(250px,.7fr);gap:28px;padding-top:18px;border-top:1px solid #42616d}.deck-sources{display:grid;grid-template-columns:1fr 1fr;gap:0 24px}.deck-sources .deck-title{grid-column:1/-1}.deck-component{min-width:0}.deck-line{display:flex;justify-content:space-between;gap:10px;font-size:14px}.deck-line span small{display:block;color:#acc6c9;font-size:11px;margin-top:3px}.deck-line b{white-space:nowrap;font-variant-numeric:tabular-nums}.deck-line em{font-style:normal;color:#acc6c9;font-weight:400}.deck-track{height:9px;background:#31515e;margin:11px 0 0}.deck-track i{display:block;height:100%;background:#44aca2}.deck-component:nth-child(3) .deck-track i{background:var(--signal)}.deck-capital{border-left:1px solid #42616d;padding-left:24px}.deck-capital-value{font-size:31px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}.deck-capital-value span{display:block;color:#c1d5d5;font-size:11px;font-weight:400;margin-top:6px}.deck-capital p{color:#a9c0c5;font-size:11px;margin-bottom:0}.deck-decision{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:20px;align-items:center;background:var(--night-2);margin:0 -28px -20px;padding:18px 28px}.deck-decision h2{font-size:19px;margin:4px 0}.deck-decision p{color:#c5d9dc;font-size:12px;margin:0;max-width:74ch}.deck-decision>a{background:var(--signal);color:var(--night);font-weight:800;font-size:12px;padding:10px 14px;text-decoration:none;white-space:nowrap}.deck-fresh{font-size:11px;color:#a8dbd5;white-space:nowrap}
+.ops,.monitor,.viz-card,.chart,.sale-card,.radio-item,.panel,.trade,.slot,.rank-strategy,.catalog-brief,.set-card{box-shadow:none;border-radius:3px}.ops,.monitor{padding:22px 25px;background:var(--surface);border:1px solid var(--line);margin-bottom:16px}.monitor .bar{background:var(--soft)}.monitor .bar-fill{background:var(--teal)}.monitor .bar-best{background:var(--signal)}.monitor .slot{background:var(--soft);border:1px solid var(--line)}.monitor .slot.open{border-color:var(--saffron)}.monitor .slot.done{border-color:var(--teal)}.monitor .pip{background:#d6e3e1}.monitor .pip.on{background:var(--teal)}.monitor .breakdown th,.monitor .breakdown td{border-color:var(--line)}.monitor .breakdown .why{opacity:1;color:var(--muted)}.chart{padding:18px 18px 12px}.chart figcaption{font-size:15px;color:var(--ink)}.chart svg{height:190px}.chart .grid{stroke:#dbe6e4}.chart .baseline{stroke:var(--saffron)}.chart .tick.base{fill:var(--saffron)}.charts{grid-template-columns:repeat(2,minmax(0,1fr))}.dashboard-overview{grid-template-columns:repeat(2,minmax(0,1fr))}.viz-card{padding:22px}.section-shell{border-radius:3px;background:var(--surface)}.action-card{box-shadow:none;border-radius:3px}.sidebar{border-radius:3px}.catalog-toolbar{top:47px}.sale-card{border-top-width:3px}
+.headroom-chart{display:grid;gap:11px}.headroom-row{display:grid;grid-template-columns:65px minmax(0,1fr) 54px;gap:10px;align-items:center;font-size:12px}.headroom-row strong{text-align:right;font-variant-numeric:tabular-nums}.headroom-row strong.positive{color:var(--teal)}.headroom-row strong.negative{color:var(--red)}.headroom-bars{display:grid;gap:3px}.headroom-bars span,.headroom-bars i{height:5px;display:block;min-width:2px}.headroom-bars span{background:var(--teal)}.headroom-bars i{background:var(--saffron)}
+@media(max-width:900px){.deck-lead{grid-template-columns:1fr 1fr}.deck-lower{grid-template-columns:1fr}.deck-capital{border:0;border-top:1px solid #42616d;padding:15px 0 0}.dashboard-overview,.charts{grid-template-columns:1fr}.deck-decision{grid-template-columns:1fr auto}.deck-fresh{grid-column:1/-1}}
+@media(max-width:620px){.wrap{padding:10px 10px 45px}header{padding:15px;display:block}header .status{margin-top:12px}h1{font-size:22px}.command-deck{padding:20px 17px 17px}.deck-lead,.deck-sources,.deck-lower{display:block}.deck-race{border-top:1px solid #42616d;margin-top:18px;padding-top:17px}.deck-component+.deck-component{margin-top:18px}.deck-capital{margin-top:20px}.deck-decision{margin:0 -17px -17px;padding:18px 17px;display:block}.deck-decision>a{display:inline-block;margin-top:14px}.deck-fresh{display:block;margin-top:12px}.ops,.monitor{padding:16px}.coverage-grid{grid-template-columns:1fr}.dashboard-overview,.charts{display:block}.dashboard-overview>*+*,.charts>*+*{margin-top:12px}.viz-head{display:block}.viz-head .mini-stat{text-align:left;margin:9px 0}.bar-row{grid-template-columns:76px minmax(0,1fr) 60px}.catalog-toolbar{top:45px}.catalog-brief{grid-template-columns:1fr 1fr}}
+@media(prefers-reduced-motion:reduce){html,body{scroll-behavior:auto}*{transition-duration:.01ms!important;animation-duration:.01ms!important}}
+"""
+
 
 def render_operations(data: dict) -> str:
     op = data.get('operations') or {}
@@ -1041,10 +1079,83 @@ def render_operations(data: dict) -> str:
             'La decisión final requiere autotest y supervisor.</p></article></div></section>')
 
 
+def render_command_deck(data: dict) -> str:
+    """First-screen decision view; every number comes from the current snapshot."""
+    board = sorted((r for r in (data.get('leaderboard') or {}).get('teams') or []
+                    if isinstance(r.get('score'), (int, float))),
+                   key=lambda r: r['score'], reverse=True)
+    idx = next((i for i, r in enumerate(board) if r.get('team') == 't15'), None)
+    mine = (data.get('score') or {}).get('score')
+    if not isinstance(mine, (int, float)) and idx is not None:
+        mine = board[idx]['score']
+    public_mine = board[idx]['score'] if idx is not None else None
+    above = board[idx - 1] if idx is not None and idx > 0 else None
+    below = board[idx + 1] if idx is not None and idx + 1 < len(board) else None
+    gap = max(0, above['score'] - public_mine) if above and public_mine is not None else None
+    score = data.get('scoring') or {}
+    components = score.get('components') or {}
+    op = data.get('operations') or {}
+    capital = op.get('capital') or {}
+    queue = op.get('queue') or []
+    trades = data.get('trades') or []
+    if queue:
+        action = queue[0].get('action')
+    elif trades:
+        first_trade = trades[0]
+        action = (f'{first_trade.get("action") or "Operar"} · {first_trade.get("team") or ""} '
+                  f'{", ".join(first_trade.get("give") or [])}').strip()
+    else:
+        action = None
+    evidence = queue[0].get('evidence') if queue else (trades[0].get('why') if trades else None)
+    action_target = '#operacion' if queue else '#ranking'
+    spendable = capital.get('spendable_after_reserve')
+    cash = capital.get('cash')
+    feed = data.get('feed_health') or {}
+    source_label = ('Feed al día' if feed.get('status') == 'fresh' else
+                    'Feed pendiente de verificar')
+    bars = []
+    for key, label, note in (
+            ('negotiating', 'Negociación', 'Duelos, dealers y trades'),
+            ('market', 'Mercado', 'Test y valor entre terceros')):
+        value = (components.get(key) or {}).get('ours')
+        pct = max(0, min(100, value / 30 * 100)) if isinstance(value, (int, float)) else 0
+        bars.append(f'<div class="deck-component"><div class="deck-line"><span>{label}<small>{note}</small></span>'
+                    f'<b>{fmt(value)} <em>/ 30</em></b></div><div class="deck-track" role="img" '
+                    f'aria-label="{label}: {fmt(value)} de 30 puntos"><i style="width:{pct:.1f}%"></i></div></div>')
+    comparison = []
+    for row, kind in ((above, 'above'), ({'team': 't15', 'score': public_mine}, 'self'), (below, 'below')):
+        if not row or not isinstance(row.get('score'), (int, float)):
+            continue
+        pct = max(2, min(100, row['score'] / max(40, board[0]['score'] if board else 40) * 100))
+        comparison.append(f'<div class="race-row {kind}"><span>{esc(row["team"])}</span>'
+                          f'<div class="race-track"><i style="width:{pct:.1f}%"></i></div>'
+                          f'<b>{fmt(row["score"])}</b></div>')
+    freshness = ('Dato privado verificado' if data.get('verified') else 'Sólo lectura pública')
+    return ('<section class="command-deck" aria-label="Situación actual">'
+            '<div class="deck-lead"><div class="deck-score"><span class="deck-kicker">Situación actual</span>'
+            f'<strong>{fmt(mine)}</strong><span class="deck-score-label">puntos de servidor · {freshness}</span>'
+            f'<div class="deck-rank">Puesto <b>{idx + 1 if idx is not None else "—"}</b> de {len(board) or "—"}'
+            f'<span>{("Faltan " + fmt(gap) + " puntos para superar a " + esc(above["team"])) if gap is not None else "Sin rival superior medido"}</span></div>'
+            '</div><div class="deck-race"><div class="deck-title"><h2>Carrera inmediata</h2>'
+            '<a href="#estrategia-ranking">Ver ruta</a></div>' + ''.join(comparison) +
+            '<p>Comparación del leaderboard público. El score privado puede ir por delante.</p></div></div>'
+            '<div class="deck-lower"><div class="deck-sources"><div class="deck-title"><h2>De dónde vienen los puntos</h2>'
+            '<a href="#monitor">Ver desglose</a></div>' + ''.join(bars) + '</div>'
+            '<div class="deck-capital"><div class="deck-title"><h2>Capital para actuar</h2>'
+            '<a href="#operacion">Ver operación</a></div>'
+            f'<div class="deck-capital-value">{fmt(spendable)} <span>P disponibles tras reserva</span></div>'
+            f'<p>Caja {fmt(cash)} P · reserva {fmt(capital.get("operating_reserve"))} P · '
+            f'comprometido {fmt(capital.get("open_bid_commitments"))} P</p></div></div>'
+            '<div class="deck-decision"><div><span class="deck-kicker">Siguiente decisión</span>'
+            f'<h2>{esc(action or "Revisar oportunidades nuevas")}</h2>'
+            f'<p>{esc(evidence or "No hay una alerta prioritaria en este tick. Vigila duelos y demandas nuevas.")}</p></div>'
+            f'<a href="{action_target}">Abrir detalle</a><span class="deck-fresh">{source_label}</span></div>'
+            '</section>')
+
+
 def render(data: dict) -> str:
     tick = data.get("tick")
     live = data.get("live")
-    score = data.get("score") or {}
     teams = data.get("teams") or []
     trades = data.get("trades") or []
     parts = ['<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
@@ -1052,12 +1163,7 @@ def render(data: dict) -> str:
              '<header><div><h1>Mesa de mando · Team 15</h1><p class="sub">Puntos, duelos, caja y mercado para decidir durante el último día.</p></div>',
              '<div class="status"><span class="flag ', 'live' if live else 'warn', '">',
              'Equipo conectado' if live else 'Sólo feed público', '</span><span class="clock">Tick ', esc(tick), '</span></div></header>',
-             '<div class="summary">',
-             f'<div class="metric"><small>Efectivo nuestro</small><strong>{fmt(data.get("cash"))} P</strong></div>',
-             f'<div class="metric"><small>Valor de colección</small><strong>{fmt(data.get("collection_value"))} P</strong></div>',
-             f'<div class="metric"><small>{"Puntos propios en vivo" if live else "Puntos del leaderboard (con retraso)"}</small><strong>{fmt(score.get("score"))}</strong></div>',
-             f'<div class="metric"><small>Ofertas visibles · venues</small><strong>{data.get("board_count",0)} · {data.get("venue_count",0)}</strong></div>',
-             '</div><nav class="jump"><a href="#operacion">Mesa de mando</a><a href="#monitor">Monitor de ranking</a><a href="#tendencia">Trayectoria</a><a href="#guide">Venta rápida</a><a href="#radio">Radio y decisión</a><a href="#ranking">Ranking</a><a href="#estrategia-ranking">Estrategia</a><a href="#catalogo">Catálogo completo</a></nav>', render_operations(data), render_monitor(data), render_trend(data), render_dashboard_overview(data), render_rank_strategy(data)]
+             '<nav class="jump" aria-label="Secciones"><a href="#operacion">Operación</a><a href="#monitor">Puntos</a><a href="#tendencia">Trayectoria</a><a href="#guide">Ventas</a><a href="#radio">Señales</a><a href="#ranking">Oportunidades</a><a href="#estrategia-ranking">Ranking</a><a href="#catalogo">Catálogo</a></nav>', render_command_deck(data), render_operations(data), render_monitor(data), render_trend(data), render_dashboard_overview(data), render_rank_strategy(data)]
     for warning in data.get("warnings") or []:
         parts.append('<div class="warning">' + esc(warning) + '</div>')
     guide = data.get("sale_guide") or []
