@@ -27,6 +27,149 @@ def _cash_and_assets(me: dict, offers: list[dict]):
     return assets, locked
 
 
+def sale_guide(result: dict, margin: float = 2.0) -> list[dict]:
+    """One clear selling decision per surplus card, using single-card sales only."""
+    sales = defaultdict(list)
+    for trade in result["trades"]:
+        if trade["action"] not in ("Vender", "Proponer venta") or len(trade["give"]) != 1:
+            continue
+        ref = trade["give"][0]
+        if " ×" in ref:
+            ref, quantity = ref.rsplit(" ×", 1)
+            if quantity != "1":
+                continue
+        sales[ref].append({"team": trade["team"], "price": trade["price"],
+                           "fee": trade["fee"], "net": trade["surplus"],
+                           "active": trade["kind"] in ("live", "public-live"),
+                           "offer_id": trade.get("offer_id")})
+    guide = []
+    for card in result["inventory"]:
+        free = card["free_surplus"]
+        if not (isinstance(free, int) and free > 0) and free != "por verificar":
+            continue
+        buyers = sorted(sales.get(card["ref"], []),
+                        key=lambda b: (-(b["net"] if b["net"] is not None else b["price"] - b["fee"]),
+                                       not b["active"], b["team"]))
+        best = buyers[0] if buyers else None
+        floor = math.ceil(card["loss"] + margin) if card["loss"] is not None else None
+        guide.append({"ref": card["ref"], "free": free, "loss": card["loss"],
+                      "floor": floor, "suggested": best["price"] if best else None,
+                      "concession": max(0, best["price"] - floor) if best and floor is not None and not best["active"] else None,
+                      "best": best, "buyers": buyers})
+    guide.sort(key=lambda g: (g["best"] is None,
+                              -(g["best"]["net"] if g["best"] and g["best"]["net"] is not None else -1),
+                              g["ref"]))
+    return guide
+
+
+def catalog_matrix(catalog: dict, counts: Counter, val, verified: bool,
+                   inventory: list[dict], rivals: dict, margin: float = 2.0) -> list[dict]:
+    """Every published catalog card, with private caps only when reconciled."""
+    free = {row['ref']: row['free_surplus'] for row in inventory}
+    observed = {row['ref']: row['copies'] for row in inventory}
+    rows = []
+    for set_data in catalog.get('sets', []):
+        for card in set_data.get('cards', []):
+            ref = card.get('id')
+            if not ref:
+                continue
+            released = bool(set_data.get('released', card.get('released', True)))
+            held = int(counts.get(ref, 0)) if verified else observed.get(ref, 0)
+            can_value = verified and released and val.unit(ref) is not None
+            loss = -val.delta(counts, Counter(), Counter({ref: 1}))[0] if can_value and held else None
+            gain = val.delta(counts, Counter({ref: 1}), Counter())[0] if can_value else None
+            rows.append({'ref': ref, 'set': set_data.get('name') or set_data.get('id'),
+                         'rarity': card.get('rarity'), 'released': released,
+                         'stock': held, 'free': free.get(ref, 0),
+                         'sell_floor': math.ceil(loss + margin) if loss is not None else None,
+                         'buy_ceiling': max(0, math.floor(gain - margin)) if gain is not None else None,
+                         'held_by': sorted(r['team'] for r in rivals.get('teams', [])
+                                           if r.get('team') != 't15' and ref in (r.get('held') or [])),
+                         'wanted_by': sorted(r['team'] for r in rivals.get('teams', [])
+                                             if r.get('team') != 't15' and ref in (r.get('sought') or []))})
+    return rows
+
+
+def public_sales(result: dict, catalog: dict, clock: dict, venues: list[dict],
+                 boards: dict[str, list[dict]], rivals: dict,
+                 listing_teams: dict[int, str], market_refs: dict | None = None) -> dict:
+    """Feed-only leads. A public duplicate is evidence, not verified inventory."""
+    own = next((row for row in rivals.get("teams", []) if row.get("team") == "t15"), {})
+    duplicates = set(own.get("duplicates_observed") or [])
+    result["public_only"] = True
+    result["inventory"] = [
+        {"ref": ref, "copies": "≥2" if ref in duplicates else "≥1",
+         "free_surplus": "por verificar" if ref in duplicates else "—", "loss": None}
+        for ref in own.get("held") or []]
+    result["needs"] = [{"ref": ref, "gain": None, "page": None}
+                       for ref in own.get("sought") or []]
+    if not duplicates:
+        result["warnings"].append("El feed no acredita duplicados de t15; no se inventan ventas.")
+        result["sale_guide"] = sale_guide(result)
+        result['catalog_rows'] = catalog_matrix(catalog, Counter(), None, False, result['inventory'], rivals)
+        return result
+    book = {c.get("id"): c.get("book") for s in catalog.get("sets", []) for c in s.get("cards", [])}
+    available_venues = {v.get("venue"): v for v in venues
+                        if v.get("status") == "open" and v.get("owner") != "t15"}
+    tick = int(clock.get("tick") or 0)
+    active = set()
+    for venue_id, offers in boards.items():
+        venue = available_venues.get(venue_id)
+        if not venue:
+            continue
+        for offer in offers:
+            team = offer_team(offer, listing_teams)
+            if not team or team == "t15" or offer.get("status") != "open":
+                continue
+            if offer.get("to") not in (None, "t15") or (offer.get("expires_tick") or 10**12) <= tick + 1:
+                continue
+            give, want = offer.get("give") or {}, offer.get("want") or {}
+            refs = list(want.get("types") or []) + [f"card:{r}" for r in want.get("cards") or []]
+            if (type(give.get("cash")) is not int or give["cash"] <= 0 or
+                give.get("assets") or give.get("types") or want.get("assets") or want.get("cash") or
+                len(refs) != 1 or not refs[0].startswith("card:")):
+                continue
+            ref = refs[0][5:]
+            if ref not in duplicates:
+                continue
+            price = give["cash"]
+            try:
+                fee = tr.fee(price, 1, venue)
+            except ValueError:
+                continue
+            active.add((team, ref))
+            result["trades"].append({"kind": "public-live", "team": team,
+                "action": "Posible venta", "give": [ref], "receive": [], "price": price,
+                "fee": fee, "surplus": None, "rank_signal": price - fee,
+                "offer_id": offer.get("id"), "confidence": "Puja activa · duplicado observado",
+                "why": f"{team} ofrece {price} P por {ref} en {venue_id}; cobraríamos {price-fee} P tras comisión."
+                       " El feed vio al menos dos copias nuestras, pero hay que confirmar que una siga libre y cuánto vale para t15."})
+    for rv in rivals.get("teams", []):
+        team = rv.get("team")
+        if not team or team == "t15":
+            continue
+        for ref in rv.get("sought") or []:
+            if ref not in duplicates or (team, ref) in active:
+                continue
+            last_bid = (rv.get("best_bids") or {}).get(ref)
+            fair = ((market_refs or {}).get(ref) or {}).get("fair")
+            anchors = [math.ceil(v) for v in (last_bid, fair, book.get(ref)) if isinstance(v, (int, float)) and v > 0]
+            if not anchors:
+                continue
+            price = max(anchors)
+            result["trades"].append({"kind": "public-proposal", "team": team,
+                "action": "Proponer venta", "give": [ref], "receive": [], "price": price,
+                "fee": 0, "surplus": None, "rank_signal": price,
+                "offer_id": None, "confidence": "Demanda observada · precio orientativo",
+                "why": f"{team} pidió {ref}. {price} P toma como referencia el mayor dato observado:"
+                       f" puja anterior {last_bid or '—'}, mercado {math.ceil(fair) if isinstance(fair,(int,float)) else '—'},"
+                       f" catálogo {book.get(ref) or '—'}. Confirma nuestro valor privado y la aceptación del rival."})
+    result["trades"].sort(key=lambda row: (row["kind"] != "public-live", -row["rank_signal"], row["team"]))
+    result["sale_guide"] = sale_guide(result)
+    result['catalog_rows'] = catalog_matrix(catalog, Counter(), None, False, result['inventory'], rivals)
+    return result
+
+
 def build_rank(me: dict, catalog: dict, clock: dict, venues: list[dict], boards: dict[str, list[dict]],
                own_offers: list[dict], rivals: dict, listing_teams: dict[int, str],
                *, reserve: int = 100, margin: float = 2.0,
@@ -49,10 +192,11 @@ def build_rank(me: dict, catalog: dict, clock: dict, venues: list[dict], boards:
     if not me.get("id") or not catalog.get("sets"):
         if not catalog.get("sets"):
             result["warnings"].append("No se pudo leer el catálogo; no se calculan operaciones.")
-        return result
+        return public_sales(result, catalog, clock, venues, boards, rivals, listing_teams, market_refs)
     val = tr.Valuation(catalog, me.get("affinity") or {})
     assets, locked = _cash_and_assets(me, own_offers)
     resources = tr.resources(own_offers, me["id"], [])
+    result['buy_capacity'] = max(0, int(me.get('cash') or 0) - reserve - resources.reserved_cash)
     counts = tr.counts_of(assets)
     other_value = sum(float(a.get("your_value") or 0) for a in me.get("assets", []) if a.get("kind") != "card")
     server_value = me.get("collection_value")
@@ -85,11 +229,13 @@ def build_rank(me: dict, catalog: dict, clock: dict, venues: list[dict], boards:
         result["needs"].append({"ref": ref, "gain": gain if verified else None,
                                 "page": next((n for n in notes if "completa la página" in n), None)})
     result["needs"].sort(key=lambda r: -(r["gain"] or 0))
+    result['catalog_rows'] = catalog_matrix(catalog, counts, val, verified, result['inventory'], rivals, margin)
 
     venue_by_id = {v.get("venue"): v for v in venues if v.get("status") == "open"}
     own_venue = me.get("venue")
     own_venue = own_venue.get("venue") if isinstance(own_venue, dict) else own_venue
     if not verified:
+        result["sale_guide"] = sale_guide(result, margin)
         return result
     tick = int(clock.get("tick") or 0)
     seen_offers = set()
@@ -108,6 +254,8 @@ def build_rank(me: dict, catalog: dict, clock: dict, venues: list[dict], boards:
                                        my_assets=assets, locked=locked)
             if p is None:
                 continue
+            if not p.deliver:  # esta mesa prioriza convertir duplicados en efectivo o canjes
+                continue
             try:
                 ev = tr.evaluate(p, val, counts, venue)
             except (ValueError, TypeError, KeyError):
@@ -124,7 +272,7 @@ def build_rank(me: dict, catalog: dict, clock: dict, venues: list[dict], boards:
                 "cash_out": p.cash_out, "fee": ev.fee, "delta_value": ev.dv,
                 "surplus": ev.du, "venue": venue_id, "offer_id": p.offer_id,
                 "expires": p.expires_tick, "confidence": "Oferta activa",
-                "why": f"Oferta #{p.offer_id} visible en {venue_id}; ΔU = efectivo neto {ev.cash:+.1f} P + colección {ev.dv:+.1f} P.",
+                "why": f"Oferta #{p.offer_id} visible en {venue_id}; ΔU = efectivo neto {ev.cash:+g} P + colección {ev.dv:+g} P.",
                 "notes": ev.notes})
 
     # A declared want identifies a counterparty, not a guaranteed sale.
@@ -150,7 +298,7 @@ def build_rank(me: dict, catalog: dict, clock: dict, venues: list[dict], boards:
                 "fee": 0, "delta_value": -loss, "surplus": round(price - loss, 2),
                 "venue": None, "offer_id": None, "expires": None,
                 "confidence": "Demanda declarada; aceptación incierta",
-                "why": f"{team} pidió {ref} en el feed. Suelo nuestro {floor} P = pérdida {loss:.1f} P + margen {margin:.1f} P."
+                "why": f"{team} pidió {ref} en el feed. Suelo nuestro {floor} P: redondeamos hacia arriba la pérdida {loss:g} P + margen {margin:g} P."
                        + (f" Referencia de mercado {fair} P ({ref_market.get('confidence','sin confianza')})." if fair else "")
                        + (f" Última puja observada {market} P; puede haber caducado." if market else " Sin puja vigente verificada."),
                 "notes": []})
@@ -169,9 +317,11 @@ def build_rank(me: dict, catalog: dict, clock: dict, venues: list[dict], boards:
                     "fee": 0, "delta_value": dv, "surplus": dv, "venue": None,
                     "offer_id": None, "expires": None,
                     "confidence": "Intereses observados; aceptación incierta",
-                    "why": f"{team} pidió {give} y ofreció {receive}. Para t15, recibir {receive} y dar {give} cambia la colección {dv:+.1f} P."
+                    "why": f"{team} pidió {give} y ofreció {receive}. Para t15, recibir {receive} y dar {give} cambia la colección {dv:+g} P."
                            " Sin efectivo; la comisión propia sería cero si el rival acepta una propuesta nuestra.",
                     "notes": notes})
         result["trades"].extend(sorted(candidates, key=lambda c: -c["surplus"])[:3])
-    result["trades"].sort(key=lambda t: (t["kind"] != "live", -t["surplus"], t["team"], t["price"]))
+    sale_priority = {"Vender": 0, "Proponer venta": 1, "Canjear": 2, "Proponer canje": 3}
+    result["trades"].sort(key=lambda t: (sale_priority.get(t["action"], 4), -t["surplus"], t["team"], t["price"]))
+    result["sale_guide"] = sale_guide(result, margin)
     return result

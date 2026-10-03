@@ -10,6 +10,7 @@ import argparse
 import html
 import json
 import os
+import statistics
 import sys
 import threading
 import time
@@ -25,6 +26,7 @@ sys.path.insert(0, str(KIT))
 import dashboard as public_dashboard
 
 from planner import build_rank
+from radio import interpret, radio_event
 
 URL = os.environ.get("BAZAAR_URL", "https://bazaar.causaprima.ai").rstrip("/")
 
@@ -36,7 +38,17 @@ def esc(value) -> str:
 def fmt(value) -> str:
     if value is None:
         return "—"
-    return f"{value:,.1f}".replace(",", " ").replace(".0", "") if isinstance(value, (float, int)) else esc(value)
+    return f"{value:,.2f}".rstrip("0").rstrip(".").replace(",", " ") if isinstance(value, (float, int)) else esc(value)
+
+
+RARITY_LABELS = {
+    "common": "Común", "uncommon": "Poco común", "rare": "Rara",
+    "epic": "Épica", "legendary": "Legendaria",
+}
+
+
+def rarity_label(value) -> str:
+    return RARITY_LABELS.get(str(value).lower(), str(value) if value else "—")
 
 
 class Reader:
@@ -80,6 +92,22 @@ class Model:
         self.cached = None
         self.cached_at = 0.0
         self.catalog = None
+        self.radio_tail = public_dashboard.Tail()
+        self.radio_news = {}
+
+    def _read_radio(self) -> list[dict]:
+        events = []
+        for path in self.public.stores:
+            events.extend(self.radio_tail.read(path))
+        try:
+            events.extend(self.reader.get('/api/feed?limit=500').get('events') or [])
+        except Exception:
+            pass  # El historial local puede seguir disponible durante un fallo de red.
+        for event in events:
+            item = radio_event(event)
+            if item and item['id'] is not None:
+                self.radio_news[item['id']] = item
+        return list(self.radio_news.values())
 
     def snapshot(self, max_age: float = 12.0) -> dict:
         with self.lock:
@@ -134,6 +162,9 @@ class Model:
                           rivals, listing_teams, reserve=self.reserve,
                           market_refs={ref: {"fair": card.fair, "confidence": card.confidence}
                                        for ref, card in public.oracle.cards.items()})
+        enrich_catalog_market(rank.get('catalog_rows') or [], self.catalog or {}, public.oracle.cards)
+        rank['radio'] = interpret(self._read_radio(), self.catalog or {}, rank.get('sale_guide') or [],
+                                  int(public.clock.get('tick') or 0))
         rank["warnings"] = warnings + public.errors + rank["warnings"]
         rank["board_count"] = sum(map(len, boards.values()))
         rank["venue_count"] = len(boards)
@@ -147,6 +178,19 @@ class Model:
             if public_team:
                 rank["score"] = {"score": public_team.get("score")}
         return rank
+
+
+def enrich_catalog_market(rows: list[dict], catalog: dict, market_cards: dict) -> None:
+    """Attach only published mint counts and confirmed single-card sale prices."""
+    published = {c.get('id'): c for st in catalog.get('sets') or [] for c in st.get('cards') or []}
+    for row in rows:
+        card = published.get(row['ref']) or {}
+        market = market_cards.get(row['ref'])
+        sold = list(market.settled) if market else []
+        row['minted'] = card.get('minted')
+        row['print_run'] = card.get('print_run')
+        row['sold_prices'] = sold
+        row['sold_median'] = statistics.median(sold) if sold else None
 
 
 CSS = """
@@ -163,20 +207,358 @@ h3{font-size:17px;margin:0 0 5px}.sub{color:var(--muted);max-width:70ch;margin:9
 .metric{padding:8px 22px 17px 0}.metric+.metric{border-left:1px solid var(--line);padding-left:22px}.metric small{display:block;color:var(--muted)}
 .metric strong{display:block;font:700 28px/1.2 Georgia,serif;margin-top:4px}
 .warning{background:#fff1e9;border-left:4px solid var(--red);padding:10px 14px;margin:10px 0}
-.layout{display:grid;grid-template-columns:240px minmax(0,1fr);gap:26px}.sidebar{border-right:1px solid var(--line);padding-right:20px}
+.jump{display:flex;gap:16px;flex-wrap:wrap;margin:-9px 0 23px;font-size:13px;font-weight:700}.jump a{text-decoration:none;border-bottom:1px solid var(--teal)}
+.guide{margin:0 0 30px}.guide-head{display:flex;justify-content:space-between;gap:18px;align-items:baseline;margin-bottom:13px}.guide-head p{margin:0;color:var(--muted)}
+.sale-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:10px}.sale-card{background:var(--surface);border:1px solid var(--line);border-top:4px solid var(--teal);padding:16px 18px}
+.sale-card.no-buyer{border-top-color:var(--muted)}.sale-top{display:flex;justify-content:space-between;align-items:baseline;gap:12px}.sale-top h3{font:700 24px Georgia,serif;margin:0}.sale-top small{color:var(--muted)}
+.sale-numbers{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:15px 0}.sale-numbers>div+div{border-left:1px solid var(--line);padding-left:12px}.sale-numbers strong{display:block;font:700 22px Georgia,serif;white-space:nowrap}
+.sale-buyers{display:flex;flex-wrap:wrap;gap:5px;margin-top:9px}.buyer-chip{background:var(--blue);color:var(--teal);padding:3px 7px;font-size:12px}.buyer-chip.proposed{background:#f8edd5;color:#865b02}
+.sale-note{color:var(--muted);font-size:13px;margin:0}.guide-empty{padding:15px;border:1px dashed var(--line);color:var(--muted)}
+.radio{border-top:2px solid var(--ink);padding-top:14px;margin:5px 0 30px}.radio-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:10px}.radio-item{background:#fff;border:1px solid var(--line);padding:14px 16px}.radio-item h3{margin:4px 0}.radio-item p{margin:6px 0}.radio-item small{color:var(--muted)}.radio-action{border-left:3px solid var(--saffron);padding-left:9px;font-weight:700}
+.catalog{border-top:2px solid var(--ink);padding-top:18px;margin-top:32px;scroll-margin-top:18px}.catalog-head{display:flex;justify-content:space-between;gap:20px;align-items:start}.catalog-head h2{font-size:31px;margin-bottom:8px}.catalog-head p{color:var(--muted);margin:0;max-width:75ch}.catalog-head .eyebrow{font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--teal);margin-bottom:5px}.catalog-brief{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border:1px solid var(--line);background:var(--surface);margin:20px 0}.catalog-brief>div{padding:15px 18px}.catalog-brief>div+div{border-left:1px solid var(--line)}.catalog-brief strong{display:block;font:700 28px/1.1 Georgia,serif;margin:4px 0}.catalog-brief small{display:block;color:var(--muted);font-size:12px}.catalog-brief .brief-action{color:var(--teal)}.catalog-brief .brief-alert{color:var(--saffron)}.catalog-map-head{display:flex;justify-content:space-between;gap:14px;align-items:baseline;margin:0 0 10px}.catalog-map-head h3{margin:0}.catalog-map-head p{margin:0;color:var(--muted);font-size:12px}.catalog-map{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:9px}.set-card{border:1px solid var(--line);background:var(--surface);padding:12px 14px;text-align:left;color:var(--ink);min-width:0;overflow:hidden;transition:background .18s,border-color .18s,transform .18s}.set-card:hover,.set-card:focus-visible,.set-card[aria-pressed=true]{border-color:var(--teal);background:var(--blue);transform:translateY(-1px)}.set-card-top{display:flex;justify-content:space-between;gap:8px;align-items:baseline}.set-card b{font-size:15px}.set-card small{font-size:12px;color:var(--muted)}.set-track{height:6px;background:var(--paper);margin:10px 0 7px}.set-track span{display:block;height:100%;background:var(--teal)}.set-cells{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:3px}.set-cells span{display:block;height:13px;background:var(--line)}.set-cells .owned{background:var(--teal)}.set-cells .free{background:var(--saffron)}.set-cells .unreleased{background:var(--paper);border:1px solid var(--line)}.catalog-legend{display:flex;align-items:center;flex-wrap:wrap;gap:14px;margin:11px 0 18px;padding:9px 11px;border:1px solid var(--line);background:var(--surface);font-size:12px;color:var(--muted)}.catalog-legend span{display:inline-flex;align-items:center;white-space:nowrap}.catalog-legend span:before{content:"";display:inline-block;flex:0 0 9px;width:9px;height:9px;margin-right:5px;background:var(--line)}.catalog-legend .l-owned:before{background:var(--teal)}.catalog-legend .l-free:before{background:var(--saffron)}.catalog-legend .l-unreleased:before{background:var(--paper);border:1px solid var(--line)}.catalog-toolbar{position:sticky;top:0;z-index:3;display:flex;flex-wrap:wrap;align-items:end;gap:8px;border:1px solid var(--line);padding:12px;background:rgba(237,242,245,.96);backdrop-filter:blur(8px)}.catalog-toolbar label{display:grid;gap:4px;color:var(--muted);font-size:12px;font-weight:700}.catalog-toolbar input,.catalog-toolbar select{height:38px;background:var(--surface);border:1px solid var(--line);color:var(--ink);padding:7px 9px;font:14px Arial,Helvetica,sans-serif}.catalog-toolbar input{min-width:min(100%,230px)}.catalog-toolbar button{height:38px;background:var(--ink);border:1px solid var(--ink);color:#fff;padding:7px 13px;font-weight:700}.catalog-result{margin:10px 0;color:var(--muted);font-size:13px}.catalog-table{overflow-x:auto;border:1px solid var(--line);background:var(--surface)}#catalog-table{min-width:1210px}#catalog-table th{position:sticky;top:62px;background:var(--ink);color:#fff;z-index:2;padding:10px 12px;font-weight:700}#catalog-table td{padding:11px 12px;vertical-align:top}#catalog-table tbody tr{border-left:3px solid transparent}#catalog-table tbody tr[data-state="free"]{border-left-color:var(--saffron)}#catalog-table tbody tr[data-state="missing"]{border-left-color:var(--teal)}#catalog-table tbody tr:hover{background:var(--blue)}#catalog-table .dim{color:var(--muted)}#catalog-table .strong{font-weight:700;color:var(--teal)}#catalog-table .blocked{color:var(--red)}#catalog-table .cell-main{font-weight:700}.catalog-state{display:inline-block;padding:3px 8px;background:var(--paper);font-size:12px;font-weight:700;white-space:nowrap}.catalog-state.free{background:#f8edd5;color:#865b02}.catalog-state.missing{background:var(--blue);color:var(--teal)}.catalog-state.unreleased{color:var(--muted)}.catalog-count{font-weight:700}.catalog-signals{display:flex;gap:10px;flex-wrap:wrap;font-size:12px}.catalog-signals b{color:var(--teal)}.catalog-hint{margin:12px 0 0;color:var(--muted);font-size:12px}.catalog-empty{padding:22px;text-align:center;color:var(--muted)}
+.scarcity-track{display:block;height:5px;background:var(--paper);margin-top:5px;max-width:110px}.scarcity-track span{display:block;height:100%;background:var(--saffron)}.catalog-quick{display:flex;flex-wrap:wrap;gap:7px;margin:11px 0 0}.catalog-quick button{border:1px solid var(--line);background:var(--surface);color:var(--teal);padding:5px 9px;font-size:12px;font-weight:700}.catalog-quick button:hover,.catalog-quick button:focus-visible{border-color:var(--teal);background:var(--blue)}#catalog-table{min-width:1210px}.layout{display:grid;grid-template-columns:240px minmax(0,1fr);gap:26px}.sidebar{border-right:1px solid var(--line);padding-right:20px}
 .team-button{display:flex;justify-content:space-between;width:100%;text-align:left;border:0;border-bottom:1px solid var(--line);background:transparent;padding:10px 5px;color:var(--ink)}
 .team-button[aria-pressed=true]{background:var(--blue);font-weight:700;color:var(--teal)}.team-button small{color:var(--muted)}
 .section-head{display:flex;justify-content:space-between;gap:16px;align-items:baseline;margin:3px 0 14px}.section-head p{color:var(--muted);margin:0}
 .rank{display:grid;gap:9px}.trade{display:grid;grid-template-columns:34px minmax(0,1.7fr) 105px 130px;gap:14px;align-items:start;background:var(--surface);border:1px solid var(--line);padding:15px 17px}
-.trade.live{border-left:5px solid var(--teal)}.trade.proposal{border-left:5px solid var(--saffron)}.index{font:700 18px Georgia,serif;color:var(--muted)}
+.trade.live,.trade.public-live{border-left:5px solid var(--teal)}.trade.proposal,.trade.public-proposal{border-left:5px solid var(--saffron)}.index{font:700 18px Georgia,serif;color:var(--muted)}
 .trade p{margin:5px 0;color:var(--muted)}.trade .title{font-weight:700;font-size:17px}.trade .why{color:var(--ink);font-size:13px}
-.tag{display:inline-block;font-size:12px;padding:2px 6px;background:var(--blue);color:var(--teal);margin-left:5px}.proposal .tag{background:#f8edd5;color:#865b02}
+.tag{display:inline-block;font-size:12px;padding:2px 6px;background:var(--blue);color:var(--teal);margin-left:5px}.proposal .tag,.public-proposal .tag{background:#f8edd5;color:#865b02}
 .money{font:700 23px Georgia,serif;white-space:nowrap}.gain{color:var(--teal)}.label{display:block;color:var(--muted);font-size:12px}
 .below{display:grid;grid-template-columns:1fr 1fr;gap:25px;margin-top:30px}.panel{border-top:2px solid var(--ink);padding-top:13px}
 .team-profile{background:var(--blue);border-left:4px solid var(--teal);padding:12px 16px;margin-top:16px}.team-profile p{margin:5px 0}
 table{border-collapse:collapse;width:100%}th,td{padding:8px 6px;border-bottom:1px solid var(--line);text-align:left}th{color:var(--muted);font-size:12px;font-weight:400}td:last-child,th:last-child{text-align:right}
 .empty{padding:22px;border:1px dashed var(--line);color:var(--muted)}.foot{border-top:1px solid var(--line);margin-top:30px;padding-top:15px;color:var(--muted);font-size:13px}
-button:focus-visible{outline:3px solid var(--saffron);outline-offset:2px}@media(max-width:850px){.wrap{padding:18px}.layout{grid-template-columns:1fr}.sidebar{border:0;padding:0}.teams{display:flex;overflow-x:auto}.team-button{min-width:100px}.summary{grid-template-columns:1fr 1fr}.metric:nth-child(3){border-left:0;padding-left:0}.trade{grid-template-columns:25px 1fr 95px}.trade .surplus{grid-column:3}.trade .price{grid-column:3;grid-row:1}.below{grid-template-columns:1fr}}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid var(--saffron);outline-offset:2px}@media(max-width:850px){.wrap{padding:18px}.layout{grid-template-columns:1fr}.sidebar{border:0;padding:0}.teams{display:flex;overflow-x:auto}.team-button{min-width:100px}.summary{grid-template-columns:1fr 1fr}.metric:nth-child(3){border-left:0;padding-left:0}.trade{grid-template-columns:25px 1fr 95px}.trade .surplus{grid-column:3}.trade .price{grid-column:3;grid-row:1}.below{grid-template-columns:1fr}.catalog-brief{grid-template-columns:1fr 1fr}.catalog-brief>div:nth-child(3){border-left:0;border-top:1px solid var(--line)}.catalog-brief>div:nth-child(4){border-top:1px solid var(--line)}}@media(max-width:440px){.catalog-head{display:block}.catalog-toolbar label,.catalog-toolbar input,.catalog-toolbar select{width:100%}.catalog-toolbar label:first-child{flex:1 1 100%}.catalog-brief>div{padding:12px}.catalog-brief strong{font-size:23px}}
+"""
+
+CSS += r"""
+/* Decision desk redesign */
+:root{--ink:#10212b;--ink-2:#1b3440;--paper:#f4f7f8;--surface:#ffffff;--line:#d7e1e5;--muted:#6b7d86;--teal:#087f82;--teal-2:#d9f1ef;--saffron:#e2a52b;--red:#d06154;--violet:#6a61c7;--shadow:0 10px 30px rgba(16,33,43,.06)}
+*{box-sizing:border-box}body{background:#f5f8f9;color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:14px;letter-spacing:-.01em}.wrap{max-width:1680px;padding:28px 34px 80px}h1,h2,h3{font-family:Inter,ui-sans-serif,system-ui,sans-serif;letter-spacing:-.035em}h1{font-size:42px;font-weight:800;line-height:1.02}h2{font-size:25px;font-weight:750}h3{font-size:16px;font-weight:750}.sub{font-size:14px;line-height:1.55}.status{align-items:center}.flag{border-radius:999px;padding:7px 12px;font-size:12px;letter-spacing:.02em}.clock{font-size:14px;color:var(--muted);font-weight:700}
+header{border:0;border-radius:22px;background:linear-gradient(120deg,#102a35 0%,#134c55 52%,#0a7775 100%);color:#fff;padding:30px 34px 28px;align-items:center;box-shadow:var(--shadow)}header .sub{color:#bfe1e0;max-width:58ch}.summary{gap:12px;border:0;margin:18px 0 16px}.metric{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:17px 19px;box-shadow:0 4px 18px rgba(16,33,43,.035)}.metric+.metric{border:1px solid var(--line);padding-left:19px}.metric small{font-size:12px;color:var(--muted);font-weight:650}.metric strong{font-family:Inter,sans-serif;font-size:26px;font-weight:800;letter-spacing:-.04em}.jump{background:#e7eff1;border-radius:12px;padding:8px 11px;margin:0 0 25px;gap:6px}.jump a{border:0;padding:7px 11px;color:var(--ink-2);border-radius:8px}.jump a:hover{background:#fff;color:var(--teal)}
+.dashboard-overview{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(330px,.75fr);gap:16px;margin:0 0 30px}.viz-card{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:20px;box-shadow:var(--shadow)}.viz-card h2{margin:0 0 4px}.viz-card .viz-caption{margin:0 0 17px;color:var(--muted);font-size:12px}.viz-head{display:flex;justify-content:space-between;gap:16px;align-items:start}.viz-head .mini-stat{text-align:right}.mini-stat strong{display:block;font-size:25px;font-weight:800;color:var(--teal)}.mini-stat span{font-size:11px;color:var(--muted)}.bar-chart{display:grid;gap:10px}.bar-row{display:grid;grid-template-columns:110px minmax(60px,1fr) 66px;align-items:center;gap:9px;font-size:12px}.bar-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink-2);font-weight:650}.bar-track{height:9px;background:#edf2f3;border-radius:99px;overflow:hidden}.bar-fill{height:100%;border-radius:99px;background:linear-gradient(90deg,var(--teal),#45b8ad)}.bar-value{text-align:right;font-weight:800;color:var(--ink-2)}.chart-legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:16px;color:var(--muted);font-size:11px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;background:var(--teal)}.dot.gold{background:var(--saffron)}.dot.violet{background:var(--violet)}.coverage-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}.coverage-item{display:grid;grid-template-columns:92px 1fr 37px;gap:7px;align-items:center;font-size:12px}.coverage-item b{font-size:12px}.coverage-item small{text-align:right;color:var(--muted);font-weight:700}.coverage-track{height:8px;border-radius:99px;background:#edf2f3;overflow:hidden}.coverage-track i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--violet),#9891eb)}.action-strip{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:0 0 30px}.action-card{border:1px solid var(--line);border-radius:15px;padding:14px 16px;background:var(--surface);display:flex;gap:12px;align-items:flex-start;box-shadow:0 4px 18px rgba(16,33,43,.03)}.action-card .action-icon{width:31px;height:31px;border-radius:10px;background:var(--teal-2);display:grid;place-items:center;color:var(--teal);font-weight:800;flex:0 0 auto}.action-card.warn .action-icon{background:#fff1d5;color:#9a6b06}.action-card.hot .action-icon{background:#f6e4e2;color:var(--red)}.action-card strong{display:block;font-size:14px}.action-card span{display:block;font-size:12px;color:var(--muted);margin-top:3px}.section-shell{border-top:0;margin-top:22px;padding:22px;border-radius:18px;background:rgba(255,255,255,.52);border:1px solid rgba(215,225,229,.75)}.guide,.radio,.catalog{margin-top:20px}.guide-head{margin-bottom:16px}.sale-card,.radio-item,.trade,.panel,.team-profile{border-radius:15px;box-shadow:0 5px 22px rgba(16,33,43,.04);border:1px solid var(--line)}.sale-card{border-top:3px solid var(--teal)}.radio{border-top:0}.radio-list{gap:12px}.radio-item{padding:16px}.layout{gap:20px}.sidebar{border:0;background:var(--surface);border:1px solid var(--line);padding:15px;border-radius:16px;height:max-content;position:sticky;top:18px}.team-button{border-radius:9px;border:0;margin:2px 0}.trade{padding:16px 18px}.panel{padding:18px;background:var(--surface);border-top:1px solid var(--line)}
+.catalog{border:0;padding:24px;border-radius:18px;background:var(--surface);box-shadow:var(--shadow)}.catalog-head h2{font-size:30px}.catalog-brief{border:0;gap:10px;background:transparent}.catalog-brief>div{border:1px solid var(--line)!important;border-radius:15px;background:#fbfcfc;box-shadow:none}.catalog-map{gap:10px}.set-card{border-radius:13px}.catalog-toolbar{border-radius:14px;top:12px;box-shadow:0 8px 24px rgba(16,33,43,.08)}.catalog-table{border-radius:14px;overflow:auto}.catalog-table table{font-size:13px}.catalog-table th{top:74px}.catalog-table tbody tr{border-left-width:4px}.foot{border:0;text-align:center}
+
+.analytics-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 28px}.analytics-card{background:var(--ink-2);color:#fff;border-radius:15px;padding:16px 18px;position:relative;overflow:hidden}.analytics-card:nth-child(2){background:#13666b}.analytics-card:nth-child(3){background:#4d478d}.analytics-card:nth-child(4){background:#835f20}.analytics-card small{display:block;color:#c5d4d8;font-size:11px;font-weight:650}.analytics-card strong{display:block;font-size:25px;letter-spacing:-.04em;margin-top:5px}.analytics-card span{display:block;color:#d8e4e6;font-size:11px;margin-top:4px}.analytics-card:after{content:"";position:absolute;width:80px;height:80px;border:1px solid rgba(255,255,255,.18);border-radius:50%;right:-28px;bottom:-35px}.priority-panel{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin:0 0 30px}.priority-card{background:var(--surface);border:1px solid var(--line);border-radius:15px;padding:15px 17px}.priority-card h3{margin:0 0 5px}.priority-card p{font-size:12px;color:var(--muted);margin:0;line-height:1.45}.priority-card .priority-value{font-size:20px;font-weight:800;color:var(--teal);margin-bottom:5px;display:block}.priority-card.buy .priority-value{color:var(--violet)}.priority-card.hold .priority-value{color:#9a6b06}
+@media(max-width:1100px){.analytics-grid{grid-template-columns:1fr 1fr}.priority-panel{grid-template-columns:1fr 1fr}}
+@media(max-width:700px){.analytics-grid{grid-template-columns:1fr 1fr}.priority-panel{grid-template-columns:1fr}.analytics-card strong{font-size:21px}}
+@media(max-width:1100px){.dashboard-overview{grid-template-columns:1fr}.action-strip{grid-template-columns:1fr 1fr}.coverage-grid{grid-template-columns:1fr 1fr}}
+@media(max-width:700px){.wrap{padding:16px 12px 48px}header{padding:23px 20px;border-radius:18px}h1{font-size:32px}.summary{grid-template-columns:1fr 1fr}.metric{padding:14px}.metric strong{font-size:22px}.dashboard-overview{gap:12px}.action-strip{grid-template-columns:1fr}.coverage-grid{grid-template-columns:1fr}.viz-card{padding:16px}.catalog{padding:16px}.catalog-brief{grid-template-columns:1fr 1fr}.bar-row{grid-template-columns:88px 1fr 56px}}
+"""
+
+
+def render_dashboard_overview(data: dict) -> str:
+    """Compact decision visualizations using the same live rows as the detailed views."""
+    rows = data.get('catalog_rows') or []
+    released = [r for r in rows if r.get('released')]
+    sold = sorted([r for r in released if r.get('sold_median') is not None], key=lambda r: r.get('sold_median') or 0, reverse=True)[:7]
+    max_sold = max([r.get('sold_median') or 0 for r in sold] or [1])
+    sold_bars = ''.join(
+        f'<div class="bar-row"><span class="bar-label">{esc(r["ref"])}</span><span class="bar-track"><i class="bar-fill" style="width:{max(5, (r["sold_median"] or 0)/max_sold*100):.1f}%"></i></span><b class="bar-value">{fmt(r["sold_median"])} P</b></div>'
+        for r in sold
+    ) or '<p class="sub">Todavía no hay liquidaciones individuales suficientes.</p>'
+    sets = []
+    for name, cards in _group_rows(rows, 'set').items():
+        available = [r for r in cards if r.get('released')]
+        owned = sum(1 for r in available if isinstance(r.get('stock'), int) and r['stock'] > 0)
+        pct = round(owned / len(available) * 100) if available else 0
+        sets.append((name, pct, owned, len(available)))
+    sets.sort(key=lambda x: x[1], reverse=True)
+    coverage = ''.join(f'<div class="coverage-item"><b>{esc(name)}</b><span class="coverage-track"><i style="width:{pct}%"></i></span><small>{owned}/{total}</small></div>' for name,pct,owned,total in sets[:8])
+    holders = sorted([r for r in released if r.get('held_by')], key=lambda r: len(r.get('held_by') or []), reverse=True)[:6]
+    max_holders = max([len(r.get('held_by') or []) for r in holders] or [1])
+    holder_bars = ''.join(f'<div class="bar-row"><span class="bar-label">{esc(r["ref"])}</span><span class="bar-track"><i class="bar-fill" style="width:{max(5, len(r.get("held_by") or [])/max_holders*100):.1f}%;background:linear-gradient(90deg,var(--saffron),#f0c96b)"></i></span><b class="bar-value">{len(r.get("held_by") or [])} equipos</b></div>' for r in holders) or '<p class="sub">Aún no hay posesiones observadas.</p>'
+    free = [r for r in released if isinstance(r.get('free'), int) and r['free'] > 0]
+    missing = [r for r in released if r.get('stock') == 0]
+    scarce = sorted([r for r in released if r.get('minted') and r.get('print_run')], key=lambda r: r['minted']/r['print_run'])[:1]
+    top_scarce = scarce[0] if scarce else None
+    trades = data.get('trades') or []
+    best_trade = trades[0] if trades else None
+    missing_value = sum((r.get('buy_ceiling') or 0) for r in released if r.get('stock') == 0)
+    sell_value = sum((r.get('sold_median') or 0) for r in free)
+    sold_values = [r.get('sold_median') for r in released if r.get('sold_median') is not None]
+    avg_sold = statistics.mean(sold_values) if sold_values else None
+    demand_total = sum(len(r.get('wanted_by') or []) for r in released)
+    held_total = sum(len(r.get('held_by') or []) for r in released)
+    def action(icon, title, detail, kind=''):
+        return f'<article class="action-card {kind}"><span class="action-icon">{icon}</span><div><strong>{title}</strong><span>{detail}</span></div></article>'
+    analytics = ('<section class="analytics-grid" aria-label="KPIs estratégicos">'
+        f'<article class="analytics-card"><small>Capital potencial en faltantes</small><strong>{fmt(missing_value)} P</strong><span>Suma de topes de compra publicados</span></article>'
+        f'<article class="analytics-card"><small>Liquidez de duplicados</small><strong>{fmt(sell_value)} P</strong><span>Medianas vendidas de cartas libres</span></article>'
+        f'<article class="analytics-card"><small>Precio mediano del mercado</small><strong>{fmt(avg_sold)} P</strong><span>Entre referencias con venta confirmada</span></article>'
+        f'<article class="analytics-card"><small>Presión de demanda</small><strong>{demand_total} / {held_total}</strong><span>Pedidos frente a posesiones observadas</span></article></section>')
+    priorities = ('<section class="priority-panel" aria-label="Lectura estratégica">'
+        f'<article class="priority-card"><span class="priority-value">{len(free)} cartas</span><h3>Vender primero</h3><p>Duplicados libres detectados. Empieza por las que tienen compradores y mediana ejecutada.</p></article>'
+        f'<article class="priority-card buy"><span class="priority-value">{len(missing)} cartas · {fmt(missing_value)} P</span><h3>Comprar con criterio</h3><p>Faltantes publicados. Ordena el catálogo por “valor al recibir” y respeta la caja disponible.</p></article>'
+        f'<article class="priority-card hold"><span class="priority-value">{len(released)-len(free)-len(missing)} cartas</span><h3>Proteger</h3><p>Cartas propias sin duplicado. Son el núcleo de colección; venderlas tiene coste de oportunidad.</p></article></section>')
+    overview = (analytics + priorities + '<section class="dashboard-overview" aria-label="Resumen visual">'
+
+        '<article class="viz-card"><div class="viz-head"><div><h2>Precios que ya se han pagado</h2><p class="viz-caption">Mediana de ventas individuales confirmadas en el feed</p></div>'
+        f'<div class="mini-stat"><strong>{len(sold)}</strong><span>referencias con venta</span></div></div><div class="bar-chart">{sold_bars}</div><div class="chart-legend"><span><i class="dot"></i>Precio mediano ejecutado</span><span>Ordenado de mayor a menor</span></div></article>'
+        '<article class="viz-card"><div class="viz-head"><div><h2>Cobertura de colección</h2><p class="viz-caption">Cartas publicadas que ya tenemos por colección</p></div></div><div class="coverage-grid">'+(coverage or '<p class="sub">Sin colecciones publicadas.</p>')+'</div><div class="chart-legend"><span><i class="dot violet"></i>Más cobertura</span><span>Haz clic en una colección abajo para filtrar</span></div></article>'
+        '<article class="viz-card"><div class="viz-head"><div><h2>Cartas más comunes</h2><p class="viz-caption">Equipos distintos en los que hemos observado cada referencia</p></div></div><div class="bar-chart">'+holder_bars+'</div><div class="chart-legend"><span><i class="dot gold"></i>Posesión observada</span><span>Más equipos = menos exclusividad</span></div></article></section>')
+    actions = '<section class="action-strip" aria-label="Siguientes decisiones">'
+    actions += action('↗', f'{len(free)} duplicados libres', 'Revisa el precio de venta sugerido en Venta rápida', 'hot' if free else '')
+    actions += action('＋', f'{len(missing)} cartas faltantes', 'Prioriza las que tengan mayor valor al recibirlas', 'warn' if missing else '')
+    actions += action('◎', f'{"Escasez: "+top_scarce["ref"] if top_scarce else "Sin dato de tirada"}', f'{fmt(top_scarce["minted"])} de {fmt(top_scarce["print_run"])} acuñadas' if top_scarce else 'El feed aún no publica tiradas completas', '')
+    actions += '</section>'
+    return overview + actions
+
+
+def _group_rows(rows, key):
+    groups = {}
+    for row in rows:
+        groups.setdefault(row.get(key) or 'Sin colección', []).append(row)
+    return groups
+
+
+def strategy_export(data: dict) -> dict:
+    """Agent-friendly, evidence-preserving strategy payload."""
+    rows = data.get('catalog_rows') or []
+    released = [r for r in rows if r.get('released')]
+    sold = [r for r in released if r.get('sold_median') is not None]
+    free = [r for r in released if isinstance(r.get('free'), int) and r['free'] > 0]
+    missing = [r for r in released if r.get('stock') == 0]
+    sold_values = [r['sold_median'] for r in sold]
+    leaderboard_rows = (data.get('leaderboard') or {}).get('teams') or []
+    board_sorted = sorted([r for r in leaderboard_rows if isinstance(r.get('score'), (int, float))], key=lambda r: r.get('score', 0), reverse=True)
+    rank_index = next((i for i, r in enumerate(board_sorted, 1) if r.get('team') == 't15'), None)
+    current_score = next((r.get('score') for r in board_sorted if r.get('team') == 't15'), data.get('score', {}).get('score'))
+    next_score = board_sorted[rank_index - 2].get('score') if rank_index and rank_index > 1 else None
+    leader_score = board_sorted[0].get('score') if board_sorted else None
+    ranking = {
+        'position': rank_index, 'teams_count': len(board_sorted), 'score': current_score,
+        'gap_to_next_position': round(next_score - current_score, 2) if next_score is not None and current_score is not None else None,
+        'gap_to_leader': round(leader_score - current_score, 2) if leader_score is not None and current_score is not None else None,
+        'leaderboard_order': [{'team': r.get('team'), 'score': r.get('score')} for r in board_sorted],
+    }
+    cards = []
+    for row in rows:
+        minted, print_run = row.get('minted'), row.get('print_run')
+        scarcity_ratio = minted / print_run if isinstance(minted, int) and isinstance(print_run, int) and print_run > 0 else None
+        holders = row.get('held_by') or []
+        wanted = row.get('wanted_by') or []
+        holder_count, demand_count = len(holders), len(wanted)
+        if not row.get('released'):
+            decision = 'unreleased'
+        elif isinstance(row.get('free'), int) and row['free'] > 0:
+            decision = 'sell_candidate'
+        elif isinstance(row.get('stock'), int) and row['stock'] > 0:
+            decision = 'hold'
+        else:
+            decision = 'buy_candidate'
+        cards.append({
+            'ref': row.get('ref'), 'set': row.get('set'), 'rarity': row.get('rarity'),
+            'decision': decision, 'released': bool(row.get('released')),
+            'stock': row.get('stock'), 'free': row.get('free'),
+            'holder_count_observed': holder_count, 'holders_observed': holders,
+            'demand_count_observed': demand_count, 'demanders_observed': wanted,
+            'demand_to_holder_ratio': round(demand_count / max(holder_count, 1), 3),
+            'minted': minted, 'print_run': print_run,
+            'scarcity_ratio_minted_to_print_run': round(scarcity_ratio, 4) if scarcity_ratio is not None else None,
+            'sold_median': row.get('sold_median'), 'sold_count': len(row.get('sold_prices') or []),
+            'sold_prices': row.get('sold_prices') or [],
+            'sell_floor': row.get('sell_floor'), 'buy_ceiling': row.get('buy_ceiling'),
+        })
+    return {
+        'schema': 'team15.strategy.v1', 'team': 't15', 'tick': data.get('tick'),
+        'generated_at': data.get('built_at'), 'verified_private_data': bool(data.get('verified')),
+        'ranking': ranking,
+        'kpis': {
+            'published_cards': len(released), 'catalog_cards': len(rows),
+            'owned_references': sum(1 for r in released if isinstance(r.get('stock'), int) and r['stock'] > 0),
+            'free_duplicate_references': len(free), 'missing_references': len(missing),
+            'confirmed_sale_references': len(sold),
+            'average_confirmed_sold_median': round(statistics.mean(sold_values), 2) if sold_values else None,
+            'observed_demand_events': sum(len(r.get('wanted_by') or []) for r in released),
+            'observed_holder_events': sum(len(r.get('held_by') or []) for r in released),
+            'cash': data.get('cash'), 'collection_value': data.get('collection_value'),
+            'buy_capacity_after_reserve': data.get('buy_capacity') if data.get('verified') else None,
+        },
+        'ratios': {
+            'demand_pressure': round(sum(len(r.get('wanted_by') or []) for r in released) / max(sum(len(r.get('held_by') or []) for r in released), 1), 3),
+            'collection_coverage': round(sum(1 for r in released if isinstance(r.get('stock'), int) and r['stock'] > 0) / max(len(released), 1), 4),
+            'free_duplicate_rate': round(len(free) / max(len(released), 1), 4),
+            'confirmed_sale_rate': round(len(sold) / max(len(released), 1), 4),
+        },
+        'definitions': {
+            'holder_count_observed': 'Número de equipos distintos con posesión observada en el feed; no demuestra inventario completo.',
+            'demand_count_observed': 'Número de equipos distintos que pidieron la referencia en el feed.',
+            'scarcity_ratio_minted_to_print_run': 'minted / print_run. Menor proporción implica menos copias emitidas respecto de la tirada.',
+            'demand_to_holder_ratio': 'demand_count_observed / max(holder_count_observed, 1). Señal comparativa, no probabilidad de venta.',
+            'sold_median': 'Mediana de liquidaciones de una sola carta por efectivo; no incluye lotes ni ofertas sin liquidar.',
+            'buy_ceiling': 'Tope de valoración privada de recibir la carta antes de caja y comisiones.',
+            'sell_floor': 'Mínimo rentable para desprenderse de una copia libre según pérdida marginal + margen.',
+        },
+        'cards': cards,
+    }
+
+
+
+def render_catalog(data: dict) -> str:
+    """A decision view of the complete catalog; feed signals stay explicitly observational."""
+    rows = data.get('catalog_rows') or []
+    verified = bool(data.get('verified'))
+    capacity = data.get('buy_capacity') if verified else None
+    released = [r for r in rows if r['released']]
+    owned = [r for r in released if isinstance(r['stock'], int) and r['stock'] > 0]
+    free = [r for r in released if isinstance(r['free'], int) and r['free'] > 0]
+    missing = [r for r in released if r['stock'] == 0]
+    leads = [r for r in missing if r['held_by']]
+    traded = [r for r in released if r.get('sold_prices')]
+    sets = {}
+    for row in rows:
+        sets.setdefault(row['set'], []).append(row)
+    parts = ['<section id="catalogo" class="catalog"><div class="catalog-head"><div>',
+             '<p class="eyebrow">Inventario · valoración · señales del feed</p>',
+             '<h2>Todo el catálogo · Team 15</h2>',
+             '<p>Explora qué conservar, qué falta y dónde hay señales para iniciar una negociación. '
+             '«Le vimos» y «pidió» son observaciones, no ofertas ni inventario confirmado del rival.</p>',
+             '</div></div><div class="catalog-brief" aria-label="Resumen del catálogo">',
+             f'<div><small>Cartas publicadas</small><strong>{len(released)} / {len(rows)}</strong><small>disponibles / catálogo total</small></div>',
+             f'<div><small>{"En nuestra colección" if verified else "Observadas en t15"}</small><strong>{len(owned)}</strong><small>referencias distintas publicadas</small></div>',
+             f'<div><small>{"Duplicados libres" if verified else "Duplicados por verificar"}</small><strong class="brief-alert">{len(free) if verified else "—"}</strong><small>referencias vendibles verificadas</small></div>',
+             f'<div><small>Con venta confirmada</small><strong class="brief-action">{len(traded)}</strong><small>referencias con precio ejecutado</small></div>',
+             '</div><div class="catalog-map-head"><h3>Mapa por colección</h3>',
+             '<p>Selecciona una colección para filtrar la tabla</p></div><div class="catalog-map">']
+    for name, cards in sets.items():
+        available = [r for r in cards if r['released']]
+        have = sum(isinstance(r['stock'], int) and r['stock'] > 0 for r in available)
+        pct = round(100 * have / len(available)) if available else 0
+        cells = ''.join(f'<span class="{"unreleased" if not r["released"] else "free" if isinstance(r["free"], int) and r["free"] > 0 else "owned" if isinstance(r["stock"], int) and r["stock"] > 0 else "missing"}" '
+                        f'title="{esc(r["ref"])}"></span>' for r in cards)
+        parts.append(f'<button type="button" class="set-card" data-set="{esc(name)}" aria-pressed="false" '
+                     f'aria-label="Filtrar {esc(name)}: {have} de {len(available)} cartas publicadas observadas">'
+                     f'<span class="set-card-top"><b>{esc(name)}</b><small>{have} / {len(available)}</small></span>'
+                     f'<span class="set-track"><span style="width:{pct}%"></span></span>'
+                     f'<span class="set-cells" aria-hidden="true">{cells}</span></button>')
+    parts += ['</div><div class="catalog-legend" aria-label="Leyenda del mapa">',
+              '<span class="l-owned">Tenemos</span><span class="l-free">Duplicado libre</span>',
+              '<span>Falta</span><span class="l-unreleased">No publicada</span></div>',
+              '<div class="catalog-toolbar">',
+              '<label>Buscar<input id="catalog-search" type="search" placeholder="Carta, barrio o equipo"></label>',
+              '<label>Situación<select id="catalog-status"><option value="all">Todas</option><option value="free">Duplicado libre</option><option value="owned">Conservar</option><option value="missing">Falta</option><option value="unreleased">No publicada</option></select></label>',
+              '<label>Rareza<select id="catalog-rarity"><option value="all">Todas</option><option value="common">Común</option><option value="uncommon">Poco común</option><option value="rare">Rara</option><option value="epic">Épica</option><option value="legendary">Legendaria</option></select></label>',
+              '<label>Ordenar<select id="catalog-sort"><option value="catalog">Catálogo</option><option value="sold">Mayor mediana vendida</option><option value="scarce">Menor proporción acuñada</option><option value="buy">Mayor valor al recibir</option><option value="interest">Más equipos interesados</option><option value="held">Más equipos observados</option><option value="holders">Más equipos que la tienen</option></select></label>',
+              '<button type="button" id="catalog-reset">Limpiar</button></div>',
+              '<div class="catalog-quick" aria-label="Filtros rápidos">'
+              '<button type="button" data-preset="free">Ver duplicados libres</button>'
+              '<button type="button" data-preset="missing">Ver faltantes</button>'
+              '<button type="button" data-preset="sold">Ordenar por ventas</button>'
+              '<button type="button" data-preset="scarce">Ordenar por escasez</button><button type="button" data-preset="holders">Más equipos la tienen</button></div>',
+              '<p id="catalog-result" class="catalog-result" role="status"></p>',
+              '<div class="catalog-table"><table id="catalog-table"><thead><tr>',
+              '<th>Carta</th><th>Decisión</th><th>Escasez real</th><th>Vendida por</th><th>Equipos que la tienen</th><th>Stock / libre</th>',
+              '<th>Vender desde</th><th>Comprar hasta</th><th>Señales del feed</th>',
+              '</tr></thead><tbody>']
+    for index, row in enumerate(rows):
+        stock, free_count = row['stock'], row['free']
+        if not row['released']:
+            state, label = 'unreleased', 'No publicada'
+        elif verified and isinstance(free_count, int) and free_count > 0:
+            state, label = 'free', 'Vender posible'
+        elif isinstance(stock, int) and stock > 0:
+            state, label = 'owned', 'Conservar' if verified else 'Observada'
+        else:
+            state, label = 'missing', 'Falta' if verified else 'No observada'
+        floor, ceiling = row['sell_floor'], row['buy_ceiling']
+        buy_limit = min(ceiling, capacity) if ceiling is not None and capacity is not None else ceiling
+        sell_text = f'<span class="cell-main">{fmt(floor)} P</span>' if floor is not None else '<span class="dim">—</span>'
+        if floor is not None and state != 'free':
+            sell_text += '<span class="label">Referencia; copia no libre</span>'
+        buy_text = f'<span class="cell-main">{fmt(buy_limit)} P</span>' if buy_limit is not None else '<span class="dim">—</span>'
+        if not row['released']:
+            buy_text = '<span class="dim">No disponible</span>'
+        elif ceiling is not None and capacity is not None and capacity < ceiling:
+            buy_text += f'<span class="label">Valor {fmt(ceiling)} P · caja {fmt(capacity)} P</span>'
+        elif ceiling is not None:
+            buy_text += '<span class="label">Tope por valoración</span>'
+        minted, print_run = row.get('minted'), row.get('print_run')
+        scarcity = minted / print_run if isinstance(minted, int) and isinstance(print_run, int) and print_run > 0 else None
+        scarcity_text = (f'<span class="cell-main">{fmt(minted)} / {fmt(print_run)}</span>'
+                         f'<span class="label">{scarcity:.1%} de la tirada acuñada · {esc(rarity_label(row["rarity"]))}</span>'
+                         f'<span class="scarcity-track"><span style="width:{max(0, min(100, scarcity * 100)):.1f}%"></span></span>') if scarcity is not None else f'<span class="dim">Sin tirada publicada</span><span class="label">{esc(rarity_label(row["rarity"]))}</span>'
+        sold = row.get('sold_prices') or []
+        sold_text = (f'<span class="cell-main">{fmt(row["sold_median"])} P</span>'
+                     f'<span class="label">mediana · {len(sold)} venta{"s" if len(sold) != 1 else ""}</span>'
+                     f'<span class="label">Rango {fmt(min(sold))}–{fmt(max(sold))} P · últimas {", ".join(fmt(p) for p in sold[-3:])} P</span>') if sold else '<span class="dim">Sin venta registrada</span>'
+        held = ', '.join(row['held_by']) or 'Sin observación'
+        wanted = ', '.join(row['wanted_by']) or 'Sin demanda'
+        signals = (f'<span title="{esc(held)}"><b>{len(row["held_by"])}</b> le vimos</span>'
+                   f'<span title="{esc(wanted)}"><b>{len(row["wanted_by"])}</b> pidieron</span>')
+        parts.append(f'<tr data-index="{index}" data-set="{esc(row["set"])}" data-state="{state}" '
+                     f'data-rarity="{esc(row["rarity"] or "")}" data-buy="{ceiling if ceiling is not None else -1}" '
+                     f'data-interest="{len(row["wanted_by"])}" data-held="{len(row["held_by"])}" '
+                     f'data-sold="{row["sold_median"] if sold else -1}" data-scarcity="{scarcity if scarcity is not None else 2}" '
+                     f'data-search="{esc(" ".join([row["ref"], row["set"], *row["held_by"], *row["wanted_by"]]).lower())}">'
+                     f'<td><b>{esc(row["ref"])}</b><span class="label">{esc(row["set"])}</span></td>'
+                     f'<td><span class="catalog-state {state}">{label}</span></td><td>{scarcity_text}</td><td>{sold_text}</td>'
+                     f'<td><span class="cell-main">{len(row["held_by"])} equipos</span><span class="label">{esc(held) if held != "Sin observación" else "Sin posesión observada"}</span></td>'
+                     f'<td><span class="catalog-count">{esc(stock)}</span> / {esc(free_count)}</td>'
+                     f'<td>{sell_text}</td><td>{buy_text}</td><td><div class="catalog-signals">{signals}</div>'
+                     f'<span class="label">Le vimos: {esc(held)}<br>Pidieron: {esc(wanted)}</span></td></tr>')
+    parts += ['</tbody></table><div id="catalog-empty" class="catalog-empty" hidden>Sin cartas para estos filtros.</div></div>',
+              '<p class="catalog-hint">«Vendida por» usa sólo liquidaciones de una carta por efectivo observadas en el feed; los lotes no permiten atribuir un precio individual. Menor porcentaje acuñado significa menos copias emitidas respecto a la tirada, no menos cartas actualmente a la venta. Los topes son límites privados antes de posibles comisiones. '
+              + (f'Capacidad con reserva: {fmt(capacity)} P.' if capacity is not None else 'Sin valoración privada verificada: topes desconocidos.')
+              + '</p></section>']
+    return ''.join(parts)
+
+
+CATALOG_JS = """
+const catalogTable=document.querySelector('#catalog-table tbody');
+const catalogRows=Array.from(catalogTable.querySelectorAll('tr'));
+const catalogSearch=document.getElementById('catalog-search');
+const catalogStatus=document.getElementById('catalog-status');
+const catalogRarity=document.getElementById('catalog-rarity');
+const catalogSort=document.getElementById('catalog-sort');
+const catalogSets=Array.from(document.querySelectorAll('.set-card'));
+let catalogSet=sessionStorage.getItem('t15.catalog.set')||'';
+catalogSearch.value=sessionStorage.getItem('t15.catalog.search')||'';
+catalogStatus.value=sessionStorage.getItem('t15.catalog.status')||'all';
+catalogRarity.value=sessionStorage.getItem('t15.catalog.rarity')||'all';
+catalogSort.value=sessionStorage.getItem('t15.catalog.sort')||'catalog';
+function updateCatalog(){
+  const q=catalogSearch.value.trim().toLocaleLowerCase();
+  const sort=catalogSort.value;
+  catalogRows.sort((a,b)=>{
+    if(sort==='catalog')return Number(a.dataset.index)-Number(b.dataset.index);
+    const key=sort==='scarce'?'scarcity':sort;
+    const av=Number(a.dataset[key]),bv=Number(b.dataset[key]);
+    return (sort==='scarce'?av-bv:bv-av)||Number(a.dataset.index)-Number(b.dataset.index);
+  });
+  catalogRows.forEach(r=>catalogTable.appendChild(r));
+  let shown=0;
+  catalogRows.forEach(r=>{
+    const match=(!q||r.dataset.search.includes(q))&&(!catalogSet||r.dataset.set===catalogSet)
+      &&(catalogStatus.value==='all'||r.dataset.state===catalogStatus.value)
+      &&(catalogRarity.value==='all'||r.dataset.rarity===catalogRarity.value);
+    r.hidden=!match;if(match)shown++;
+  });
+  catalogSets.forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.set===catalogSet)));
+  document.getElementById('catalog-result').textContent=shown+' de '+catalogRows.length+' cartas · '+(catalogSet||'todas las colecciones');
+  document.getElementById('catalog-empty').hidden=shown!==0;
+  sessionStorage.setItem('t15.catalog.search',catalogSearch.value);
+  sessionStorage.setItem('t15.catalog.status',catalogStatus.value);
+  sessionStorage.setItem('t15.catalog.rarity',catalogRarity.value);
+  sessionStorage.setItem('t15.catalog.sort',catalogSort.value);
+  sessionStorage.setItem('t15.catalog.set',catalogSet);
+}
+catalogSets.forEach(b=>b.addEventListener('click',()=>{catalogSet=catalogSet===b.dataset.set?'':b.dataset.set;updateCatalog();}));
+[catalogStatus,catalogRarity,catalogSort].forEach(el=>el.addEventListener('change',updateCatalog));
+catalogSearch.addEventListener('input',updateCatalog);
+document.getElementById('catalog-reset').addEventListener('click',()=>{
+  catalogSet='';catalogSearch.value='';catalogStatus.value='all';catalogRarity.value='all';catalogSort.value='catalog';updateCatalog();catalogSearch.focus();
+});
+document.querySelectorAll('[data-preset]').forEach(button=>button.addEventListener('click',()=>{
+  const preset=button.dataset.preset;
+  if(preset==='free'||preset==='missing'){catalogStatus.value=preset;catalogSort.value='catalog';}
+  if(preset==='sold'){catalogStatus.value='all';catalogSort.value='sold';}
+  if(preset==='scarce'){catalogStatus.value='all';catalogSort.value='scarce';}
+  if(preset==='holders'){catalogStatus.value='all';catalogSort.value='holders';}
+  updateCatalog();
+}));
+updateCatalog();
 """
 
 
@@ -188,7 +570,7 @@ def render(data: dict) -> str:
     trades = data.get("trades") or []
     parts = ['<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
              '<title>Team 15 · mesa de trades</title><style>', CSS, '</style></head><body><div class="wrap">',
-             '<header><div><h1>Mesa de trades · Team 15</h1><p class="sub">Qué podemos dar, qué podemos recibir y con quién conviene hablar ahora.</p></div>',
+             '<header><div><h1>Vender duplicados · Team 15</h1><p class="sub">Compradores concretos, precio razonado y valor neto para nuestra colección.</p></div>',
              '<div class="status"><span class="flag ', 'live' if live else 'warn', '">',
              'Equipo conectado' if live else 'Sólo feed público', '</span><span class="clock">Tick ', esc(tick), '</span></div></header>',
              '<div class="summary">',
@@ -196,43 +578,85 @@ def render(data: dict) -> str:
              f'<div class="metric"><small>Valor de colección</small><strong>{fmt(data.get("collection_value"))} P</strong></div>',
              f'<div class="metric"><small>{"Puntos propios en vivo" if live else "Puntos del leaderboard (con retraso)"}</small><strong>{fmt(score.get("score"))}</strong></div>',
              f'<div class="metric"><small>Ofertas visibles · venues</small><strong>{data.get("board_count",0)} · {data.get("venue_count",0)}</strong></div>',
-             '</div>']
+             '</div><nav class="jump"><a href="#guide">Venta rápida</a><a href="#radio">Radio y decisión</a><a href="#ranking">Ranking</a><a href="#catalogo">Catálogo completo</a></nav>', render_dashboard_overview(data)]
     for warning in data.get("warnings") or []:
         parts.append('<div class="warning">' + esc(warning) + '</div>')
-    parts += ['<div class="layout"><aside class="sidebar"><h2>Equipos</h2><div class="teams">',
+    guide = data.get("sale_guide") or []
+    parts += ['<section id="guide" class="guide"><div class="guide-head"><div><h2>¿En cuánto vender cada carta?</h2>',
+              '<p>Mínimo al proponer una venta que el rival acepte: al menos +2 P sin comisión nuestra. El valor ganado en trades cuenta para negociación; los puntos exactos por venta no se publican.</p></div></div><div class="sale-grid">']
+    if not guide:
+        parts.append('<div class="guide-empty">No hay duplicados libres verificados para vender ahora.</div>')
+    for card in guide:
+        best = card["best"]
+        public_only = card["loss"] is None
+        target = f'{fmt(card["suggested"])} P' if best else '—'
+        gain = f'+{fmt(best["net"])} P' if best and best["net"] is not None else '—'
+        note = (f'Perdemos {fmt(card["loss"])} P de colección al dar una. '
+                + (f'La venta indicada deja {gain} de valor neto para t15.' if best else 'Aún no hay un comprador detectado.')) if not public_only else 'Duplicado observado en el feed; confirma copias libres y valor privado antes de vender.'
+        if card.get('concession') is not None:
+            note += f' Puedes ceder hasta {fmt(card["concession"])} P frente al precio sugerido y aún conservar al menos +2 P netos, si el rival acepta nuestra propuesta.'
+        free_label = f'{card["free"]} libre' if card["free"] == 1 else f'{card["free"]} libres' if isinstance(card["free"], int) else str(card["free"])
+        parts += [f'<article class="sale-card{"" if best else " no-buyer"}"><div class="sale-top"><h3>{esc(card["ref"])}</h3><small>{esc(free_label)}</small></div>',
+                  '<div class="sale-numbers">',
+                  f'<div><span class="label">Mínimo rentable</span><strong>{fmt(card["floor"])}{ " P" if card["floor"] is not None else ""}</strong></div>',
+                  f'<div><span class="label">Pedir al comprador</span><strong>{target}</strong></div>',
+                  f'<div><span class="label">Valor neto estimado</span><strong class="gain">{gain}</strong></div></div>',
+                  f'<p class="sale-note">{esc(note)}</p><div class="sale-buyers">']
+        for buyer in card["buyers"]:
+            state = 'puja activa' if buyer["active"] else 'propuesta'
+            gain_text = f' · +{fmt(buyer["net"])} P netos' if buyer["net"] is not None else ''
+            parts.append(f'<span class="buyer-chip{"" if buyer["active"] else " proposed"}">{esc(buyer["team"])} · {fmt(buyer["price"])} P{gain_text} · {state}</span>')
+        if not card["buyers"]:
+            parts.append('<span class="label">Ningún equipo pidió esta carta en el feed reciente.</span>')
+        parts.append('</div></article>')
+    parts.append('</div></section>')
+    parts += ['<section id="radio" class="radio"><h2>Radio: qué hacer con cada señal</h2>',
+              '<p class="sub">La radio publica rumores. Una noticia no confirma el precio ni la voluntad de compra: contrástala con una oferta o cotización real.</p><div class="radio-list">']
+    if not data.get('radio'):
+        parts.append('<div class="guide-empty">Aún no hay noticias de radio en el feed disponible.</div>')
+    for news in data.get('radio') or []:
+        parts += [f'<article class="radio-item"><small>{esc(news["source"])} · tick {esc(news["tick"])}</small>',
+                  f'<h3>{esc(news["headline"])}</h3><p>{esc(news["body"])}</p>',
+                  f'<p class="radio-action">{esc(news["action"])}</p></article>']
+    parts += ['</div></section><div id="ranking" class="layout"><aside class="sidebar"><h2>Compradores</h2><div class="teams">',
               '<button class="team-button" data-team="all" aria-pressed="true">Todos <small>↗</small></button>']
     for team in teams:
         code = team["team"]
         count = len(team["declared_wants"])
         parts.append(f'<button class="team-button" data-team="{esc(code)}" aria-pressed="false">{esc(code)} <small>{count} {"pedido" if count == 1 else "pedidos"}</small></button>')
-    parts += ['</div></aside><main><div class="section-head"><div><h2>Mejores trades ahora</h2>',
-              '<p>Primero ofertas activas; después propuestas que requieren respuesta del otro equipo.</p></div>',
+    parts += ['</div></aside><main><div class="section-head"><div><h2>Ranking de ventas</h2>',
+              '<p>Ventas de duplicados primero; los canjes aparecen como alternativa. Las propuestas requieren respuesta.</p></div>',
               '<label><input id="pause" type="checkbox"> Pausar refresco</label></div><div class="rank">']
     if not trades:
-        parts.append('<div class="empty">No hay trades verificables con margen positivo. Conecta la clave de t15 para valorar nuestra mano; el feed público solo no basta.</div>')
+        parts.append('<div class="empty">No hay compradores o canjes rentables para los duplicados libres en este tick.</div>')
     for i, trade in enumerate(trades, 1):
         code = trade["team"]
         give = ", ".join(trade["give"]) or "—"
         receive = ", ".join(trade["receive"]) or "—"
         offer = f' · oferta #{trade["offer_id"]}' if trade["offer_id"] else ""
+        public_only = trade.get("surplus") is None
+        value_label = "Cobro tras comisión" if trade["kind"] == "public-live" else "Valor neto para t15"
+        value_text = (f'{fmt(trade["rank_signal"])} P' if trade["kind"] == "public-live" else "—") if public_only else f'+{fmt(trade["surplus"])} P'
         parts += [f'<article class="trade {esc(trade["kind"])}" data-team="{esc(code)}">',
                   f'<span class="index">{i}</span><div><div class="title">{esc(trade["action"])} · {esc(code)}<span class="tag">{esc(trade["confidence"])}</span></div>',
                   f'<p>Dar {esc(give)} · recibir {esc(receive)}{esc(offer)}</p>',
                   f'<div class="why">{esc(trade["why"])}</div></div>',
                   f'<div class="price"><span class="label">Precio</span><span class="money">{fmt(trade["price"])} P</span><span class="label">Comisión nuestra: {fmt(trade["fee"])} P</span></div>',
-                  f'<div class="surplus"><span class="label">Valor neto para t15</span><span class="money gain">+{fmt(trade["surplus"])} P</span>',
-                  '<span class="label">No equivale a puntos del ranking</span></div></article>']
-    parts += ['</div>']
+                  f'<div class="surplus"><span class="label">{value_label}</span><span class="money gain">{value_text}</span>',
+                  '<span class="label">Puntos futuros: no calculables</span></div></article>']
+    parts += ['</div><div id="filter-empty" class="empty" hidden>No hay ventas o canjes para este equipo en este tick. Selecciona Todos para ver las demás oportunidades.</div>']
     for team in teams:
         parts.append(f'<section class="team-profile" data-team="{esc(team["team"])}" hidden><h3>{esc(team["team"])} · señales del feed</h3>'
                      f'<p><b>Le vimos:</b> {esc(", ".join(team["observed_held"]) or "Sin evidencia")}</p>'
                      f'<p><b>Pidió:</b> {esc(", ".join(team["declared_wants"]) or "Sin demanda declarada")}</p>'
                      f'<p><b>Ofrece ahora:</b> {esc(", ".join(team["offered"]) or "Sin oferta identificada")}</p></section>')
-    parts += ['</main></div><div class="below"><section class="panel"><h2>Nuestra mano</h2>',
+    parts += ['</main></div><div class="below"><section class="panel"><h2>',
+              'Nuestra mano real' if live else 'Nuestra mano observada en el feed', '</h2>',
               '<table><thead><tr><th>Carta</th><th>Copias</th><th>Libres para dar</th><th>Valor perdido al dar una</th></tr></thead><tbody>']
     for card in data.get("inventory") or []:
         parts.append(f'<tr><td>{esc(card["ref"])}</td><td>{card["copies"]}</td><td>{card["free_surplus"]}</td><td>{fmt(card["loss"])} P</td></tr>')
-    parts += ['</tbody></table></section><section class="panel"><h2>Cartas que nos aportan más</h2>',
+    parts += ['</tbody></table></section><section class="panel"><h2>',
+              'Cartas que nos aportan más' if live else 'Cartas que t15 pidió en el feed', '</h2>',
               '<table><thead><tr><th>Carta que falta</th><th>Valor al recibirla</th><th>Página</th></tr></thead><tbody>']
     for card in (data.get("needs") or [])[:20]:
         parts.append(f'<tr><td>{esc(card["ref"])}</td><td>{fmt(card["gain"])} P</td><td>{esc(card["page"] or "")}</td></tr>')
@@ -244,16 +668,20 @@ def render(data: dict) -> str:
     parts += ['</tbody></table></section><section class="panel"><h2>Cómo leer los puntos</h2>',
               '<p>El <b>valor neto (+P)</b> suma el efectivo y el cambio en nuestra colección, después de la comisión. Es la medida privada usada para ordenar trades. El servidor transforma el valor de negociación en puntos de la ronda; la fórmula exacta por operación no está publicada, así que el panel no inventa puntos futuros.</p>',
               '<p>«Oferta activa» significa que hay una estructura aceptable visible en un venue. «Proponer venta» usa una demanda observada; el precio es nuestro mínimo rentable o una puja histórica y requiere que el rival acepte.</p>',
-              '</section></div><div class="foot">Sólo lecturas GET · datos renovados cada 15 s · ',
+              '</section></div>']
+    parts += [render_catalog(data),
+              '<div class="foot">Sólo lecturas GET · datos renovados cada 15 s · ',
               time.strftime('%H:%M:%S', time.localtime(data.get('built_at') or time.time())),
               ' · clave nunca enviada al navegador</div></div><script>',
               "const buttons=document.querySelectorAll('.team-button');const rows=document.querySelectorAll('.trade,.team-row,.team-profile');"
               "let selected=sessionStorage.getItem('t15.team')||'all';function choose(t){selected=t;sessionStorage.setItem('t15.team',t);"
               "buttons.forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.team===t)));"
-              "rows.forEach(r=>r.hidden=r.classList.contains('team-profile')?(t==='all'||r.dataset.team!==t):(t!=='all'&&r.dataset.team!==t))}"
+              "rows.forEach(r=>r.hidden=r.classList.contains('team-profile')?(t==='all'||r.dataset.team!==t):(t!=='all'&&r.dataset.team!==t));"
+              "document.getElementById('filter-empty').hidden=t==='all'||!!document.querySelector('.trade:not([hidden])')}"
               "buttons.forEach(b=>b.addEventListener('click',()=>choose(b.dataset.team)));choose(selected);"
               "const pause=document.getElementById('pause');pause.checked=sessionStorage.getItem('t15.pause')==='1';"
-              "pause.addEventListener('change',()=>sessionStorage.setItem('t15.pause',pause.checked?'1':'0'));"
+              "pause.addEventListener('change',()=>sessionStorage.setItem('t15.pause',pause.checked?'1':'0'));",
+              CATALOG_JS,
               "setInterval(()=>{if(!pause.checked)location.reload()},15000);",
               '</script></body></html>']
     return ''.join(parts)
@@ -266,6 +694,12 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/healthz":
             body, typ, status = b"ok\n", "text/plain", 200
+        elif path == "/api/strategy":
+            try:
+                payload = json.dumps(strategy_export(self.model.snapshot()), ensure_ascii=False).encode()
+                body, typ, status = payload, "application/json; charset=utf-8", 200
+            except Exception as exc:
+                body, typ, status = json.dumps({"error": f"{type(exc).__name__}: {exc}"}).encode(), "application/json; charset=utf-8", 500
         elif path in ("/", "/index.html"):
             try:
                 body, typ, status = render(self.model.snapshot()).encode(), "text/html; charset=utf-8", 200
