@@ -25,6 +25,7 @@ KIT = HERE.parent / "bazaar-kit"
 sys.path.insert(0, str(KIT))
 import dashboard as public_dashboard
 
+import scoring
 from planner import build_rank
 from radio import interpret, radio_event
 
@@ -65,6 +66,36 @@ class Reader:
         req = urllib.request.Request(self.url + path, headers=headers, method="GET")
         with urllib.request.urlopen(req, timeout=self.timeout) as response:
             return json.load(response)
+
+
+def settled_by_dealer(stores, team: str) -> dict:
+    """{dealer: [precio, ...]} de nuestras liquidaciones con vendedores, leídas del feed.
+
+    Es una COTA INFERIOR: el almacén local sólo tiene los ticks recogidos, así que una
+    casilla puede estar llena sin que aquí se vea. `GET /api/me` manda sobre esto; el
+    contador sirve para ver *dónde* faltan huecos cuando esa cifra no está disponible."""
+    out: dict[str, list] = {}
+    for path in stores or ():
+        p = Path(path)
+        if not p.exists():
+            continue
+        with p.open() as fh:
+            for line in fh:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if event.get("type") != "settlement":
+                    continue
+                sides = [event.get("seller"), event.get("buyer"), event.get("with"), event.get("actor")]
+                sides = [x.get("id") if isinstance(x, dict) else x for x in sides]
+                if team not in sides:
+                    continue
+                dealer = next((x for x in sides if isinstance(x, str) and not x.startswith("t")), None)
+                price = event.get("price") or event.get("cash")
+                if dealer and isinstance(price, (int, float)):
+                    out.setdefault(dealer, []).append(price)
+    return out
 
 
 class Model:
@@ -157,6 +188,21 @@ class Model:
         rank["clock"] = public.clock
         rank["live"] = bool(me)
         rank["leaderboard"] = public.leaderboard
+        tick_now = int(public.clock.get("tick") or 0) or None
+        rank["scoring"] = scoring.scoring_block(rank.get("score") or {}, public.leaderboard, self.team)
+        rank["peers"] = scoring.peers_block(public.leaderboard, self.team)
+        rank["feed_health"] = scoring.feed_health(self.public.stores, tick_now)
+        dealers = {}
+        try:
+            dealers = {p["id"]: p for p in (self.reader.get("/api/dealers").get("personas") or []) if p.get("id")}
+        except Exception as exc:
+            warnings.append(f"Vendedores: {type(exc).__name__}")
+        rank["ladder"] = scoring.ladder_block(dealers, settled_by_dealer(self.public.stores, self.team),
+                                              me.get("unlocked") or [])
+        if rank["feed_health"].get("status") != "fresh":
+            rank["warnings"].append(
+                "El almacén del feed no está al día: los precios, los rivales y el playbook se calculan sobre él. "
+                "Arranca python3 feed_stream.py --collect")
         if not me:
             public_team = next((row for row in public.leaderboard.get("teams", [])
                                 if row.get("team") == self.team), None)
@@ -215,6 +261,35 @@ h3{font-size:17px;margin:0 0 5px}.sub{color:var(--muted);max-width:70ch;margin:9
 table{border-collapse:collapse;width:100%}th,td{padding:8px 6px;border-bottom:1px solid var(--line);text-align:left}th{color:var(--muted);font-size:12px;font-weight:400}td:last-child,th:last-child{text-align:right}
 .empty{padding:22px;border:1px dashed var(--line);color:var(--muted)}.foot{border-top:1px solid var(--line);margin-top:30px;padding-top:15px;color:var(--muted);font-size:13px}
 button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid var(--saffron);outline-offset:2px}@media(max-width:850px){.wrap{padding:18px}.layout{grid-template-columns:1fr}.sidebar{border:0;padding:0}.teams{display:flex;overflow-x:auto}.team-button{min-width:100px}.summary{grid-template-columns:1fr 1fr}.metric:nth-child(3){border-left:0;padding-left:0}.trade{grid-template-columns:25px 1fr 95px}.trade .surplus{grid-column:3}.trade .price{grid-column:3;grid-row:1}.below{grid-template-columns:1fr}.catalog-brief{grid-template-columns:1fr 1fr}.catalog-brief>div:nth-child(3){border-left:0;border-top:1px solid var(--line)}.catalog-brief>div:nth-child(4){border-top:1px solid var(--line)}}@media(max-width:440px){.catalog-head{display:block}.catalog-toolbar label,.catalog-toolbar input,.catalog-toolbar select{width:100%}.catalog-toolbar label:first-child{flex:1 1 100%}.catalog-brief>div{padding:12px}.catalog-brief strong{font-size:23px}}
+
+.monitor{margin:28px 0;padding:22px;border:1px solid var(--line,#2a2f3a);border-radius:14px;background:var(--panel,#151a23)}
+.comps{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));margin:18px 0}
+.comp-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;font-size:.92rem}
+.comp-head small{opacity:.55;font-weight:400}
+.bar{position:relative;height:10px;border-radius:999px;background:rgba(255,255,255,.08);overflow:visible}
+.bar-fill{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#3d7dff,#58e3b0)}
+.bar-best{position:absolute;top:-4px;width:2px;height:18px;background:#ffb347;border-radius:2px}
+.breakdown{width:100%;border-collapse:collapse;margin:18px 0;font-size:.9rem}
+.breakdown caption{text-align:left;font-weight:600;padding-bottom:8px;opacity:.75}
+.breakdown th{text-align:left;font-weight:500;padding:7px 10px 7px 0;border-top:1px solid rgba(255,255,255,.07)}
+.breakdown td{padding:7px 0;border-top:1px solid rgba(255,255,255,.07);vertical-align:baseline}
+.breakdown .num{text-align:right;font-variant-numeric:tabular-nums;font-weight:600;padding-right:14px;white-space:nowrap}
+.breakdown .why{opacity:.6;font-size:.84rem}
+.breakdown .missing{opacity:.45;font-style:italic;font-weight:400}
+.ladder{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));margin:12px 0 4px}
+.slot{padding:14px;border:1px solid rgba(255,255,255,.1);border-radius:11px;background:rgba(255,255,255,.02)}
+.slot.open{border-color:#ffb347}
+.slot.done{border-color:#58e3b0}
+.slot.off{opacity:.5}
+.slot-top{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.slot h4{margin:0;font-size:.95rem}
+.slot-top small{opacity:.6;white-space:nowrap}
+.pips{display:flex;gap:5px;margin:10px 0 8px}
+.pip{width:100%;height:7px;border-radius:999px;background:rgba(255,255,255,.12)}
+.pip.on{background:#58e3b0}
+.slot .sub{margin:0;font-size:.8rem}
+.waste{display:inline-block;margin-top:6px;color:#ffb347;font-size:.78rem}
+@media (max-width:640px){.monitor{padding:16px}.comps{grid-template-columns:1fr}}
 """
 
 CSS += r"""
@@ -387,6 +462,10 @@ def strategy_export(data: dict) -> dict:
         'generated_at': data.get('built_at'), 'verified_private_data': bool(data.get('verified')),
         'freshness': {'snapshot_tick': data.get('tick'), 'built_at': data.get('built_at'), 'status': 'live' if data.get('live') else 'public_only', 'cache_max_age_seconds': 12},
         'ranking': ranking,
+        'scoring': data.get('scoring') or {},
+        'ladder': data.get('ladder') or {},
+        'peers': data.get('peers') or {},
+        'feed_health': data.get('feed_health') or {},
         'opportunities': opportunities,
         'kpis': {
             'published_cards': len(released), 'catalog_cards': len(rows),
@@ -413,6 +492,13 @@ def strategy_export(data: dict) -> dict:
             'sold_median': 'Mediana de liquidaciones de una sola carta por efectivo; no incluye lotes ni ofertas sin liquidar.',
             'buy_ceiling': 'Tope de valoración privada de recibir la carta antes de caja y comisiones.',
             'sell_floor': 'Mínimo rentable para desprenderse de una copia libre según pérdida marginal + margen.',
+            'ladder_points': 'Puntos de la escalera de vendedores: cuota del rango de precio capturada, 3 mejores tratos por nivel, casilla vacía = 0. Sólo con X-Team-Key.',
+            'duel_points': 'Puntos de duelos: cuota del pastel capturada. Una sesión no jugada cuenta cero. Sólo con X-Team-Key.',
+            'slots_empty': 'Casillas de escalera sin cubrir en ese nivel. Cota superior: el contador lee el feed local, y GET /api/me manda sobre él.',
+            'deals_beyond_scoring': 'Tratos por encima de los 3 que puntúan en ese nivel: munición gastada sin efecto en el score.',
+            'empty_slots_weighted_by_level': 'Suma de casillas vacías multiplicadas por el nivel del vendedor. Los niveles altos pesan más en la escalera.',
+            'negotiating_per_deal': 'negotiating / deals. Mide rango capturado por trato, que es lo que paga la escalera; el número de tratos por sí solo correlaciona NEGATIVAMENTE con el score.',
+            'feed_health.ticks_behind': 'Ticks entre el último evento recogido y el tick actual. Por encima de stale_after_ticks, todo lo derivado del feed describe otro momento del mercado.',
         },
         'cards': cards,
     }
@@ -585,6 +671,107 @@ updateCatalog();
 """
 
 
+def _bar(value, total, label, best=None, best_team=None) -> str:
+    """Barra de un componente del score. `best` marca dónde está el mejor del juego."""
+    pct = max(0.0, min(100.0, (value or 0) / total * 100)) if total else 0.0
+    mark = ''
+    if best is not None and total:
+        mark = (f'<span class="bar-best" style="left:{max(0.0, min(100.0, best / total * 100)):.1f}%" '
+                f'title="mejor del juego: {esc(best_team)} con {fmt(best)}"></span>')
+    return (f'<div class="comp"><div class="comp-head"><span>{esc(label)}</span>'
+            f'<strong>{fmt(value)} <small>/ {fmt(total)}</small></strong></div>'
+            f'<div class="bar"><span class="bar-fill" style="width:{pct:.1f}%"></span>{mark}</div></div>')
+
+
+def render_monitor(data: dict) -> str:
+    """Monitor de ranking: qué componente mueve puntos, qué casillas de escalera están
+    vacías y si los datos de los que todo esto depende siguen vivos.
+
+    Orden deliberado: primero de dónde salen los puntos, después qué hueco los da, y al
+    final el aviso de frescura, porque una cifra de un almacén parado se lee igual de
+    bien que una buena."""
+    block = data.get('scoring') or {}
+    ladder = data.get('ladder') or {}
+    peers = data.get('peers') or {}
+    health = data.get('feed_health') or {}
+    comps = block.get('components') or {}
+    parts = ['<section id="monitor" class="monitor"><div class="section-head"><div>',
+             '<h2>Monitor de ranking</h2>',
+             '<p class="sub">Los 60 puntos se reparten 30 de negociación y 30 de mercado. '
+             'El valor de colección y los bonos de página no son componentes del score.</p>',
+             '</div></div>']
+
+    if health.get('status') and health['status'] != 'fresh':
+        behind = health.get('ticks_behind')
+        parts.append('<div class="warning">Almacén del feed '
+                     + ('sin datos' if health['status'] == 'no_data'
+                        else f'parado: último tick {esc(health.get("last_tick"))}, '
+                             f'{esc(behind)} ticks por detrás')
+                     + '. Los precios, los rivales y el playbook se calculan sobre este fichero. '
+                     + 'Arranca el recolector: <code>python3 feed_stream.py --collect</code></div>')
+
+    parts.append('<div class="comps">')
+    for key, label in (('negotiating', 'Negociación'), ('market', 'Mercado')):
+        c = comps.get(key) or {}
+        parts.append(_bar(c.get('ours'), c.get('weight_in_total') or 30.0, label,
+                          c.get('best'), c.get('best_team')))
+    parts.append('</div>')
+
+    rows = []
+    for key, label, why in (
+            ('ladder_points', 'Escalera de vendedores', 'cuota del rango de precio capturada, 3 mejores por nivel'),
+            ('duel_points', 'Duelos', 'cuota del pastel; una sesión no jugada cuenta cero'),
+            ('mm_points', 'Creación de mercado', 'valor creado entre otros equipos en nuestro venue'),
+            ('neg_points', 'Valor en trades', 'con otros equipos, a valores privados')):
+        value = block.get(key)
+        rows.append(f'<tr><th>{esc(label)}</th><td class="num">'
+                    + (f'{fmt(value)}' if value is not None else '<span class="missing">sin clave</span>')
+                    + f'</td><td class="why">{esc(why)}</td></tr>')
+    parts += ['<table class="breakdown"><caption>De dónde salen los puntos</caption>',
+              '<tbody>', *rows, '</tbody></table>']
+    if block.get('missing_from_api'):
+        parts.append('<p class="sub">Sin <code>X-Team-Key</code> no llegan '
+                     + esc(', '.join(block['missing_from_api']))
+                     + ', y sin ellos no se distingue «la escalera está vacía» de «no jugamos duelos».</p>')
+
+    if ladder.get('levels'):
+        parts += ['<div class="section-head"><div><h3>Casillas de escalera</h3>',
+                  f'<p class="sub">{esc(ladder.get("empty_slots_available"))} huecos disponibles '
+                  f'(peso {esc(ladder.get("empty_slots_weighted_by_level"))} contando el nivel). '
+                  'Una casilla vacía cuenta cero y los niveles altos pesan más.</p></div></div>',
+                  '<div class="ladder">']
+        for level in ladder['levels']:
+            state = 'off' if not level['available'] else ('done' if not level['slots_empty'] else 'open')
+            pips = ''.join(f'<span class="pip{" on" if i < level["slots_filled"] else ""}"></span>'
+                           for i in range(level['slots_total']))
+            extra = (f'<small class="waste">{level["deals_beyond_scoring"]} tratos de más</small>'
+                     if level['deals_beyond_scoring'] else '')
+            buys = ', '.join(level.get('buys_rarities') or []) or '—'
+            parts.append(f'<article class="slot {state}"><div class="slot-top">'
+                         f'<h4>{esc(level.get("name") or level["dealer"])}</h4>'
+                         f'<small>nivel {esc(level["level"])}</small></div>'
+                         f'<div class="pips">{pips}</div>'
+                         f'<p class="sub">{esc(level["slots_filled"])}/{esc(level["slots_total"])} · compra {esc(buys)}'
+                         + ('' if level['available'] else ' · no disponible aún') + f'</p>{extra}</article>')
+        parts.append('</div>')
+
+    ours = peers.get('ours') or {}
+    if ours:
+        best = (peers.get('efficiency_ranking') or [{}])[0]
+        parts += ['<table class="breakdown"><caption>Puntos de negociación por trato</caption><tbody>',
+                  f'<tr><th>Nosotros</th><td class="num">{fmt(ours.get("negotiating_per_deal"))}</td>'
+                  f'<td class="why">{esc(ours.get("negotiating"))} puntos en {esc(ours.get("deals"))} tratos'
+                  f' · puesto {esc(peers.get("our_efficiency_position"))} de {esc(peers.get("teams_measured"))}</td></tr>',
+                  f'<tr><th>Mejor del juego</th><td class="num">{fmt(best.get("negotiating_per_deal"))}</td>'
+                  f'<td class="why">{esc(best.get("team"))} con {esc(best.get("deals"))} tratos'
+                  f' y {esc(best.get("album_filled"))} cartas de álbum</td></tr>',
+                  '</tbody></table>',
+                  '<p class="sub">Más tratos no es mejor: sobre los equipos activos la correlación de '
+                  '<code>deals</code> con el score es negativa. Lo que paga es el rango capturado por trato.</p>']
+    parts.append('</section>')
+    return ''.join(parts)
+
+
 def render(data: dict) -> str:
     tick = data.get("tick")
     live = data.get("live")
@@ -601,7 +788,7 @@ def render(data: dict) -> str:
              f'<div class="metric"><small>Valor de colección</small><strong>{fmt(data.get("collection_value"))} P</strong></div>',
              f'<div class="metric"><small>{"Puntos propios en vivo" if live else "Puntos del leaderboard (con retraso)"}</small><strong>{fmt(score.get("score"))}</strong></div>',
              f'<div class="metric"><small>Ofertas visibles · venues</small><strong>{data.get("board_count",0)} · {data.get("venue_count",0)}</strong></div>',
-             '</div><nav class="jump"><a href="#guide">Venta rápida</a><a href="#radio">Radio y decisión</a><a href="#ranking">Ranking</a><a href="#estrategia-ranking">Estrategia</a><a href="#catalogo">Catálogo completo</a></nav>', render_dashboard_overview(data), render_rank_strategy(data)]
+             '</div><nav class="jump"><a href="#monitor">Monitor de ranking</a><a href="#guide">Venta rápida</a><a href="#radio">Radio y decisión</a><a href="#ranking">Ranking</a><a href="#estrategia-ranking">Estrategia</a><a href="#catalogo">Catálogo completo</a></nav>', render_monitor(data), render_dashboard_overview(data), render_rank_strategy(data)]
     for warning in data.get("warnings") or []:
         parts.append('<div class="warning">' + esc(warning) + '</div>')
     guide = data.get("sale_guide") or []
