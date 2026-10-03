@@ -1,0 +1,2224 @@
+{
+ "generado": "2026-10-03 (ronda del sábado, ticks 159-665)",
+ "fuente": "intel/market.db (feed público, leaderboard y /api/me de Team 15; solo lectura)",
+ "notas": [
+  "Score y rango: tabla leaderboard (última instantánea de cada tick).",
+  "Desglose propio y duel_points: /api/me de Team 15 (me_snapshots); el servidor estuvo en pausa en el tick 630 (13:26-15:28).",
+  "Captura por dealer: misma definición que intel/profiler.py (posición del trato entre la apertura mediana del dealer y el mejor trato observado), desglosada por dealer.",
+  "Solo agregados; sin claves ni mensajes completos."
+ ],
+ "equipos_top3": [
+  "t14",
+  "t12",
+  "t18"
+ ],
+ "score_por_tick": [
+  {
+   "tick": 159,
+   "t15": 10.35,
+   "t14": 18.09,
+   "t12": 27.87,
+   "t18": 19.19,
+   "t15_rank": 12
+  },
+  {
+   "tick": 165,
+   "t15": 10.33,
+   "t14": 18.06,
+   "t12": 27.82,
+   "t18": 19.16,
+   "t15_rank": 12
+  },
+  {
+   "tick": 169,
+   "t15": 10.33,
+   "t14": 18.06,
+   "t12": 27.82,
+   "t18": 19.16,
+   "t15_rank": 12
+  },
+  {
+   "tick": 174,
+   "t15": 9.5,
+   "t14": 17.95,
+   "t12": 24.79,
+   "t18": 17.2,
+   "t15_rank": 12
+  },
+  {
+   "tick": 178,
+   "t15": 9.5,
+   "t14": 17.95,
+   "t12": 24.79,
+   "t18": 17.2,
+   "t15_rank": 12
+  },
+  {
+   "tick": 182,
+   "t15": 8.83,
+   "t14": 17.92,
+   "t12": 23.25,
+   "t18": 15.61,
+   "t15_rank": 13
+  },
+  {
+   "tick": 186,
+   "t15": 8.83,
+   "t14": 17.92,
+   "t12": 23.25,
+   "t18": 15.61,
+   "t15_rank": 13
+  },
+  {
+   "tick": 191,
+   "t15": 8.21,
+   "t14": 17.56,
+   "t12": 23.64,
+   "t18": 14.27,
+   "t15_rank": 14
+  },
+  {
+   "tick": 195,
+   "t15": 8.21,
+   "t14": 17.56,
+   "t12": 23.64,
+   "t18": 14.27,
+   "t15_rank": 14
+  },
+  {
+   "tick": 199,
+   "t15": 8.21,
+   "t14": 17.56,
+   "t12": 23.64,
+   "t18": 14.27,
+   "t15_rank": 14
+  },
+  {
+   "tick": 203,
+   "t15": 7.72,
+   "t14": 17.41,
+   "t12": 21.98,
+   "t18": 13.17,
+   "t15_rank": 15
+  },
+  {
+   "tick": 208,
+   "t15": 7.72,
+   "t14": 17.41,
+   "t12": 21.98,
+   "t18": 13.17,
+   "t15_rank": 15
+  },
+  {
+   "tick": 212,
+   "t15": 7.63,
+   "t14": 17.23,
+   "t12": 32.19,
+   "t18": 14.0,
+   "t15_rank": 14
+  },
+  {
+   "tick": 216,
+   "t15": 7.63,
+   "t14": 17.23,
+   "t12": 32.19,
+   "t18": 14.0,
+   "t15_rank": 14
+  },
+  {
+   "tick": 221,
+   "t15": 12.12,
+   "t14": 21.94,
+   "t12": 27.6,
+   "t18": 21.06,
+   "t15_rank": 14
+  },
+  {
+   "tick": 225,
+   "t15": 12.12,
+   "t14": 21.94,
+   "t12": 27.6,
+   "t18": 21.06,
+   "t15_rank": 14
+  },
+  {
+   "tick": 229,
+   "t15": 12.12,
+   "t14": 21.94,
+   "t12": 27.6,
+   "t18": 21.06,
+   "t15_rank": 14
+  },
+  {
+   "tick": 233,
+   "t15": 12.06,
+   "t14": 21.2,
+   "t12": 27.52,
+   "t18": 27.31,
+   "t15_rank": 14
+  },
+  {
+   "tick": 238,
+   "t15": 12.06,
+   "t14": 21.2,
+   "t12": 27.52,
+   "t18": 27.31,
+   "t15_rank": 14
+  },
+  {
+   "tick": 242,
+   "t15": 12.87,
+   "t14": 21.94,
+   "t12": 27.21,
+   "t18": 28.03,
+   "t15_rank": 13
+  },
+  {
+   "tick": 244,
+   "t15": 12.87,
+   "t14": 21.94,
+   "t12": 27.21,
+   "t18": 28.03,
+   "t15_rank": 13
+  },
+  {
+   "tick": 249,
+   "t15": 12.87,
+   "t14": 21.94,
+   "t12": 27.21,
+   "t18": 28.03,
+   "t15_rank": 13
+  },
+  {
+   "tick": 253,
+   "t15": 13.02,
+   "t14": 22.16,
+   "t12": 27.17,
+   "t18": 28.55,
+   "t15_rank": 14
+  },
+  {
+   "tick": 257,
+   "t15": 13.02,
+   "t14": 22.16,
+   "t12": 27.17,
+   "t18": 28.55,
+   "t15_rank": 14
+  },
+  {
+   "tick": 261,
+   "t15": 13.15,
+   "t14": 22.36,
+   "t12": 27.13,
+   "t18": 29.02,
+   "t15_rank": 14
+  },
+  {
+   "tick": 266,
+   "t15": 13.15,
+   "t14": 22.36,
+   "t12": 27.13,
+   "t18": 29.02,
+   "t15_rank": 14
+  },
+  {
+   "tick": 270,
+   "t15": 13.99,
+   "t14": 22.89,
+   "t12": 27.1,
+   "t18": 29.29,
+   "t15_rank": 14
+  },
+  {
+   "tick": 274,
+   "t15": 13.99,
+   "t14": 22.89,
+   "t12": 27.1,
+   "t18": 29.29,
+   "t15_rank": 14
+  },
+  {
+   "tick": 278,
+   "t15": 13.99,
+   "t14": 22.89,
+   "t12": 27.1,
+   "t18": 29.29,
+   "t15_rank": 14
+  },
+  {
+   "tick": 282,
+   "t15": 14.13,
+   "t14": 23.07,
+   "t12": 27.07,
+   "t18": 29.66,
+   "t15_rank": 14
+  },
+  {
+   "tick": 285,
+   "t15": 14.13,
+   "t14": 23.07,
+   "t12": 27.07,
+   "t18": 29.66,
+   "t15_rank": 14
+  },
+  {
+   "tick": 289,
+   "t15": 14.13,
+   "t14": 23.07,
+   "t12": 27.07,
+   "t18": 29.66,
+   "t15_rank": 14
+  },
+  {
+   "tick": 294,
+   "t15": 14.88,
+   "t14": 23.23,
+   "t12": 27.74,
+   "t18": 29.99,
+   "t15_rank": 13
+  },
+  {
+   "tick": 298,
+   "t15": 14.88,
+   "t14": 23.23,
+   "t12": 27.74,
+   "t18": 29.99,
+   "t15_rank": 13
+  },
+  {
+   "tick": 302,
+   "t15": 15.01,
+   "t14": 23.37,
+   "t12": 27.73,
+   "t18": 30.3,
+   "t15_rank": 14
+  },
+  {
+   "tick": 307,
+   "t15": 15.01,
+   "t14": 23.37,
+   "t12": 27.73,
+   "t18": 30.3,
+   "t15_rank": 14
+  },
+  {
+   "tick": 311,
+   "t15": 15.13,
+   "t14": 23.5,
+   "t12": 27.73,
+   "t18": 30.58,
+   "t15_rank": 14
+  },
+  {
+   "tick": 315,
+   "t15": 15.13,
+   "t14": 23.5,
+   "t12": 27.73,
+   "t18": 30.58,
+   "t15_rank": 14
+  },
+  {
+   "tick": 319,
+   "t15": 15.13,
+   "t14": 23.5,
+   "t12": 27.73,
+   "t18": 30.58,
+   "t15_rank": 14
+  },
+  {
+   "tick": 323,
+   "t15": 15.13,
+   "t14": 23.38,
+   "t12": 27.43,
+   "t18": 30.22,
+   "t15_rank": 13
+  },
+  {
+   "tick": 327,
+   "t15": 15.13,
+   "t14": 23.38,
+   "t12": 27.43,
+   "t18": 30.22,
+   "t15_rank": 13
+  },
+  {
+   "tick": 332,
+   "t15": 14.85,
+   "t14": 22.7,
+   "t12": 26.47,
+   "t18": 28.32,
+   "t15_rank": 12
+  },
+  {
+   "tick": 336,
+   "t15": 14.85,
+   "t14": 22.7,
+   "t12": 26.47,
+   "t18": 28.32,
+   "t15_rank": 12
+  },
+  {
+   "tick": 340,
+   "t15": 15.07,
+   "t14": 23.16,
+   "t12": 26.38,
+   "t18": 28.61,
+   "t15_rank": 12
+  },
+  {
+   "tick": 344,
+   "t15": 15.07,
+   "t14": 23.16,
+   "t12": 26.38,
+   "t18": 28.61,
+   "t15_rank": 12
+  },
+  {
+   "tick": 348,
+   "t15": 15.07,
+   "t14": 23.16,
+   "t12": 26.38,
+   "t18": 28.61,
+   "t15_rank": 12
+  },
+  {
+   "tick": 352,
+   "t15": 15.87,
+   "t14": 25.06,
+   "t12": 26.52,
+   "t18": 30.47,
+   "t15_rank": 12
+  },
+  {
+   "tick": 356,
+   "t15": 15.87,
+   "t14": 25.06,
+   "t12": 26.52,
+   "t18": 30.47,
+   "t15_rank": 12
+  },
+  {
+   "tick": 360,
+   "t15": 15.81,
+   "t14": 24.93,
+   "t12": 26.24,
+   "t18": 30.55,
+   "t15_rank": 13
+  },
+  {
+   "tick": 364,
+   "t15": 15.81,
+   "t14": 24.93,
+   "t12": 26.24,
+   "t18": 30.55,
+   "t15_rank": 13
+  },
+  {
+   "tick": 369,
+   "t15": 15.81,
+   "t14": 24.93,
+   "t12": 26.24,
+   "t18": 30.55,
+   "t15_rank": 13
+  },
+  {
+   "tick": 373,
+   "t15": 15.66,
+   "t14": 25.2,
+   "t12": 26.21,
+   "t18": 30.18,
+   "t15_rank": 13
+  },
+  {
+   "tick": 377,
+   "t15": 15.66,
+   "t14": 25.2,
+   "t12": 26.21,
+   "t18": 30.18,
+   "t15_rank": 13
+  },
+  {
+   "tick": 381,
+   "t15": 15.8,
+   "t14": 23.17,
+   "t12": 25.4,
+   "t18": 27.85,
+   "t15_rank": 15
+  },
+  {
+   "tick": 385,
+   "t15": 15.8,
+   "t14": 23.17,
+   "t12": 25.4,
+   "t18": 27.85,
+   "t15_rank": 15
+  },
+  {
+   "tick": 390,
+   "t15": 16.29,
+   "t14": 21.9,
+   "t12": 25.44,
+   "t18": 26.68,
+   "t15_rank": 15
+  },
+  {
+   "tick": 394,
+   "t15": 16.29,
+   "t14": 21.9,
+   "t12": 25.44,
+   "t18": 26.68,
+   "t15_rank": 15
+  },
+  {
+   "tick": 398,
+   "t15": 16.29,
+   "t14": 21.9,
+   "t12": 25.44,
+   "t18": 26.68,
+   "t15_rank": 15
+  },
+  {
+   "tick": 402,
+   "t15": 14.38,
+   "t14": 21.9,
+   "t12": 25.5,
+   "t18": 26.61,
+   "t15_rank": 15
+  },
+  {
+   "tick": 406,
+   "t15": 14.38,
+   "t14": 21.9,
+   "t12": 25.5,
+   "t18": 26.61,
+   "t15_rank": 15
+  },
+  {
+   "tick": 410,
+   "t15": 14.38,
+   "t14": 23.68,
+   "t12": 26.16,
+   "t18": 26.66,
+   "t15_rank": 15
+  },
+  {
+   "tick": 414,
+   "t15": 14.38,
+   "t14": 23.68,
+   "t12": 26.16,
+   "t18": 26.66,
+   "t15_rank": 15
+  },
+  {
+   "tick": 418,
+   "t15": 14.38,
+   "t14": 23.68,
+   "t12": 26.16,
+   "t18": 26.66,
+   "t15_rank": 15
+  },
+  {
+   "tick": 423,
+   "t15": 15.91,
+   "t14": 29.05,
+   "t12": 25.76,
+   "t18": 26.66,
+   "t15_rank": 15
+  },
+  {
+   "tick": 427,
+   "t15": 15.91,
+   "t14": 29.05,
+   "t12": 25.76,
+   "t18": 26.66,
+   "t15_rank": 15
+  },
+  {
+   "tick": 431,
+   "t15": 15.91,
+   "t14": 29.05,
+   "t12": 26.36,
+   "t18": 26.66,
+   "t15_rank": 15
+  },
+  {
+   "tick": 436,
+   "t15": 15.91,
+   "t14": 29.05,
+   "t12": 26.36,
+   "t18": 26.66,
+   "t15_rank": 15
+  },
+  {
+   "tick": 440,
+   "t15": 16.44,
+   "t14": 29.05,
+   "t12": 26.36,
+   "t18": 26.66,
+   "t15_rank": 15
+  },
+  {
+   "tick": 444,
+   "t15": 16.44,
+   "t14": 29.05,
+   "t12": 26.36,
+   "t18": 26.66,
+   "t15_rank": 15
+  },
+  {
+   "tick": 448,
+   "t15": 16.44,
+   "t14": 29.05,
+   "t12": 26.36,
+   "t18": 26.66,
+   "t15_rank": 15
+  },
+  {
+   "tick": 452,
+   "t15": 16.44,
+   "t14": 29.05,
+   "t12": 26.36,
+   "t18": 26.66,
+   "t15_rank": 15
+  },
+  {
+   "tick": 456,
+   "t15": 16.44,
+   "t14": 29.05,
+   "t12": 26.36,
+   "t18": 26.66,
+   "t15_rank": 15
+  },
+  {
+   "tick": 461,
+   "t15": 16.44,
+   "t14": 29.05,
+   "t12": 26.36,
+   "t18": 26.66,
+   "t15_rank": 14
+  },
+  {
+   "tick": 465,
+   "t15": 16.44,
+   "t14": 29.05,
+   "t12": 26.36,
+   "t18": 26.66,
+   "t15_rank": 14
+  },
+  {
+   "tick": 469,
+   "t15": 16.44,
+   "t14": 29.05,
+   "t12": 26.36,
+   "t18": 26.66,
+   "t15_rank": 14
+  },
+  {
+   "tick": 473,
+   "t15": 14.25,
+   "t14": 24.58,
+   "t12": 32.23,
+   "t18": 26.84,
+   "t15_rank": 15
+  },
+  {
+   "tick": 477,
+   "t15": 14.25,
+   "t14": 24.58,
+   "t12": 32.23,
+   "t18": 26.84,
+   "t15_rank": 15
+  },
+  {
+   "tick": 481,
+   "t15": 21.09,
+   "t14": 31.16,
+   "t12": 32.19,
+   "t18": 24.88,
+   "t15_rank": 12
+  },
+  {
+   "tick": 485,
+   "t15": 21.09,
+   "t14": 31.16,
+   "t12": 32.19,
+   "t18": 24.88,
+   "t15_rank": 12
+  },
+  {
+   "tick": 489,
+   "t15": 21.09,
+   "t14": 31.16,
+   "t12": 32.19,
+   "t18": 24.88,
+   "t15_rank": 12
+  },
+  {
+   "tick": 494,
+   "t15": 21.31,
+   "t14": 31.15,
+   "t12": 32.19,
+   "t18": 26.58,
+   "t15_rank": 12
+  },
+  {
+   "tick": 498,
+   "t15": 21.31,
+   "t14": 31.15,
+   "t12": 32.19,
+   "t18": 26.58,
+   "t15_rank": 12
+  },
+  {
+   "tick": 502,
+   "t15": 22.23,
+   "t14": 29.7,
+   "t12": 32.19,
+   "t18": 26.61,
+   "t15_rank": 11
+  },
+  {
+   "tick": 507,
+   "t15": 22.23,
+   "t14": 29.7,
+   "t12": 32.19,
+   "t18": 26.61,
+   "t15_rank": 11
+  },
+  {
+   "tick": 511,
+   "t15": 21.72,
+   "t14": 28.85,
+   "t12": 31.91,
+   "t18": 27.48,
+   "t15_rank": 11
+  },
+  {
+   "tick": 515,
+   "t15": 21.72,
+   "t14": 28.85,
+   "t12": 31.91,
+   "t18": 27.48,
+   "t15_rank": 11
+  },
+  {
+   "tick": 519,
+   "t15": 21.72,
+   "t14": 28.85,
+   "t12": 31.91,
+   "t18": 27.48,
+   "t15_rank": 11
+  },
+  {
+   "tick": 524,
+   "t15": 21.75,
+   "t14": 31.29,
+   "t12": 30.78,
+   "t18": 27.95,
+   "t15_rank": 13
+  },
+  {
+   "tick": 528,
+   "t15": 21.75,
+   "t14": 31.29,
+   "t12": 30.78,
+   "t18": 27.95,
+   "t15_rank": 13
+  },
+  {
+   "tick": 532,
+   "t15": 21.69,
+   "t14": 31.61,
+   "t12": 30.63,
+   "t18": 29.1,
+   "t15_rank": 14
+  },
+  {
+   "tick": 536,
+   "t15": 21.69,
+   "t14": 31.61,
+   "t12": 30.63,
+   "t18": 29.1,
+   "t15_rank": 14
+  },
+  {
+   "tick": 540,
+   "t15": 21.56,
+   "t14": 32.96,
+   "t12": 30.53,
+   "t18": 29.4,
+   "t15_rank": 14
+  },
+  {
+   "tick": 544,
+   "t15": 21.56,
+   "t14": 32.96,
+   "t12": 30.53,
+   "t18": 29.4,
+   "t15_rank": 14
+  },
+  {
+   "tick": 549,
+   "t15": 21.56,
+   "t14": 32.96,
+   "t12": 30.53,
+   "t18": 29.4,
+   "t15_rank": 14
+  },
+  {
+   "tick": 553,
+   "t15": 21.39,
+   "t14": 33.79,
+   "t12": 30.05,
+   "t18": 30.4,
+   "t15_rank": 14
+  },
+  {
+   "tick": 557,
+   "t15": 21.39,
+   "t14": 33.79,
+   "t12": 30.05,
+   "t18": 30.4,
+   "t15_rank": 14
+  },
+  {
+   "tick": 561,
+   "t15": 21.61,
+   "t14": 32.38,
+   "t12": 29.6,
+   "t18": 30.16,
+   "t15_rank": 13
+  },
+  {
+   "tick": 565,
+   "t15": 21.61,
+   "t14": 32.38,
+   "t12": 29.6,
+   "t18": 30.16,
+   "t15_rank": 13
+  },
+  {
+   "tick": 569,
+   "t15": 21.61,
+   "t14": 32.38,
+   "t12": 29.6,
+   "t18": 30.16,
+   "t15_rank": 13
+  },
+  {
+   "tick": 573,
+   "t15": 21.1,
+   "t14": 31.76,
+   "t12": 28.91,
+   "t18": 29.98,
+   "t15_rank": 14
+  },
+  {
+   "tick": 577,
+   "t15": 21.1,
+   "t14": 31.76,
+   "t12": 28.91,
+   "t18": 29.98,
+   "t15_rank": 14
+  },
+  {
+   "tick": 582,
+   "t15": 20.85,
+   "t14": 31.35,
+   "t12": 28.58,
+   "t18": 29.77,
+   "t15_rank": 15
+  },
+  {
+   "tick": 586,
+   "t15": 20.85,
+   "t14": 31.35,
+   "t12": 28.58,
+   "t18": 29.77,
+   "t15_rank": 15
+  },
+  {
+   "tick": 590,
+   "t15": 20.5,
+   "t14": 31.24,
+   "t12": 28.32,
+   "t18": 29.83,
+   "t15_rank": 15
+  },
+  {
+   "tick": 594,
+   "t15": 20.5,
+   "t14": 31.24,
+   "t12": 28.32,
+   "t18": 29.83,
+   "t15_rank": 15
+  },
+  {
+   "tick": 598,
+   "t15": 20.5,
+   "t14": 31.24,
+   "t12": 28.32,
+   "t18": 29.83,
+   "t15_rank": 15
+  },
+  {
+   "tick": 602,
+   "t15": 20.26,
+   "t14": 30.42,
+   "t12": 29.88,
+   "t18": 29.21,
+   "t15_rank": 16
+  },
+  {
+   "tick": 607,
+   "t15": 20.26,
+   "t14": 30.42,
+   "t12": 29.88,
+   "t18": 29.21,
+   "t15_rank": 16
+  },
+  {
+   "tick": 611,
+   "t15": 20.93,
+   "t14": 30.77,
+   "t12": 29.62,
+   "t18": 29.25,
+   "t15_rank": 15
+  },
+  {
+   "tick": 616,
+   "t15": 20.93,
+   "t14": 30.77,
+   "t12": 29.62,
+   "t18": 29.25,
+   "t15_rank": 15
+  },
+  {
+   "tick": 620,
+   "t15": 21.87,
+   "t14": 30.77,
+   "t12": 29.61,
+   "t18": 29.23,
+   "t15_rank": 14
+  },
+  {
+   "tick": 624,
+   "t15": 21.87,
+   "t14": 30.77,
+   "t12": 29.61,
+   "t18": 29.23,
+   "t15_rank": 14
+  },
+  {
+   "tick": 628,
+   "t15": 21.87,
+   "t14": 30.77,
+   "t12": 29.61,
+   "t18": 29.23,
+   "t15_rank": 14
+  },
+  {
+   "tick": 630,
+   "t15": 21.51,
+   "t14": 30.77,
+   "t12": 29.6,
+   "t18": 28.81,
+   "t15_rank": 14
+  },
+  {
+   "tick": 631,
+   "t15": 21.51,
+   "t14": 30.77,
+   "t12": 29.6,
+   "t18": 28.81,
+   "t15_rank": 14
+  },
+  {
+   "tick": 636,
+   "t15": 21.51,
+   "t14": 30.77,
+   "t12": 29.6,
+   "t18": 28.81,
+   "t15_rank": 14
+  },
+  {
+   "tick": 640,
+   "t15": 21.46,
+   "t14": 30.66,
+   "t12": 29.71,
+   "t18": 28.74,
+   "t15_rank": 14
+  },
+  {
+   "tick": 644,
+   "t15": 21.46,
+   "t14": 30.66,
+   "t12": 29.71,
+   "t18": 28.74,
+   "t15_rank": 14
+  },
+  {
+   "tick": 648,
+   "t15": 21.46,
+   "t14": 30.66,
+   "t12": 29.71,
+   "t18": 28.74,
+   "t15_rank": 14
+  },
+  {
+   "tick": 652,
+   "t15": 21.25,
+   "t14": 30.35,
+   "t12": 29.54,
+   "t18": 29.29,
+   "t15_rank": 15
+  },
+  {
+   "tick": 657,
+   "t15": 21.25,
+   "t14": 30.35,
+   "t12": 29.54,
+   "t18": 29.29,
+   "t15_rank": 15
+  },
+  {
+   "tick": 661,
+   "t15": 21.69,
+   "t14": 30.35,
+   "t12": 29.54,
+   "t18": 29.29,
+   "t15_rank": 13
+  },
+  {
+   "tick": 665,
+   "t15": 21.69,
+   "t14": 30.35,
+   "t12": 29.54,
+   "t18": 29.29,
+   "t15_rank": 13
+  }
+ ],
+ "t15_desglose_por_tick": [
+  {
+   "tick": 159,
+   "score": 10.35,
+   "duel_points": 0.0,
+   "neg_points": 37.0,
+   "ladder_points": 0.031,
+   "negotiating": 10.35,
+   "market": 0.0,
+   "deals": 13,
+   "rank": 12,
+   "album_filled": 26
+  },
+  {
+   "tick": 165,
+   "score": 10.33,
+   "duel_points": 0.0,
+   "neg_points": 7.8,
+   "ladder_points": 0.0,
+   "negotiating": 10.33,
+   "market": 0.0,
+   "deals": 14,
+   "rank": 12,
+   "album_filled": 26
+  },
+  {
+   "tick": 175,
+   "score": 9.5,
+   "duel_points": 0.0,
+   "neg_points": 7.8,
+   "ladder_points": 0.0,
+   "negotiating": 9.5,
+   "market": 0.0,
+   "deals": 14,
+   "rank": 12,
+   "album_filled": 26
+  },
+  {
+   "tick": 186,
+   "score": 8.83,
+   "duel_points": 0.0,
+   "neg_points": 7.8,
+   "ladder_points": 0.0,
+   "negotiating": 8.83,
+   "market": 0.0,
+   "deals": 14,
+   "rank": 13,
+   "album_filled": 26
+  },
+  {
+   "tick": 196,
+   "score": 8.21,
+   "duel_points": 0.0,
+   "neg_points": 7.8,
+   "ladder_points": 0.0,
+   "negotiating": 8.21,
+   "market": 0.0,
+   "deals": 14,
+   "rank": 14,
+   "album_filled": 26
+  },
+  {
+   "tick": 206,
+   "score": 7.72,
+   "duel_points": 0.0,
+   "neg_points": 10.5,
+   "ladder_points": 0.0,
+   "negotiating": 7.72,
+   "market": 0.0,
+   "deals": 15,
+   "rank": 15,
+   "album_filled": 27
+  },
+  {
+   "tick": 216,
+   "score": 7.63,
+   "duel_points": 0.0,
+   "neg_points": 10.5,
+   "ladder_points": 0.0,
+   "negotiating": 7.63,
+   "market": 0.0,
+   "deals": 15,
+   "rank": 14,
+   "album_filled": 27
+  },
+  {
+   "tick": 227,
+   "score": 12.12,
+   "duel_points": 0.0,
+   "neg_points": 10.5,
+   "ladder_points": 0.0,
+   "negotiating": 7.32,
+   "market": 4.8,
+   "deals": 15,
+   "rank": 14,
+   "album_filled": 27
+  },
+  {
+   "tick": 237,
+   "score": 12.06,
+   "duel_points": 0.0,
+   "neg_points": 14.7,
+   "ladder_points": 0.0,
+   "negotiating": 6.83,
+   "market": 5.23,
+   "deals": 17,
+   "rank": 14,
+   "album_filled": 29
+  },
+  {
+   "tick": 244,
+   "score": 12.87,
+   "duel_points": 0.0,
+   "neg_points": 14.7,
+   "ladder_points": 0.0,
+   "negotiating": 7.26,
+   "market": 5.61,
+   "deals": 17,
+   "rank": 13,
+   "album_filled": 29
+  },
+  {
+   "tick": 255,
+   "score": 13.02,
+   "duel_points": 0.0,
+   "neg_points": 14.7,
+   "ladder_points": 0.0,
+   "negotiating": 7.08,
+   "market": 5.94,
+   "deals": 17,
+   "rank": 14,
+   "album_filled": 30
+  },
+  {
+   "tick": 265,
+   "score": 13.15,
+   "duel_points": 0.0,
+   "neg_points": 19.4,
+   "ladder_points": 0.0,
+   "negotiating": 6.92,
+   "market": 6.23,
+   "deals": 18,
+   "rank": 14,
+   "album_filled": 30
+  },
+  {
+   "tick": 275,
+   "score": 13.99,
+   "duel_points": 0.0,
+   "neg_points": 19.4,
+   "ladder_points": 0.0,
+   "negotiating": 7.5,
+   "market": 6.5,
+   "deals": 18,
+   "rank": 14,
+   "album_filled": 30
+  },
+  {
+   "tick": 284,
+   "score": 14.13,
+   "duel_points": 0.0,
+   "neg_points": 19.4,
+   "ladder_points": 0.0,
+   "negotiating": 7.39,
+   "market": 6.73,
+   "deals": 18,
+   "rank": 14,
+   "album_filled": 30
+  },
+  {
+   "tick": 294,
+   "score": 14.88,
+   "duel_points": 0.0,
+   "neg_points": 23.1,
+   "ladder_points": 0.0,
+   "negotiating": 7.93,
+   "market": 6.95,
+   "deals": 19,
+   "rank": 13,
+   "album_filled": 30
+  },
+  {
+   "tick": 304,
+   "score": 15.01,
+   "duel_points": 0.0,
+   "neg_points": 23.1,
+   "ladder_points": 0.0,
+   "negotiating": 7.87,
+   "market": 7.14,
+   "deals": 19,
+   "rank": 14,
+   "album_filled": 30
+  },
+  {
+   "tick": 315,
+   "score": 15.13,
+   "duel_points": 0.0,
+   "neg_points": 23.1,
+   "ladder_points": 0.0,
+   "negotiating": 7.8,
+   "market": 7.32,
+   "deals": 19,
+   "rank": 14,
+   "album_filled": 30
+  },
+  {
+   "tick": 325,
+   "score": 15.13,
+   "duel_points": 0.0,
+   "neg_points": 23.1,
+   "ladder_points": 0.0,
+   "negotiating": 7.64,
+   "market": 7.48,
+   "deals": 19,
+   "rank": 13,
+   "album_filled": 30
+  },
+  {
+   "tick": 335,
+   "score": 14.85,
+   "duel_points": 0.0,
+   "neg_points": 23.1,
+   "ladder_points": 0.0,
+   "negotiating": 7.35,
+   "market": 7.5,
+   "deals": 20,
+   "rank": 12,
+   "album_filled": 31
+  },
+  {
+   "tick": 345,
+   "score": 15.07,
+   "duel_points": 0.0,
+   "neg_points": 23.1,
+   "ladder_points": 0.0,
+   "negotiating": 7.57,
+   "market": 7.5,
+   "deals": 20,
+   "rank": 12,
+   "album_filled": 31
+  },
+  {
+   "tick": 355,
+   "score": 15.87,
+   "duel_points": 0.0,
+   "neg_points": 23.1,
+   "ladder_points": 0.0,
+   "negotiating": 8.37,
+   "market": 7.5,
+   "deals": 20,
+   "rank": 12,
+   "album_filled": 31
+  },
+  {
+   "tick": 365,
+   "score": 15.81,
+   "duel_points": 0.0,
+   "neg_points": 23.1,
+   "ladder_points": 0.0,
+   "negotiating": 8.31,
+   "market": 7.5,
+   "deals": 20,
+   "rank": 13,
+   "album_filled": 31
+  },
+  {
+   "tick": 376,
+   "score": 15.66,
+   "duel_points": 0.0,
+   "neg_points": 23.1,
+   "ladder_points": 0.017,
+   "negotiating": 8.16,
+   "market": 7.5,
+   "deals": 21,
+   "rank": 13,
+   "album_filled": 32
+  },
+  {
+   "tick": 386,
+   "score": 15.8,
+   "duel_points": 0.0,
+   "neg_points": 23.1,
+   "ladder_points": 0.017,
+   "negotiating": 8.3,
+   "market": 7.5,
+   "deals": 21,
+   "rank": 15,
+   "album_filled": 32
+  },
+  {
+   "tick": 396,
+   "score": 16.29,
+   "duel_points": 0.0,
+   "neg_points": 23.1,
+   "ladder_points": 0.033,
+   "negotiating": 8.79,
+   "market": 7.5,
+   "deals": 22,
+   "rank": 15,
+   "album_filled": 33
+  },
+  {
+   "tick": 406,
+   "score": 14.38,
+   "duel_points": 0.0,
+   "neg_points": 9.6,
+   "ladder_points": 0.033,
+   "negotiating": 6.88,
+   "market": 7.5,
+   "deals": 23,
+   "rank": 15,
+   "album_filled": 34
+  },
+  {
+   "tick": 416,
+   "score": 14.38,
+   "duel_points": 0.0,
+   "neg_points": 9.6,
+   "ladder_points": 0.033,
+   "negotiating": 6.88,
+   "market": 7.5,
+   "deals": 23,
+   "rank": 15,
+   "album_filled": 34
+  },
+  {
+   "tick": 426,
+   "score": 15.91,
+   "duel_points": 0.0,
+   "neg_points": 20.5,
+   "ladder_points": 0.033,
+   "negotiating": 8.41,
+   "market": 7.5,
+   "deals": 24,
+   "rank": 15,
+   "album_filled": 34
+  },
+  {
+   "tick": 437,
+   "score": 15.91,
+   "duel_points": 0.0,
+   "neg_points": 24.2,
+   "ladder_points": 0.033,
+   "negotiating": 8.41,
+   "market": 7.5,
+   "deals": 25,
+   "rank": 15,
+   "album_filled": 34
+  },
+  {
+   "tick": 447,
+   "score": 16.44,
+   "duel_points": 0.0,
+   "neg_points": 24.2,
+   "ladder_points": 0.033,
+   "negotiating": 8.94,
+   "market": 7.5,
+   "deals": 25,
+   "rank": 15,
+   "album_filled": 34
+  },
+  {
+   "tick": 457,
+   "score": 16.44,
+   "duel_points": 0.0,
+   "neg_points": 24.2,
+   "ladder_points": 0.033,
+   "negotiating": 8.94,
+   "market": 7.5,
+   "deals": 25,
+   "rank": 15,
+   "album_filled": 34
+  },
+  {
+   "tick": 467,
+   "score": 16.44,
+   "duel_points": 0.0,
+   "neg_points": 24.2,
+   "ladder_points": 0.033,
+   "negotiating": 8.94,
+   "market": 7.5,
+   "deals": 25,
+   "rank": 14,
+   "album_filled": 34
+  },
+  {
+   "tick": 478,
+   "score": 14.25,
+   "duel_points": 2.48,
+   "neg_points": 24.2,
+   "ladder_points": 0.033,
+   "negotiating": 6.75,
+   "market": 7.5,
+   "deals": 25,
+   "rank": 15,
+   "album_filled": 34
+  },
+  {
+   "tick": 488,
+   "score": 21.09,
+   "duel_points": 2.48,
+   "neg_points": 24.2,
+   "ladder_points": 0.033,
+   "negotiating": 13.59,
+   "market": 7.5,
+   "deals": 25,
+   "rank": 12,
+   "album_filled": 34
+  },
+  {
+   "tick": 498,
+   "score": 21.31,
+   "duel_points": 5.47,
+   "neg_points": 24.2,
+   "ladder_points": 0.033,
+   "negotiating": 13.81,
+   "market": 7.5,
+   "deals": 25,
+   "rank": 12,
+   "album_filled": 34
+  },
+  {
+   "tick": 508,
+   "score": 22.23,
+   "duel_points": 6.48,
+   "neg_points": 24.2,
+   "ladder_points": 0.033,
+   "negotiating": 14.73,
+   "market": 7.5,
+   "deals": 25,
+   "rank": 11,
+   "album_filled": 34
+  },
+  {
+   "tick": 519,
+   "score": 21.72,
+   "duel_points": 7.11,
+   "neg_points": 24.2,
+   "ladder_points": 0.033,
+   "negotiating": 14.22,
+   "market": 7.5,
+   "deals": 25,
+   "rank": 11,
+   "album_filled": 34
+  },
+  {
+   "tick": 529,
+   "score": 21.75,
+   "duel_points": 8.54,
+   "neg_points": 24.2,
+   "ladder_points": 0.033,
+   "negotiating": 14.25,
+   "market": 7.5,
+   "deals": 25,
+   "rank": 13,
+   "album_filled": 34
+  },
+  {
+   "tick": 539,
+   "score": 21.69,
+   "duel_points": 8.54,
+   "neg_points": 24.2,
+   "ladder_points": 0.033,
+   "negotiating": 14.19,
+   "market": 7.5,
+   "deals": 25,
+   "rank": 14,
+   "album_filled": 34
+  },
+  {
+   "tick": 549,
+   "score": 21.56,
+   "duel_points": 9.16,
+   "neg_points": 24.2,
+   "ladder_points": 0.033,
+   "negotiating": 14.06,
+   "market": 7.5,
+   "deals": 25,
+   "rank": 14,
+   "album_filled": 34
+  },
+  {
+   "tick": 560,
+   "score": 21.61,
+   "duel_points": 10.21,
+   "neg_points": 24.2,
+   "ladder_points": 0.033,
+   "negotiating": 14.11,
+   "market": 7.5,
+   "deals": 25,
+   "rank": 13,
+   "album_filled": 34
+  },
+  {
+   "tick": 570,
+   "score": 21.1,
+   "duel_points": 10.82,
+   "neg_points": 24.2,
+   "ladder_points": 0.033,
+   "negotiating": 13.6,
+   "market": 7.5,
+   "deals": 25,
+   "rank": 14,
+   "album_filled": 34
+  },
+  {
+   "tick": 580,
+   "score": 20.85,
+   "duel_points": 11.43,
+   "neg_points": 24.2,
+   "ladder_points": 0.033,
+   "negotiating": 13.35,
+   "market": 7.5,
+   "deals": 25,
+   "rank": 15,
+   "album_filled": 34
+  },
+  {
+   "tick": 590,
+   "score": 20.5,
+   "duel_points": 11.43,
+   "neg_points": 24.2,
+   "ladder_points": 0.033,
+   "negotiating": 13.0,
+   "market": 7.5,
+   "deals": 25,
+   "rank": 15,
+   "album_filled": 34
+  },
+  {
+   "tick": 600,
+   "score": 20.26,
+   "duel_points": 11.43,
+   "neg_points": 28.9,
+   "ladder_points": 0.033,
+   "negotiating": 12.76,
+   "market": 7.5,
+   "deals": 26,
+   "rank": 16,
+   "album_filled": 35
+  },
+  {
+   "tick": 610,
+   "score": 20.93,
+   "duel_points": 11.43,
+   "neg_points": 43.1,
+   "ladder_points": 0.033,
+   "negotiating": 13.43,
+   "market": 7.5,
+   "deals": 28,
+   "rank": 15,
+   "album_filled": 36
+  },
+  {
+   "tick": 620,
+   "score": 21.87,
+   "duel_points": 11.43,
+   "neg_points": 56.7,
+   "ladder_points": 0.033,
+   "negotiating": 14.37,
+   "market": 7.5,
+   "deals": 30,
+   "rank": 14,
+   "album_filled": 38
+  },
+  {
+   "tick": 630,
+   "score": 21.51,
+   "duel_points": 11.43,
+   "neg_points": 56.7,
+   "ladder_points": 0.033,
+   "negotiating": 14.01,
+   "market": 7.5,
+   "deals": 30,
+   "rank": 14,
+   "album_filled": 38
+  },
+  {
+   "tick": 635,
+   "score": 21.51,
+   "duel_points": 11.43,
+   "neg_points": 56.7,
+   "ladder_points": 0.033,
+   "negotiating": 14.01,
+   "market": 7.5,
+   "deals": 30,
+   "rank": 14,
+   "album_filled": 38
+  },
+  {
+   "tick": 645,
+   "score": 21.46,
+   "duel_points": 11.43,
+   "neg_points": 56.7,
+   "ladder_points": 0.033,
+   "negotiating": 13.96,
+   "market": 7.5,
+   "deals": 30,
+   "rank": 14,
+   "album_filled": 38
+  },
+  {
+   "tick": 656,
+   "score": 21.25,
+   "duel_points": 11.43,
+   "neg_points": 56.7,
+   "ladder_points": 0.05,
+   "negotiating": 13.75,
+   "market": 7.5,
+   "deals": 31,
+   "rank": 15,
+   "album_filled": 39
+  },
+  {
+   "tick": 666,
+   "score": 21.69,
+   "duel_points": 11.43,
+   "neg_points": 59.4,
+   "ladder_points": 0.05,
+   "negotiating": 14.19,
+   "market": 7.5,
+   "deals": 33,
+   "rank": 13,
+   "album_filled": 41
+  }
+ ],
+ "duel_points_por_tick": [
+  {
+   "tick": 159,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 165,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 175,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 186,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 196,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 206,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 216,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 227,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 237,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 244,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 255,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 265,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 275,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 284,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 294,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 304,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 315,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 325,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 335,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 345,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 355,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 365,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 376,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 386,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 396,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 406,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 416,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 426,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 437,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 447,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 457,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 467,
+   "duel_points": 0.0
+  },
+  {
+   "tick": 478,
+   "duel_points": 2.48
+  },
+  {
+   "tick": 488,
+   "duel_points": 2.48
+  },
+  {
+   "tick": 498,
+   "duel_points": 5.47
+  },
+  {
+   "tick": 508,
+   "duel_points": 6.48
+  },
+  {
+   "tick": 519,
+   "duel_points": 7.11
+  },
+  {
+   "tick": 529,
+   "duel_points": 8.54
+  },
+  {
+   "tick": 539,
+   "duel_points": 8.54
+  },
+  {
+   "tick": 549,
+   "duel_points": 9.16
+  },
+  {
+   "tick": 560,
+   "duel_points": 10.21
+  },
+  {
+   "tick": 570,
+   "duel_points": 10.82
+  },
+  {
+   "tick": 580,
+   "duel_points": 11.43
+  },
+  {
+   "tick": 590,
+   "duel_points": 11.43
+  },
+  {
+   "tick": 600,
+   "duel_points": 11.43
+  },
+  {
+   "tick": 610,
+   "duel_points": 11.43
+  },
+  {
+   "tick": 620,
+   "duel_points": 11.43
+  },
+  {
+   "tick": 630,
+   "duel_points": 11.43
+  },
+  {
+   "tick": 635,
+   "duel_points": 11.43
+  },
+  {
+   "tick": 645,
+   "duel_points": 11.43
+  },
+  {
+   "tick": 656,
+   "duel_points": 11.43
+  },
+  {
+   "tick": 666,
+   "duel_points": 11.43
+  }
+ ],
+ "captura_por_dealer": [
+  {
+   "equipo": "t12",
+   "dealer": "abuela",
+   "hilos": 19,
+   "tratos": 10,
+   "captura_mediana": 0.5,
+   "n_capturas": 10
+  },
+  {
+   "equipo": "t12",
+   "dealer": "chato",
+   "hilos": 7,
+   "tratos": 4,
+   "captura_mediana": 0.47,
+   "n_capturas": 4
+  },
+  {
+   "equipo": "t12",
+   "dealer": "pilar",
+   "hilos": 3,
+   "tratos": 1,
+   "captura_mediana": 1.0,
+   "n_capturas": 1
+  },
+  {
+   "equipo": "t14",
+   "dealer": "abuela",
+   "hilos": 9,
+   "tratos": 3,
+   "captura_mediana": 0.75,
+   "n_capturas": 3
+  },
+  {
+   "equipo": "t14",
+   "dealer": "chato",
+   "hilos": 5,
+   "tratos": 3,
+   "captura_mediana": 0.69,
+   "n_capturas": 3
+  },
+  {
+   "equipo": "t14",
+   "dealer": "pilar",
+   "hilos": 2,
+   "tratos": 1,
+   "captura_mediana": 0.44,
+   "n_capturas": 1
+  },
+  {
+   "equipo": "t15",
+   "dealer": "abuela",
+   "hilos": 32,
+   "tratos": 5,
+   "captura_mediana": 0.5,
+   "n_capturas": 5
+  },
+  {
+   "equipo": "t15",
+   "dealer": "chato",
+   "hilos": 17,
+   "tratos": 2,
+   "captura_mediana": 0.03,
+   "n_capturas": 2
+  },
+  {
+   "equipo": "t18",
+   "dealer": "abuela",
+   "hilos": 8,
+   "tratos": 7,
+   "captura_mediana": 0.75,
+   "n_capturas": 7
+  },
+  {
+   "equipo": "t18",
+   "dealer": "chato",
+   "hilos": 6,
+   "tratos": 3,
+   "captura_mediana": 0.69,
+   "n_capturas": 3
+  },
+  {
+   "equipo": "t18",
+   "dealer": "pilar",
+   "hilos": 1,
+   "tratos": 0,
+   "captura_mediana": null,
+   "n_capturas": 0
+  }
+ ],
+ "tratos_en_venues_de_equipos": [
+  {
+   "venue": "v01",
+   "dueño": "t06",
+   "tratos": 3,
+   "con_t15": 1
+  },
+  {
+   "venue": "v02",
+   "dueño": "t12",
+   "tratos": 7,
+   "con_t15": 3
+  },
+  {
+   "venue": "v07",
+   "dueño": "t10",
+   "tratos": 4,
+   "con_t15": 0
+  },
+  {
+   "venue": "v10",
+   "dueño": "t05",
+   "tratos": 2,
+   "con_t15": 1
+  },
+  {
+   "venue": "v14",
+   "dueño": "t14",
+   "tratos": 1,
+   "con_t15": 1
+  },
+  {
+   "venue": "v17",
+   "dueño": "t17",
+   "tratos": 1,
+   "con_t15": 1
+  },
+  {
+   "venue": "v21",
+   "dueño": "t09",
+   "tratos": 1,
+   "con_t15": 1
+  }
+ ],
+ "market_making_cierre": [
+  {
+   "equipo": "t10",
+   "market": 12.46,
+   "venues": [
+    "v07 board trades=4"
+   ]
+  },
+  {
+   "equipo": "t12",
+   "market": 12.25,
+   "venues": [
+    "v02 board trades=7"
+   ]
+  },
+  {
+   "equipo": "t06",
+   "market": 11.64,
+   "venues": [
+    "v01 board trades=3"
+   ]
+  },
+  {
+   "equipo": "t14",
+   "market": 9.53,
+   "venues": [
+    "v14 auto trades=1"
+   ]
+  },
+  {
+   "equipo": "t09",
+   "market": 8.85,
+   "venues": [
+    "v21 board trades=1",
+    "v12 auto trades=0"
+   ]
+  },
+  {
+   "equipo": "t17",
+   "market": 8.78,
+   "venues": [
+    "v17 auto trades=1"
+   ]
+  },
+  {
+   "equipo": "t01",
+   "market": 7.5,
+   "venues": [
+    "v08 auto trades=0",
+    "v19 board trades=0"
+   ]
+  },
+  {
+   "equipo": "t02",
+   "market": 7.5,
+   "venues": [
+    "v04 auto trades=0"
+   ]
+  },
+  {
+   "equipo": "t04",
+   "market": 7.5,
+   "venues": [
+    "v05 board trades=0"
+   ]
+  },
+  {
+   "equipo": "t05",
+   "market": 7.5,
+   "venues": [
+    "v10 auto trades=2"
+   ]
+  },
+  {
+   "equipo": "t07",
+   "market": 7.5,
+   "venues": [
+    "v11 auto trades=0"
+   ]
+  },
+  {
+   "equipo": "t11",
+   "market": 7.5,
+   "venues": [
+    "v13 auto trades=0"
+   ]
+  },
+  {
+   "equipo": "t15",
+   "market": 7.5,
+   "venues": [
+    "v15 auto trades=0"
+   ]
+  },
+  {
+   "equipo": "t16",
+   "market": 7.5,
+   "venues": [
+    "v16 auto trades=0"
+   ]
+  },
+  {
+   "equipo": "t18",
+   "market": 7.5,
+   "venues": [
+    "v18 auto trades=0"
+   ]
+  },
+  {
+   "equipo": "t08",
+   "market": 7.46,
+   "venues": [
+    "v06 board trades=0"
+   ]
+  },
+  {
+   "equipo": "t13",
+   "market": 5.49,
+   "venues": [
+    "v03 board trades=0"
+   ]
+  },
+  {
+   "equipo": "t03",
+   "market": 3.61,
+   "venues": [
+    "v09 auto trades=0",
+    "v20 board trades=0"
+   ]
+  }
+ ],
+ "mala_fe": {
+  "mensajes_dealer_con_precio": 2062,
+  "palabras_distintas_de_oferta": 0,
+  "faroles_final_sin_final_true": [
+   {
+    "dealer": "pilar",
+    "said": 18,
+    "then": 19,
+    "team": "t13",
+    "tick": 323
+   },
+   {
+    "dealer": "pilar",
+    "said": 23,
+    "then": 25,
+    "team": "t10",
+    "tick": 531
+   },
+   {
+    "dealer": "pilar",
+    "said": 16,
+    "then": 17,
+    "team": "t13",
+    "tick": 598
+   },
+   {
+    "dealer": "pilar",
+    "said": 18,
+    "then": 19,
+    "team": "t02",
+    "tick": 664
+   }
+  ]
+ },
+ "abuela": {
+  "regalos": 23,
+  "regalos_total": 23,
+  "mensajes_consejo_pagina": 210,
+  "mensajes_abuela": 1183
+ },
+ "ofertas_t15_por_venue": [
+  {
+   "venue": "v02",
+   "ofertas": 64
+  },
+  {
+   "venue": "(directa)",
+   "ofertas": 48
+  },
+  {
+   "venue": "rastro",
+   "ofertas": 44
+  },
+  {
+   "venue": "v20",
+   "ofertas": 16
+  },
+  {
+   "venue": "v17",
+   "ofertas": 16
+  },
+  {
+   "venue": "v14",
+   "ofertas": 15
+  },
+  {
+   "venue": "v19",
+   "ofertas": 13
+  },
+  {
+   "venue": "v18",
+   "ofertas": 12
+  },
+  {
+   "venue": "v12",
+   "ofertas": 12
+  },
+  {
+   "venue": "v01",
+   "ofertas": 11
+  },
+  {
+   "venue": "v21",
+   "ofertas": 9
+  },
+  {
+   "venue": "v07",
+   "ofertas": 8
+  },
+  {
+   "venue": "v06",
+   "ofertas": 7
+  },
+  {
+   "venue": "v04",
+   "ofertas": 7
+  },
+  {
+   "venue": "v05",
+   "ofertas": 6
+  },
+  {
+   "venue": "v03",
+   "ofertas": 6
+  },
+  {
+   "venue": "v10",
+   "ofertas": 5
+  },
+  {
+   "venue": "v13",
+   "ofertas": 3
+  },
+  {
+   "venue": "v11",
+   "ofertas": 3
+  },
+  {
+   "venue": "v16",
+   "ofertas": 1
+  }
+ ]
+}
