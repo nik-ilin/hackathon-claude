@@ -13,7 +13,9 @@ otras son rumores y otras «solo Madrid». Este módulo:
   3. en vivo, cruza cada noticia con el menú ACTUAL del vendedor (`/api/dealers`) y con nuestra colección, y propone
      acciones concretas: «el Chato compra raras MAL: tenemos MAL-09 #12 (valor privado 77 P) → abrir venta pidiendo
      P (suelo F)». Las copias propuestas pasan por page_guard (nunca rompen una página completa ni tocan copias
-     comprometidas en ofertas abiertas) y el suelo es el valor privado + margen.
+     comprometidas en ofertas abiertas) y el suelo es el valor privado + margen;
+  4. lee las fiebres de `/api/schedule` (persona_patch «Doña Pilar pays 25 % over book for Salamanca», hasta el
+     siguiente patch de ese vendedor) y, mientras están activas, propone vender ese barrio al vendedor.
 
     python3 news_watch.py --calibrate --db ../intel/market.db   # tabla de calibración por fuente (offline)
     python3 news_watch.py                                       # en vivo: noticias + acciones sugeridas
@@ -303,6 +305,97 @@ def calibration_lines(cal: dict) -> list:
     return out
 
 
+# ------------------------------------------------------------------ fiebres de /api/schedule (persona_patch)
+
+TICKS_PER_GAME_HOUR = 120.0   # dashboard.py: 120 ticks por hora de juego, sea cual sea tick_seconds
+FEVER_RE = re.compile(r"(?P<pct>\d+(?:\.\d+)?)\s*%\s*over book for (?P<what>[^.,;]+?)(?:\s+until\b|[.,;]|$)", re.I)
+
+
+def schedule_items(payload) -> list:
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    for k in ("upcoming", "schedule", "items", "events"):
+        if isinstance((payload or {}).get(k), list):
+            return [x for x in payload[k] if isinstance(x, dict)]
+    return []
+
+
+def fevers(schedule, catalog: Optional[dict] = None) -> list:
+    """persona_patch «X pays N % over book for <barrio>» -> {dealer, set, pct, start, end, note} en horas de juego; el
+    final es el siguiente persona_patch del mismo vendedor («The fever breaks»)."""
+    items = sorted((x for x in schedule_items(schedule) if x.get("action") == "persona_patch"
+                    and isinstance(x.get("at_hours"), (int, float))), key=lambda x: x["at_hours"])
+    names = set_names(catalog)
+    out = []
+    for i, x in enumerate(items):
+        m = FEVER_RE.search(x.get("note") or "")
+        if not m:
+            continue
+        what = m.group("what").lower()
+        set_id = next((sid for sid, ws in names.items() if _has(what, ws)), None)
+        did = (x.get("params") or {}).get("id") or next((d for d, ws in DEALERS.items() if _has(
+            (x.get("note") or "").lower(), ws)), None)
+        end = next((y["at_hours"] for y in items[i + 1:] if (y.get("params") or {}).get("id") == did), None)
+        out.append({"dealer": did, "set": set_id, "pct": float(m.group("pct")), "start": x["at_hours"], "end": end,
+                    "note": x.get("note")})
+    return out
+
+
+def schedule_now(schedule, clock: Optional[dict] = None) -> Optional[float]:
+    v = (schedule or {}).get("now_hours") if isinstance(schedule, dict) else None
+    v = v if isinstance(v, (int, float)) else (clock or {}).get("t_hours")
+    return float(v) if isinstance(v, (int, float)) else None
+
+
+def fever_state(f: dict, now_h: Optional[float], tick: Optional[int]) -> dict:
+    """activa / próxima / pasada, con los ticks aproximados de inicio y fin (120 ticks por hora de juego)."""
+    to_tick = lambda h: int(round(tick + (h - now_h) * TICKS_PER_GAME_HOUR)) if h is not None and tick is not None \
+        and now_h is not None else None
+    if now_h is None:
+        state = "desconocida"
+    elif now_h < f["start"]:
+        state = "próxima"
+    elif f["end"] is None or now_h < f["end"]:
+        state = "activa"
+    else:
+        state = "pasada"
+    return dict(f, state=state, start_tick=to_tick(f["start"]), end_tick=to_tick(f["end"]),
+                hours_to_start=round(f["start"] - now_h, 3) if now_h is not None else None)
+
+
+def fever_suggestions(fv: list, me: dict, catalog: Optional[dict], my_offers: list = (), margin: float = 2.0) -> list:
+    """Durante una fiebre activa: copias del barrio que page_guard deja salir, con lo que el vendedor pagaría
+    (book × (1 + pct)) frente a nuestro valor privado. Solo las que dejan excedente sobre el suelo."""
+    if not catalog:
+        return []
+    assets = [a for a in me.get("assets") or [] if a.get("kind") == "card"]
+    counts = Counter(a["ref"] for a in assets)
+    val = tr.Valuation(catalog, me.get("affinity") or {})
+    committed = pg.committed_assets(list(my_offers or []), me.get("id"))
+    out, seen = [], set()
+    for f in fv:
+        if f.get("state") != "activa" or not f.get("set"):
+            continue
+        for a in sorted(assets, key=lambda x: x["id"]):
+            card = val.cards.get(a["ref"]) or {}
+            if card.get("set") != f["set"] or card.get("book") is None or a["id"] in seen:
+                continue
+            if a["id"] not in pg.tradeable_assets(a["ref"], counts, catalog, assets, committed):
+                continue
+            loss = copy_loss(val, counts, a)
+            floor = max(1, math.ceil(loss + margin - 1e-9))
+            pays = math.floor(card["book"] * (1 + f["pct"] / 100))
+            if pays < floor:
+                continue
+            seen.add(a["id"])
+            out.append({"type": "fever_sell", "dealer": f["dealer"], "set": f["set"], "asset": a["id"], "ref": a["ref"],
+                        "value": round(loss, 2), "floor": floor, "ask": pays, "until_tick": f.get("end_tick"),
+                        "text": f"fiebre {f['set']} de {f['dealer']} (+{f['pct']:g} % sobre book) hasta "
+                                f"t~{f.get('end_tick')}: {a['ref']} #{a['id']} vale {loss:.1f} P para nosotros → "
+                                f"vender a {f['dealer']} pidiendo ~{pays} P (suelo {floor} P)"})
+    return out
+
+
 # ------------------------------------------------------------------ sugerencias en vivo
 
 def copy_loss(val: Optional[tr.Valuation], counts: Counter, asset: dict) -> float:
@@ -388,7 +481,7 @@ def advice(c: dict, st: dict) -> str:
 
 def live_report(news_raw, dealers_raw, clock: dict, me: Optional[dict] = None, catalog: Optional[dict] = None,
                 my_offers: list = (), feed_events: Iterable[dict] = (), rel: Optional[dict] = None,
-                margin: float = 2.0) -> dict:
+                margin: float = 2.0, schedule=None) -> dict:
     rel = rel or dict(PRIORS)
     tick, ts = clock.get("tick"), clock.get("tick_seconds") or DEFAULT_TICK_SECONDS
     dealers = dealer_map(dealers_raw)
@@ -401,7 +494,11 @@ def live_report(news_raw, dealers_raw, clock: dict, me: Optional[dict] = None, c
         st = status_of(c, tick, ts, rel, dealers.get(c.get("dealer")))
         rows.append(dict(c, **st, advice=advice(c, st)))
     sugg = sell_suggestions(rows, dealers, me, catalog, my_offers, tick, ts, rel, margin) if me else []
-    return {"tick": tick, "tick_seconds": ts, "reliability": rel, "news": rows, "suggestions": sugg}
+    now_h = schedule_now(schedule, clock)
+    fv = [fever_state(f, now_h, tick) for f in fevers(schedule, catalog)] if schedule is not None else []
+    if me:
+        sugg += fever_suggestions(fv, me, catalog, my_offers, margin)
+    return {"tick": tick, "tick_seconds": ts, "reliability": rel, "news": rows, "fevers": fv, "suggestions": sugg}
 
 
 def report_lines(rep: dict) -> list:
@@ -416,6 +513,9 @@ def report_lines(rep: dict) -> list:
         if r.get("confirmed_by_menu"):
             extra.append("CONFIRMADA en el menú actual")
         out.append(f"      → {r['advice']}{' · ' + ', '.join(extra) if extra else ''}")
+    for f in rep.get("fevers") or []:
+        out.append(f"  FIEBRE {f['state']}: {f['dealer']} +{f['pct']:g} % por {f['set']} · t~{f['start_tick']}–"
+                   f"t~{f['end_tick']} · {f['note']}")
     out.append("ACCIONES SUGERIDAS:" if rep["suggestions"] else "ACCIONES SUGERIDAS: ninguna")
     out += [f"  - {s['text']}" for s in rep["suggestions"]]
     return out
@@ -450,7 +550,7 @@ def main(argv: Optional[list] = None) -> int:
             me, catalog = api.me(), api.catalog()
             offers = (api.my_offers() or {}).get("offers", [])
         rep = live_report(api.call("GET", "/api/news"), api.dealers(), api.clock(), me, catalog, offers,
-                          (api.feed(400) or {}).get("events", []), reliability(cal), a.margin)
+                          (api.feed(400) or {}).get("events", []), reliability(cal), a.margin, api.schedule())
         print("\n".join(report_lines(rep)))
         if a.json:
             _dump(rep, a.json)

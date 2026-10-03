@@ -35,7 +35,7 @@ case "${1:-}" in
   t15)    shift; exec python3 coordinator.py --no-rival-venues --duende-venue rastro \
             --deny-teams t14,t12,t10,t18 --deny-margin 15 --ladder-fill --ladder-calibrated \
             --pilar-sell SAL,LAV:1.25 --pilar-last-copy --allow-last-copy SAL-07 \
-            --reserve 5 --per-card 95 "$@" ;;
+            --reserve 5 --per-card 95 --chato-mirror on --fever-priority "$@" ;;
   broker) exec python3 starter_broker.py ;;
   market-broker) shift; exec python3 market_broker.py "$@" ;;
   agent)  shift; exec python3 starter_agent.py "$@" ;;

@@ -54,3 +54,10 @@ python3 new_levels.py --workshop --workshop-margin 2           # dry run del env
 | Boletín t643 «sobres de la Abuela en una hora»: pendiente hasta t763 | Revisar `sobres sin abrir` en `new_levels.py`. |
 | «One hour» = 120 ticks (30 s/tick; el domingo 15 s → 240) | La ventana se calcula con `tick_seconds` del reloj. |
 | Taller: t05, t12, t18, t16, t08, t10 ya convierten comunes en poco comunes | Solo si la media del valor privado de las poco comunes publicadas supera lo que perdemos + margen. |
+
+### Chato v3 y fiebre de Salamanca (preset `./run.sh t15` ya incluye `--chato-mirror on --fever-priority`)
+
+| Hallazgo | Ajuste |
+|---|---|
+| Chato v3 (persona.updated t583) refleja nuestra concesión: hilos 989/998/1005 abrió a 97, repitió 97 mientras seguíamos en 87, cedió 1 («You moved little, so did I») y la compra a 96 no movió ladder_points. | `--chato-mirror on\|auto\|off` (con `--ladder-calibrated`): cada ronda un paso real = máx(paso, ⌈hueco/4⌉), nunca pasos de 1 ni repetir precio; el techo económico sigue mandando. `auto` detecta v≥3 por `/api/dealers`, `persona.updated` del feed (se recuerda en el ledger) o la frase «so did I» en el hilo. |
+| `/api/schedule`: «Salamanca fever: Doña Pilar pays 25 % over book for Salamanca» a las 9,15 h de juego (≈18:03 hora local), «The fever breaks» a las 11,15 h (≈20:03). | `--fever-priority`: mientras dura, las ventas SAL a Pilar pasan delante; en la hora de juego previa (`--fever-wait 1`) se esperan. `news_watch.py` muestra la fiebre y, activa, propone qué SAL vender y a cuánto (book × 1,25 frente a valor privado). |

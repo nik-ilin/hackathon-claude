@@ -34,6 +34,11 @@ Reglas de decisión (compra; la venta es simétrica):
     final∓1 y, si no contesta en `final_wait_ticks`, se toma su final. Con Pilar no hay muestras: se acepta su final si
     cubre el valor privado.
 
+Chato v3 (persona.updated v3 en t583) REFLEJA nuestra concesión: hilos 989, 998 y 1005 (t715-724) abrió a 97 y
+repitió 97 mientras seguíamos en 87; cuando cedió fue 1 P («You moved little, so did I») y la compra a 96 no movió
+ladder_points. Con `mirror=True` (coordinator --chato-mirror) nunca nos quedamos quietos ni bajamos a pasos de 1: cada
+ronda subimos (bajamos, en venta) un paso real = máx(step, ⌈hueco/4⌉), y si el techo no deja moverse, no se insiste.
+
 Las cifras son OBSERVACIONES de rondas anteriores, no reglas del servidor: el valor privado manda siempre.
 """
 from __future__ import annotations
@@ -49,6 +54,8 @@ from negotiation import Decision, NegState
 LADDER_DEALERS = ("abuela", "chato", "pilar")
 LEVEL_WEIGHT = {"abuela": 1, "chato": 2, "pilar": 3}  # «higher levels weigh more»: el peso exacto no es público
 PILAR_FAV_SETS = frozenset({"SAL", "RET"})            # abre a 22 (no a 16) por SAL/RET; su menú `buys` los nombra
+MIRROR_RE = re.compile(r"moved little|so did I|you move,? I move|small steps", re.I)
+MIRROR_MIN_VERSION = {"chato": 3}                     # versiones que reflejan la concesión (persona.updated)
 BLUFF_RE = re.compile(r"\bfinal\b|last word|última palabra|not a step more|not one more", re.I)
 
 
@@ -172,10 +179,41 @@ def bluff_final(thread: dict, dealer: str) -> bool:
     return False
 
 
+# ------------------------------------------------------------------ versión del vendedor y modo espejo
+
+def dealer_version(dealer: str, dealer_row: Optional[dict] = None, events=()) -> Optional[int]:
+    """Versión del vendedor: `version` de /api/dealers si la trae; si no, la mayor de los eventos persona.updated."""
+    v = (dealer_row or {}).get("version")
+    best = int(v) if isinstance(v, (int, float)) else None
+    for e in events or []:
+        if str(e.get("type") or e.get("kind") or "") != "persona.updated":
+            continue
+        p = e.get("payload") if isinstance(e.get("payload"), dict) else e
+        if p.get("persona") == dealer and isinstance(p.get("version"), (int, float)):
+            best = max(best or 0, int(p["version"]))
+    return best
+
+
+def mirror_said(thread: Optional[dict], dealer: str) -> bool:
+    """El vendedor ya ha dicho en el hilo que refleja nuestra concesión («You moved little, so did I»)."""
+    return any(m.get("sender") == dealer and MIRROR_RE.search(m.get("text") or "")
+               for m in (thread or {}).get("messages") or [])
+
+
+def mirrors(dealer: str, version: Optional[int] = None, thread: Optional[dict] = None) -> bool:
+    need = MIRROR_MIN_VERSION.get(dealer)
+    return (need is not None and version is not None and version >= need) or mirror_said(thread, dealer)
+
+
+def mirror_step(prof: Profile, gap: Optional[int]) -> int:
+    """Paso real contra un vendedor espejo: nunca el paso de 1 «cerca del objetivo»; un cuarto del hueco si es mayor."""
+    return max(prof.step, _ceil(max(0, gap or 0) / 4))
+
+
 # ------------------------------------------------------------------ decisiones
 
 def decide_buy(st: NegState, prof: Profile, ceiling: int, conv_ticks_left: int, now_tick: Optional[int] = None,
-               name: str = "calibrada") -> Decision:
+               name: str = "calibrada", mirror: bool = False) -> Decision:
     """Compra calibrada. Garantías: nunca supera `ceiling`, nunca paga su apertura, nunca repite ni baja una oferta,
     acepta una oferta NO final solo al llegar al objetivo (o al agotar rondas/ticks propios), una sola contraoferta
     tras su `final: true`."""
@@ -220,18 +258,21 @@ def decide_buy(st: NegState, prof: Profile, ceiling: int, conv_ticks_left: int, 
             return Decision("abandon", "no hay primera oferta válida")
         return Decision("counter", f"[{name}] apertura extrema {p} P ({prof.first:.0%} de {opening} P; objetivo "
                                    f"{target} P)", p)
-    step = prof.step if st.last_ours + prof.step <= target else prof.near_step
+    if mirror:  # Chato v3: refleja lo que cedemos; quedarse quieto o pasos de 1 = él tampoco se mueve
+        step = mirror_step(prof, st.ref_ask - st.last_ours)
+    else:
+        step = prof.step if st.last_ours + prof.step <= target else prof.near_step
     p = min(st.last_ours + step, hi)
     if p <= st.last_ours:
         if live and valid(live.price):
             return take(f"no queda oferta nueva por encima de {st.last_ours} P; {live.price} P es aceptable")
         return Decision("abandon", f"no queda oferta nueva entre {st.last_ours} P y {hi} P")
     return Decision("counter", f"[{name}] paso de {step} P ({st.ref_ask} P vigente, objetivo {target} P; "
-                               "paciencia hasta final:true)", p)
+                               + ("espejo: cede lo que cedemos)" if mirror else "paciencia hasta final:true)"), p)
 
 
 def decide_sell(st: NegState, prof: Profile, floor: int, conv_ticks_left: int, now_tick: Optional[int] = None,
-                name: str = "calibrada") -> Decision:
+                name: str = "calibrada", mirror: bool = False) -> Decision:
     """Venta calibrada (st con side="sell": ref_ask = su puja, last_ours = nuestra petición). Garantías: nunca por
     debajo de `floor` (valor privado de la copia), nunca a su puja de apertura, una puja NO final solo si alcanza el
     objetivo, su `final: true` se acepta si cubre el suelo."""
@@ -270,7 +311,10 @@ def decide_sell(st: NegState, prof: Profile, floor: int, conv_ticks_left: int, n
         p = max(int(prof.first * opening + 0.5), bottom)
         return Decision("counter", f"[{name}] petición extrema {p} P ({prof.first:.2f}× su puja {opening} P; "
                                    f"objetivo {target} P, suelo {lo} P)", p)
-    step = prof.step if st.last_ours - prof.step >= target else prof.near_step
+    if mirror:
+        step = mirror_step(prof, st.last_ours - st.ref_ask)
+    else:
+        step = prof.step if st.last_ours - prof.step >= target else prof.near_step
     p = max(st.last_ours - step, bottom)
     if p >= st.last_ours:
         if live and live.price >= lo:
