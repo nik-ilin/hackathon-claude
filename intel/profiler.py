@@ -281,7 +281,7 @@ def render(dealer_prof, team_prof, rmed, recs, q):
 
 
 def run_once() -> None:
-    db = sqlite3.connect(DB)
+    db = sqlite3.connect(DB, timeout=30)  # collector writes concurrently
     q, dealers = load(db)
     hs = haggles(q, dealers)
     dprof = dealer_profiles(hs)

@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS duel_snapshots (snap_ts REAL, tick INTEGER, duel INTE
 
 
 def connect() -> sqlite3.Connection:
-    db = sqlite3.connect(DB_PATH)
+    db = sqlite3.connect(DB_PATH, timeout=30)
     db.executescript(SCHEMA)
     return db
 
