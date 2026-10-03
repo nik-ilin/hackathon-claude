@@ -1,11 +1,11 @@
 # Duelos · módulo complementario
 
-Cubre el hueco que señala `ARCHITECTURE.md` («No existe módulo de duelos»). **No modifica ningún archivo existente**: son cuatro archivos nuevos.
+Cubre el hueco que señala `ARCHITECTURE.md` («No existe módulo de duelos»). **No modifica ningún archivo existente**: son cinco archivos nuevos.
 
 | Archivo | Papel |
 |---|---|
 | `duels.py` | Política pura, sin red: `duel_candidates(duels, tick)` devuelve candidatas `duel_accept` / `duel_say` ordenadas por `score`; `margin()`; `replay()` para medir con duelos terminados. |
-| `duel_runner.py` | Proceso que **solo** juega duelos. Análisis por defecto; `--execute` para enviar. Reajusta sus parámetros al terminar cada oleada. |
+| `duel_runner.py` | Proceso que **solo** juega duelos. Análisis por defecto; `--execute` para enviar. No reajusta parámetros automáticamente. |
 | `test_duels.py` | 7 pruebas offline (`python3 -m unittest test_duels`). |
 | `duels_fixture_practice.json` | Los 24 duelos reales de Team 15 en la sesión de práctica del viernes. |
 
@@ -19,9 +19,9 @@ Cubre el hueco que señala `ARCHITECTURE.md` («No existe módulo de duelos»). 
 2. El rival sigue cediendo ⇒ **silencio**.
 3. Sin oferta rival a 5 ticks del final ⇒ **una** oferta propia (comprador 0,70·L, vendedor 1,30·C).
 4. Final de la oleada ⇒ aceptar la mejor oferta dentro de límite, **escalonando** (una aceptación por tick y equipo; un tick de margen más por cada duelo con el mismo deadline).
-5. Precio + días: los días suman utilidad con `your_days_weight`, pero **nunca** justifican un precio fuera de límite.
+5. Precio + días: se omiten y se registran como pendientes de verificar la fórmula de utilidad.
 
-## Resultado en repetición (datos reales)
+## Resultado en repetición individual retrospectiva (datos de práctica)
 | Política | Captura | Fuera de límite |
 |---|---|---|
 | Sin módulo (lo que ocurrió) | 0 P | 0 |
@@ -34,8 +34,11 @@ set -a; source .env; set +a
 python3 duel_runner.py              # análisis: muestra lo que haría
 python3 duel_runner.py --execute    # juega los duelos vivos
 ```
-- `other_processes()` del coordinador no lo detecta como conflicto (solo busca sus propios nombres).
-- Solo hay una aceptación por tick y equipo: si el coordinador ya la usó, el servidor responde `wait_for_tick` (no cuesta nada) y se reintenta al tick siguiente. Durante una oleada conviene que el coordinador no acepte.
-- Integración opcional en el coordinador (decisión vuestra): llamar a `duels.duel_candidates(s["duels"], tick)` desde `candidates()` y mapear `duel_accept` a la clase «aceptar».
+- El ejecutor comparte `data/agent.lock` con coordinador, mercado y agente de vendedores. **No ejecutarlos simultáneamente**: detener el anterior antes de iniciar duelos. No detiene otros procesos por su cuenta.
+- `--execute` envía como máximo una aceptación por tick. El modo análisis no envía operaciones ni reajusta parámetros.
+- Las peticiones se espacian 0,3 s; una respuesta ambigua a una escritura detiene el ejecutor para reconciliar antes de reiniciar.
+- No hay comando `./run.sh duels`: cargar `.env` y utilizar `python3 duel_runner.py` como arriba.
+- La repetición de 562/574 evalúa cada duelo aisladamente, con parámetros elegidos sobre la misma muestra. No reproduce el límite compartido por tick, la reacción contrafactual del rival ni acredita una rentabilidad futura. Por ello `retune()` y la carga de parámetros persistidos no se invocan automáticamente.
+- Estas protecciones coordinan procesos de este ordenador; no procesos en otros equipos con la misma clave.
 
-Registro de decisiones: `data/duels_log.jsonl` · parámetros aprendidos: `data/duel_params.json`.
+Registro de decisiones: `data/duels_log.jsonl` · parámetros experimentales offline: `data/duel_params.json`.

@@ -17,10 +17,10 @@ Política por duelo vivo, en cada tick:
   3. Sin oferta rival a falta de SPEAK_AT ticks ⇒ UNA oferta propia (comprador 0,70·L, vendedor 1,30·C).
   4. Últimos ticks ⇒ aceptar la mejor oferta dentro de límite. Solo hay UNA aceptación por tick y equipo: los duelos
      que comparten deadline se escalonan (un tick de margen más por cada duelo de la oleada).
-Duelos de dos issues (precio + días): los días suman utilidad con `your_days_weight`, pero NUNCA justifican un precio
-fuera de límite.
+Duelos de precio + días: omitidos por duel_candidates hasta verificar la fórmula del servidor.
+_days_value y margin conservan una aproximación exploratoria para análisis offline.
 
-Repetición sobre la práctica: 98 % del margen máximo disponible (562 de 574 P) con los parámetros por defecto, frente
+Repetición individual retrospectiva (sin límite compartido de aceptaciones ni validación fuera de muestra): 98 % del margen máximo disponible (562 de 574 P) con los parámetros por defecto, frente
 a 77 % aceptando en cuanto hay un 30 % de margen. El viernes, sin módulo de duelos, se capturó 0.
 """
 from __future__ import annotations
@@ -86,6 +86,10 @@ def duel_candidates(duels: list, tick: int) -> list:
             continue
         deadline = d["deadline_tick"]
         left = deadline - tick
+        if left <= 0:
+            continue  # no enviar acciones sobre un snapshot caducado
+        if "days" in (d.get("issues") or []):
+            continue  # pendiente de verificar la fórmula de utilidad de días con el servidor
         ro = d.get("rival_offer") or {}
         price, days = ro.get("price"), ro.get("days")
         m = margin(d, price, days)

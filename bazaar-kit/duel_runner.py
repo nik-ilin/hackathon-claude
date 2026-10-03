@@ -3,14 +3,9 @@
     python3 duel_runner.py                 # análisis (por defecto): lee duelos y muestra lo que haría, no envía nada
     python3 duel_runner.py --execute       # juega los duelos vivos con la política de duels.py
 
-Convivencia con el coordinador: este proceso solo actúa cuando hay duelos vivos y lo hace al principio de cada tick.
-Solo hay una aceptación por tick y equipo; si el coordinador ya la usó, el servidor responde `wait_for_tick` (no
-cuesta nada) y se reintenta en el tick siguiente. Durante una oleada de duelos conviene que el coordinador no acepte
-(los duelos vencen todos a la vez).
-
-Automejora: al terminar cada oleada repite todos los duelos terminados de las dos últimas sesiones con una rejilla de
-parámetros y adopta la mejor combinación solo si mejora ≥ 3 % la captura (data/duel_params.json). Registro de cada
-decisión en data/duels_log.jsonl.
+Ejecución exclusiva: comparte data/agent.lock con los agentes existentes. Detener el coordinador antes de
+usar --execute. El modo análisis no envía operaciones ni reajusta parámetros. El replay histórico es exploratorio:
+no reproduce la competencia de varios duelos por una aceptación por tick, por lo que no se usa para autoajustar.
 """
 from __future__ import annotations
 
@@ -23,6 +18,7 @@ from pathlib import Path
 
 import duels as dl
 from bazaar_sdk import Bazaar, BazaarError
+from negotiation import InstanceLock
 
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "data"
@@ -67,17 +63,37 @@ def retune(b: Bazaar) -> None:
         log({"retune": "sin cambios", "params": current, "replay": round(base), "duels": len(recent)})
 
 
+class PacedBazaar(Bazaar):
+    """Espaciar todas las peticiones; no reintentar escrituras ambiguas."""
+    def _call(self, *args, **kwargs):
+        time.sleep(max(0.0, 0.3 - (time.monotonic() - getattr(self, "_last_request", 0))))
+        self._last_request = time.monotonic()
+        return super()._call(*args, **kwargs)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--execute", action="store_true", help="enviar (por defecto solo análisis)")
     a = ap.parse_args()
     key = os.environ.get("BAZAAR_KEY", "")
     if not key or key == "tk-xxxx-xxxx":
-        raise SystemExit("Falta BAZAAR_KEY (usa ./run.sh o exporta la variable)")
-    b = Bazaar(os.environ.get("BAZAAR_URL", "https://bazaar.causaprima.ai"), key, wait_on_tick=False)
-    load_params()
-    last_tick, had_live = None, False
+        raise SystemExit("Falta BAZAAR_KEY (carga .env o exporta la variable)")
+    b = PacedBazaar(os.environ.get("BAZAAR_URL", "https://bazaar.causaprima.ai"), key, wait_on_tick=False, retries=0)
     log({"start": True, "execute": a.execute, "params": dl.PARAMS})
+    lock = InstanceLock(str(DATA / "agent.lock"), {"version": "duels-1.0"})
+    if a.execute:
+        holder = lock.acquire()
+        if holder:
+            raise SystemExit(f"Otro agente está activo (pid {holder.get('pid')}); detén ese agente antes de ejecutar duelos")
+    try:
+        run(b, a.execute)
+    finally:
+        if a.execute:
+            lock.release()
+
+
+def run(b, execute):
+    last_tick = None
     while True:
         try:
             c = b.clock()
@@ -87,18 +103,17 @@ def main() -> None:
             last_tick = c["tick"]
             live = [d for d in b.duels().get("duels", []) if d.get("status") == "live"]
             if not live:
-                if had_live:                 # la oleada acaba de terminar: aprender de ella
-                    retune(b)
-                had_live = False
                 time.sleep(2)
                 continue
-            had_live = True
+            for d in live:
+                if "days" in (d.get("issues") or []):
+                    log({"tick": c["tick"], "duel": d["duel"], "skipped": "days utility not verified"})
             accepted = False
             for cand in dl.duel_candidates(live, c["tick"]):
                 if cand["type"] == "duel_accept" and accepted:
                     continue                 # una aceptación por tick y equipo
                 rec = {"tick": c["tick"], **{k: v for k, v in cand.items() if k != "score"}}
-                if not a.execute:
+                if not execute:
                     log({**rec, "sent": False})
                     continue
                 try:
@@ -110,6 +125,8 @@ def main() -> None:
                     log({**rec, "sent": True})
                 except BazaarError as e:
                     log({**rec, "sent": False, "error": e.code, "message": e.message})
+                    if e.code in {"network", "bad_response"}:
+                        raise SystemExit("Escritura de duelo ambigua: revisar estado del servidor antes de reiniciar")
                     if cand["type"] == "duel_accept" and e.code == "wait_for_tick":
                         accepted = True
         except BazaarError as e:
