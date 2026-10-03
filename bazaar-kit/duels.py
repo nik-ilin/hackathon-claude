@@ -20,6 +20,7 @@ Política por duelo vivo, en cada tick:
 Duelos de precio + días: omitidos por defecto hasta verificar la fórmula del servidor. Con PARAMS["PLAY_DAYS"] = True
 (opt-in, `duel_runner.py --days`) se juegan con la misma política, valorando cada oferta como precio + utilidad de
 días, exigiendo SIEMPRE precio dentro de límite y enviando `days` en toda oferta propia.
+Opt-in PARAMS["PROFILES"] (`--profiles`) y PARAMS["LOGROLL"] (`--logroll`): ver la sección de perfiles más abajo.
 Opt-in PARAMS["LADDER"]: frente a un rival que no habla, en vez de una sola oferta, una escalera de ofertas que se
 acerca al límite (por defecto desactivada: una sola oferta).
 
@@ -28,6 +29,7 @@ a 77 % aceptando en cuanto hay un 30 % de margen. El viernes, sin módulo de due
 """
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 PARAMS = {
@@ -40,6 +42,8 @@ PARAMS = {
     "PLAY_DAYS": False,        # jugar duelos de precio + días (si no, se omiten)
     "LADDER": (),         # rival mudo: márgenes sucesivos tras ANCHOR, p. ej. (0.20, 0.12, 0.06); () = una sola oferta
     "PROBE": False,       # rival plantado con tiempo de sobra: UNA contraoferta a mitad de camino antes de aceptar
+    "PROFILES": False,    # reglas por perfil del bot de la casa (Plata, Verde, Oro, Luna, Rojo, Noche) y mudos pronto
+    "LOGROLL": False,     # días: conceder los que nos cuestan poco a cambio de precio (necesita PLAY_DAYS)
 }
 
 _SCALAR_KEYS = ("per_day", "weight", "value", "slope", "w")
@@ -178,6 +182,9 @@ def duel_candidates(duels: list, tick: int) -> list:
         queue = sum(1 for x in in_limit if x <= deadline)
         safe = PARAMS["SAFE_TICKS"] + max(0, by_deadline.get(deadline, 1) - 1, queue - 1)
         why = f"duelo {d['duel']} {d['role']} límite {lim:.0f} rival {price} días {days} quedan {left} pendiente {slope:.1f}"
+        prof = rival_profile(d) if PARAMS["PROFILES"] else None
+        if prof:
+            why += f" perfil {prof}"
 
         if m is not None and m >= 0 and pm is not None and pm >= 0:
             probe = (PARAMS["PROBE"] and stalled and slope >= 0 and d.get("your_offer") is None
@@ -191,11 +198,30 @@ def duel_candidates(duels: list, tick: int) -> list:
                     c["days"] = _best_days(d)
                 out.append(c)
                 continue
-            if left <= safe or pm >= PARAMS["GOOD_SHARE"] * lim or slope < 0 or stalled:
+            if (PARAMS["LOGROLL"] and days_duel and prof != "empeora" and left > safe + 1
+                    and not _our_messages(d)):
+                lr = logroll_offer(d, price, days)
+                if lr and lr["gain"] >= PROFILE_PARAMS["LOGROLL_MIN_GAIN"] + _decay(d) * (m + lr["gain"]):
+                    out.append({"type": "duel_say", "duel": d["duel"], "price": lr["price"], "days": lr["days"],
+                                "du": m + lr["gain"], "score": 300, "text": _say_text(lr["price"], lr["days"]),
+                                "why": why + f" ⇒ logroll: día {lr['days']} por precio (+{lr['gain']:.1f} P)"})
+                    continue
+            if prof:
+                accept, pscore = _profile_rule(prof, d, pm, lim, traj, slope, stalled, left, safe)
+            else:
+                accept, pscore = left <= safe or pm >= PARAMS["GOOD_SHARE"] * lim or slope < 0 or stalled, 0
+            if accept:
                 # urgencia primero (antes el deadline más próximo); entre iguales, antes el rival que menos cede
                 score = (1000 + 10 * max(0, 50 - left) if left <= safe + 1 else 500) + max(0, 10 - int(slope))
+                score = max(score, pscore)
                 out.append({"type": "duel_accept", "duel": d["duel"], "du": m, "score": score, "why": why + " ⇒ aceptar"})
                 continue
+        if prof and price is None and not traj:
+            c = _mute_offer(d, tick, left)
+            if c:
+                c["why"] = why + c["why"]
+                out.append(c)
+            continue
         if (price is None or (m is not None and m < 0)) and left <= PARAMS["SPEAK_AT"]:
             ladder = [PARAMS["ANCHOR"]] + [s_ for s_ in PARAMS["LADDER"] if s_ < PARAMS["ANCHOR"]]
             mine = (d.get("your_offer") or {}).get("price")
@@ -214,9 +240,151 @@ def duel_candidates(duels: list, tick: int) -> list:
                  "text": f"{ours} P y cerramos ahora.", "why": why + " ⇒ una oferta propia"}
             if days_duel:
                 c["days"] = _best_days(d)
-                c["text"] = f"{ours} P con entrega el día {c['days']} y cerramos ahora."
+                _maybe_logroll(d, c)
             out.append(c)
     return sorted(out, key=lambda c: -c["score"])
+
+
+# ---------------------------------------------------------------- perfiles de rival (opt-in: PARAMS["PROFILES"])
+# Duelos I (rivales = bots de la casa con perfil fijo, los mismos para todos los equipos):
+#   Plata cede 1-3 P/tick de forma constante; Verde mejora en ciclos (escalón + meseta); Oro y Luna dan un salto
+#   grande (16-26 P) y se plantan; Rojo EMPEORA con el tiempo (vendedor 133 → 166 con nosotros compradores);
+#   Noche a veces empeora; algunos rivales no hablan nunca. El nombre es un prior; un empeoramiento observado manda.
+RIVAL_PROFILES = {"plata": "cede", "verde": "ciclos", "oro": "salto", "luna": "salto", "rojo": "empeora",
+                  "noche": "mixto"}
+
+PROFILE_PARAMS = {
+    "CEDE_SHARE": 0.90,      # con rivales que ceden solo se adelanta la aceptación con un margen enorme
+    "JUMP": 12,              # mejora de un tick ≥ JUMP primas = «salto»; después se plantan
+    "MUTE_AFTER": 3,         # ticks de silencio total del rival antes de abrir nosotros
+    "MUTE_GAP": 3,           # ticks entre nuestras ofertas a un rival mudo
+    "MUTE_MAX": 3,           # ofertas como mucho a un mudo (cada una puede costar una ronda de decay)
+    "MUTE_STEP": 0.10,       # cada oferta nueva al mudo rebaja el ancla 10 puntos del límite (0,30 → 0,20 → 0,10)
+    "DUEL_TICKS": {0.06: 12, 0.08: 16, 0.10: 12},   # duración por decay de la sesión (práctica, Duelos II, III)
+    "RIVAL_DAY_SCALE": 1.0,  # prior: al rival le importa un día de distancia lo mismo que a nosotros de media
+    "LOGROLL_MIN_GAIN": 2.0, # ganancia mínima (P) de un logroll además de la ronda de decay que cuesta
+    "LOGROLL_SHARE": 0.5,    # parte del crecimiento estimado de la tarta que se ofrece al rival
+}
+
+
+def rival_profile(duel: dict) -> str:
+    """Perfil del rival por su alias («Rival Plata» → «cede»), «desconocido» si no figura."""
+    words = str(duel.get("rival") or "").lower().split()
+    return next((prof for key, prof in RIVAL_PROFILES.items() if key in words), "desconocido")
+
+
+def _profile_rule(prof, d, pm, lim, traj, slope, stalled, left, safe):
+    """(aceptar, prioridad) para un rival con perfil y oferta dentro de límite."""
+    urgent, worsened = left <= safe, slope < 0
+    if prof == "empeora":                                     # cada tick de espera cuesta: aceptar ya
+        return True, 2000
+    if prof == "mixto":                                       # aceptar en cuanto empeora un solo tick
+        steps = _steps(d, traj)
+        return urgent or worsened or stalled or (len(traj) >= 2 and steps[-1] < 0), 1500
+    if prof == "salto":                                       # tras el salto se planta: aceptar ya
+        jumped = any(x >= PROFILE_PARAMS["JUMP"] for x in _steps(d, traj))
+        return urgent or worsened or jumped, 1500
+    if prof in ("cede", "ciclos"):                            # mesetas de Verde no son plantones: esperar
+        return urgent or worsened or pm >= PROFILE_PARAMS["CEDE_SHARE"] * lim, 0
+    return urgent or pm >= PARAMS["GOOD_SHARE"] * lim or worsened or stalled, 0
+
+
+def _steps(d: dict, traj: list) -> list:
+    """Mejoras de precio por mensaje a nuestro favor (positivo = el rival cede)."""
+    sign = 1 if d["role"] == "buyer" else -1
+    return [sign * (a[1] - b[1]) for a, b in zip(traj, traj[1:])] or [0]
+
+
+def _our_messages(d: dict) -> list:
+    rival = d.get("rival")
+    return [m for m in d.get("messages") or [] if m.get("from") != rival and m.get("price") is not None]
+
+
+def _decay(d: dict) -> float:
+    return float(d.get("decay_per_round") or 0.08)
+
+
+def duel_length(d: dict) -> int:
+    return int(d.get("duel_ticks") or PROFILE_PARAMS["DUEL_TICKS"].get(round(_decay(d), 2), 16))
+
+
+def _mute_offer(d: dict, tick: int, left: int) -> Optional[dict]:
+    """Rival mudo: abrir pronto y rebajar el ancla por escalones (máximo MUTE_MAX ofertas)."""
+    start = d.get("start_tick", d["deadline_tick"] - duel_length(d))
+    ours = _our_messages(d)
+    if tick - start < PROFILE_PARAMS["MUTE_AFTER"] or len(ours) >= PROFILE_PARAMS["MUTE_MAX"] or left <= 1:
+        return None
+    if ours and tick - max(x["tick"] for x in ours) < PROFILE_PARAMS["MUTE_GAP"]:
+        return None
+    price = _own_price(d, max(0.0, PARAMS["ANCHOR"] - len(ours) * PROFILE_PARAMS["MUTE_STEP"]))
+    c = {"type": "duel_say", "duel": d["duel"], "price": price, "du": None, "score": 100,
+         "text": _say_text(price, None), "why": f" ⇒ rival mudo: oferta {len(ours) + 1}"}
+    if _is_days(d):
+        c["days"] = _best_days(d)
+        _maybe_logroll(d, c)
+    return c
+
+
+# ---------------------------------------------------------------- logrolling de días (opt-in: PARAMS["LOGROLL"])
+def rival_days(d: dict) -> Optional[int]:
+    """Día que prefiere el rival: el más repetido en sus ofertas (empate ⇒ el más reciente)."""
+    rival = d.get("rival")
+    seen = [_num(m.get("days")) for m in d.get("messages") or [] if m.get("from") == rival and m.get("price") is not None]
+    seen = [int(x) for x in seen if x is not None and x == int(x) and 0 <= x <= 10]
+    if not seen:
+        x = _num((d.get("rival_offer") or {}).get("days"))
+        return int(x) if x is not None and x == int(x) and 0 <= x <= 10 else None
+    return max(set(seen), key=lambda k: (seen.count(k), max(i for i, v in enumerate(seen) if v == k)))
+
+
+def logroll_offer(d: dict, price: Optional[int], day_ref: Optional[int]) -> Optional[dict]:
+    """Mejor (precio, día) para nosotros que deja al rival (estimado) igual o mejor que (price, day_ref).
+
+    El rival revela su día preferido en sus ofertas; su utilidad se estima como −s·|día − preferido|, con s la
+    pendiente media de la nuestra × RIVAL_DAY_SCALE. Conceder un día que a nosotros nos cuesta poco se cobra en precio
+    (y al revés). El precio NUNCA sale de nuestro límite. None si falta información (`days_table` no entiende el
+    formato de your_days_weight o el rival no ha revelado día) o si no hay mejora."""
+    u = days_table(d)
+    pref = rival_days(d)
+    if u is None or pref is None or price is None:
+        return None
+    ref = pref if day_ref is None else int(day_ref)
+    s = PROFILE_PARAMS["RIVAL_DAY_SCALE"] * sum(abs(u[k + 1] - u[k]) for k in range(10)) / 10
+    est = lambda k: -s * abs(k - pref)
+    lim = float(d["your_limit"])
+    buyer = d["role"] == "buyer"
+    base = (-price if buyer else price) + u[ref]
+    best = None
+    for k in range(11):
+        if k == ref:
+            continue
+        comp = est(ref) - est(k)                  # lo que pierde el rival al pasar de ref a k (negativo = gana)
+        joint = (u[k] - u[ref]) - comp            # lo que crece la tarta (estimado) al cambiar de día
+        if joint > 0:                             # cedemos parte de lo que crece: colchón si subestimamos al rival
+            comp += PROFILE_PARAMS["LOGROLL_SHARE"] * joint
+        # redondeo a favor del rival y 1 P más para que prefiera estrictamente nuestra oferta
+        p = math.ceil(price + comp) + 1 if buyer else math.floor(price - comp) - 1
+        if (buyer and p > lim) or (not buyer and p < lim):
+            continue
+        ours = (-p if buyer else p) + u[k]
+        if best is None or ours > best[0]:
+            best = (ours, p, k)
+    if best is None or best[0] - base <= 0:
+        return None
+    return {"price": best[1], "days": best[2], "gain": best[0] - base}
+
+
+def _maybe_logroll(d: dict, c: dict) -> None:
+    """Oferta propia en un duelo con días: con LOGROLL, mover día y precio si mejora; texto con el día."""
+    if PARAMS["LOGROLL"]:
+        lr = logroll_offer(d, c["price"], c["days"])
+        if lr:
+            c.update(price=lr["price"], days=lr["days"])
+    c["text"] = _say_text(c["price"], c["days"])
+
+
+def _say_text(price: int, days: Optional[int]) -> str:
+    return f"{price} P y cerramos ahora." if days is None else f"{price} P con entrega el día {days} y cerramos ahora."
 
 
 def replay(duels: list, params: Optional[dict] = None) -> dict:

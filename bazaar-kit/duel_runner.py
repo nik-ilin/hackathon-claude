@@ -2,7 +2,7 @@
 
     python3 duel_runner.py                 # análisis (por defecto): lee duelos y muestra lo que haría, no envía nada
     python3 duel_runner.py --execute       # juega los duelos vivos con la política de duels.py
-    python3 duel_runner.py --execute --days --ladder --reconcile --verify-accept   # recomendado para Duelos II
+    python3 duel_runner.py --execute --days --ladder --profiles --reconcile --verify-accept   # recomendado Duelos II
 
 Opt-in (por defecto desactivados, medidos con duel_sim.py):
     --days           jugar duelos de precio + días (sin él se omiten y puntúan 0)
@@ -10,6 +10,9 @@ Opt-in (por defecto desactivados, medidos con duel_sim.py):
     --probe          frente a un rival plantado, una contraoferta antes de aceptar (neutro en duel_sim.py)
     --reconcile      una escritura ambigua (timeout) NO detiene el ejecutor: se reconcilia leyendo el estado
     --verify-accept  releer el duelo justo antes de aceptar y no aceptar si la oferta rival cambió a peor
+    --profiles       reglas por bot de la casa (Rojo/Noche: aceptar pronto; Oro/Luna: tras el salto; Plata/Verde:
+                     esperar; mudos: ofertas propias pronto y escalonadas)
+    --logroll        con --days, conceder días que nos cuestan poco a cambio de precio (neutro en duel_sim.py)
 
 Ejecución exclusiva: comparte data/agent.lock con los agentes existentes. Detener el coordinador antes de
 usar --execute. El modo análisis no envía operaciones ni reajusta parámetros. El replay histórico es exploratorio:
@@ -113,12 +116,16 @@ def main() -> None:
     ap.add_argument("--probe", action="store_true", help="opt-in: una contraoferta a rivales plantados")
     ap.add_argument("--reconcile", action="store_true", help="opt-in: no detenerse ante una escritura ambigua")
     ap.add_argument("--verify-accept", action="store_true", help="opt-in: releer el duelo antes de aceptar")
+    ap.add_argument("--profiles", action="store_true", help="opt-in: reglas por perfil del bot de la casa")
+    ap.add_argument("--logroll", action="store_true", help="opt-in (con --days): días baratos a cambio de precio")
     a = ap.parse_args()
     dl.PARAMS["PLAY_DAYS"] = a.days
     if a.ladder:
         dl.PARAMS["LADDER"] = LADDER
     if a.probe:
         dl.PARAMS["PROBE"] = True
+    dl.PARAMS["PROFILES"] = a.profiles
+    dl.PARAMS["LOGROLL"] = a.logroll
     key = os.environ.get("BAZAAR_KEY", "")
     if not key or key == "tk-xxxx-xxxx":
         raise SystemExit("Falta BAZAAR_KEY (carga .env o exporta la variable)")

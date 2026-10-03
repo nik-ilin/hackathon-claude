@@ -80,6 +80,11 @@ def decision_facts(duel: dict, tick: int, same_deadline: int = 1) -> dict:
                  all(p == trajectory[-1][1] for _, p in trajectory[-n:]),
                  safe_ticks=duels.PARAMS["SAFE_TICKS"] + max(0, same_deadline - 1),
                  speak_at_ticks=duels.PARAMS["SPEAK_AT"])
+    if duels.PARAMS.get("PROFILES"):
+        facts["rival_profile"] = duels.rival_profile(duel)
+    if "days" in facts["issues"] and duels.PARAMS.get("PLAY_DAYS"):
+        facts.update(days_weight_format="reconocido" if duels.days_table(duel) else "desconocido_solo_precio",
+                     rival_day=duels.rival_days(duel), days_meaning=duel.get("days_meaning"))
     return facts
 
 

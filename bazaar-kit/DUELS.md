@@ -73,3 +73,27 @@ python3 duel_runner.py --execute --days --ladder --reconcile --verify-accept
 - Estas protecciones coordinan procesos de este ordenador; no procesos en otros equipos con la misma clave.
 
 Registro de decisiones: `data/duels_log.jsonl` · parámetros experimentales offline: `data/duel_params.json`.
+
+## Perfiles de bots de la casa (`--profiles`) y logrolling de días (`--logroll`) — OPT-IN
+
+Conviven con `--days`, `--ladder`, `--probe`, `--reconcile` y `--verify-accept`; sin ellos la política no cambia.
+
+| Flag | Qué hace |
+|---|---|
+| `--profiles` | Perfil por alias (Duelos I): **Rojo** empeora ⇒ aceptar en cuanto la oferta entra en límite; **Noche** ⇒ al primer empeoramiento; **Oro/Luna** ⇒ tras el salto (≥ 12 P en un tick); **Plata/Verde** ⇒ sus mesetas no son plantón, esperar al cierre escalonado. **Mudo** (cualquier alias, 3 ticks sin hablar) ⇒ oferta propia pronto, 0,30 → 0,20 → 0,10 cada 3 ticks (máx. 3; sustituye a la escalera de `--ladder` para mudos). Alias desconocido ⇒ política original. |
+| `--logroll` | Con `--days`: infiere el día del rival (el más repetido en sus ofertas), estima su utilidad como −s·distancia y concede días que nos cuestan poco a cambio de precio (o al revés), solo si la ganancia supera 2 P + una ronda de decay. Usa `days_table` (formato desconocido ⇒ solo precio). El precio **nunca** sale del límite. |
+
+Simulador: `python3 duel_sim.py --house --days --session II` (bots con alias y comportamiento de Duelos I, 20 % mudos;
+captura media de la tarta, 0 tratos fuera de límite en todas las variantes):
+
+| Variante | II precio + días | II solo precio | III precio + días |
+|---|---|---|---|
+| por defecto (`--days`) | 40 % | 39 % | 36 % |
+| `--ladder` | 43 % | 43 % | 40 % |
+| `--profiles` / `--ladder --profiles` | **47 %** | **48 %** | **43 %** |
+| `--ladder --profiles --logroll` | 47 % | 48 % | 43 % |
+
+Robustez: con los alias barajados (la casa reasigna perfiles) `--ladder --profiles` sigue ≥ `--ladder` (43–46 % frente
+a 42–43 %, 3 semillas); con los rivales genéricos de #7, 41 % → 45 % (solo cambian los mudos). El logroll es neutro: con
+días lineales («urgencia de la fecha de entrega») y el rival proponiendo su día, apenas hay tarta extra que compense una
+ronda de decay.

@@ -3,6 +3,7 @@
     python3 duel_sim.py                    # tabla: captura por tipo de rival y variante de la política
     python3 duel_sim.py --n 400 --seed 7   # más oleadas / otra semilla
     python3 duel_sim.py --days             # duelos de precio + días (Duelos II)
+    python3 duel_sim.py --house --days --session II   # bots de la casa con nombre (Duelos I) y --profiles/--logroll
 
 Modelo (aproximación, no el servidor):
   * Oleadas de WAVE duelos simultáneos con el mismo deadline (Duelos II: 6) y la regla real de UNA aceptación por
@@ -12,6 +13,10 @@ Modelo (aproximación, no el servidor):
     (en la práctica `rounds` siguió en 0 con un rival que hablaba solo). Sin trato, 0; fuera de límite, negativo.
   * Tipos de rival (`RIVALS`): cedente, firme, mudo, espejo, impaciente. Los parámetros son supuestos razonables
     inspirados en los 24 duelos de práctica, no mediciones del torneo.
+  * `--house`: bots de la casa con alias y el comportamiento medido en Duelos I (`HOUSE`): Plata cede 1-3 P/tick,
+    Verde en ciclos, Oro/Luna saltan 16-26 P y se plantan, Rojo empeora 2-5 P/tick, Noche a veces empeora, Sol
+    desconocido; un 20 % de los duelos con rival mudo (cualquier alias). Los bots proponen su día preferido y aceptan
+    nuestra oferta si les vale al menos lo que su oferta vigente (SUPOSICIÓN).
 """
 from __future__ import annotations
 
@@ -29,6 +34,7 @@ DECAY = 0.08
 class Rival:
     """Contraparte sintética. `lim` es su límite (coste si vende, valor si compra). `good(p)` = mejor para él."""
     name = "base"
+    alias = "R"
 
     def __init__(self, role: str, lim: float, rng: random.Random, days_w: Optional[list] = None):
         self.role, self.lim, self.rng, self.days_w = role, lim, rng, days_w
@@ -130,6 +136,111 @@ class Impaciente(Rival):
 RIVALS = {c.name: c for c in (Cedente, Firme, Mudo, Espejo, Impaciente)}
 
 
+class House(Rival):
+    """Bot de la casa: sigue un camino de precios fijado al nacer (en primas absolutas desde su apertura) y acepta una
+    oferta nuestra que le valga al menos lo que su oferta vigente."""
+    name = "casa"
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.open = self.at(self.rng.uniform(0.35, 0.60))
+        self.moves = self.path()
+
+    def path(self) -> list:             # mejora acumulada A NUESTRO FAVOR (P) en cada tick; negativa = empeora
+        raise NotImplementedError
+
+    def act(self, t, ours, ours_moved):
+        p = self.open - self.sgn() * self.moves[min(t, len(self.moves) - 1)]
+        floor = self.at(0.02)
+        self.offer = int(round(max(p, floor) if self.sgn() > 0 else min(p, floor)))
+        return self.offer
+
+    def accepts(self, t, price, days):
+        if self.offer is None:
+            return self.surplus(price, days) >= self.lim * 0.10
+        return self.surplus(price, days) >= self.surplus(self.offer, self.days())
+
+
+class Plata(House):
+    name, alias = "plata", "Rival Plata"
+
+    def path(self):
+        c = self.rng.uniform(1, 3)
+        return [c * t for t in range(TICKS)]
+
+
+class Verde(House):
+    name, alias = "verde", "Rival Verde"
+
+    def path(self):
+        step, length = self.rng.uniform(5, 10), self.rng.choice([3, 4])
+        return [step * (t // length) for t in range(TICKS)]
+
+
+class Oro(House):
+    name, alias = "oro", "Rival Oro"
+
+    def path(self):
+        j, jump = self.rng.choice([1, 2, 3]), self.rng.uniform(16, 26)
+        return [jump if t >= j else 0.0 for t in range(TICKS)]
+
+
+class Luna(Oro):
+    name, alias = "luna", "Rival Luna"
+
+
+class Rojo(House):
+    """Abre bien (+8…20 %) y empeora 2-5 P por tick (Duelos I: vendedor 133 → 166)."""
+    name, alias = "rojo", "Rival Rojo"
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.open = self.at(self.rng.uniform(0.08, 0.20))
+
+    def path(self):
+        w = self.rng.uniform(2, 5)
+        return [-w * t for t in range(TICKS)]
+
+
+class Noche(House):
+    """A veces empeora (como un Rojo suave) y a veces cede con pausas."""
+    name, alias = "noche", "Rival Noche"
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        if self.worse:
+            self.open = self.at(self.rng.uniform(0.10, 0.25))
+
+    def path(self):
+        self.worse = self.rng.random() < 0.5
+        if self.worse:
+            w = self.rng.uniform(1, 3)
+            return [-w * t for t in range(TICKS)]
+        c = self.rng.uniform(1.5, 4)
+        return [c * (t // 2) for t in range(TICKS)]
+
+
+class Sol(House):
+    """Perfil desconocido: cede constante o en ciclos."""
+    name, alias = "sol", "Rival Sol"
+
+    def path(self):
+        return (Plata.path if self.rng.random() < 0.5 else Verde.path)(self)
+
+
+class HouseMute(Mudo):
+    """Bot mudo con alias de la casa (en Duelos I había rivales que no hablaron nunca)."""
+    name = "mudo"
+
+    def __init__(self, *a, alias="Rival Sol", **k):
+        super().__init__(*a, **k)
+        self.alias = alias
+
+
+HOUSE = {c.name: c for c in (Plata, Verde, Oro, Luna, Rojo, Noche, Sol)}
+SESSIONS = {"II": {"ticks": 16, "decay": 0.08, "wave": 6}, "III": {"ticks": 12, "decay": 0.10, "wave": 4}}
+
+
 def _days_weights(rng: random.Random, scale: float) -> list:
     """Utilidad por día: preferencia lineal hacia pronto o tarde, con intensidad aleatoria."""
     slope = rng.choice([-1, 1]) * rng.uniform(0.0, 0.03) * scale
@@ -137,7 +248,8 @@ def _days_weights(rng: random.Random, scale: float) -> list:
     return [round(base + slope * d, 2) for d in range(11)]
 
 
-def play_wave(kinds: list, rng: random.Random, params: Optional[dict] = None, days: bool = False) -> list:
+def play_wave(kinds: list, rng: random.Random, params: Optional[dict] = None, days: bool = False,
+              house: bool = False) -> list:
     """Juega una oleada de duelos simultáneos (uno por tipo de `kinds`). Devuelve [{kind, capture, deal, outside}]."""
     saved = dict(dl.PARAMS)
     dl.PARAMS.update(params or {})
@@ -151,10 +263,13 @@ def play_wave(kinds: list, rng: random.Random, params: Optional[dict] = None, da
             rrole = "seller" if role == "buyer" else "buyer"
             wd = _days_weights(rng, value - cost) if days else None
             rw = _days_weights(rng, value - cost) if days else None
-            rivals.append(RIVALS[kind](rrole, theirs, rng, rw))
+            if kind == "mudo" and house:
+                rivals.append(HouseMute(rrole, theirs, rng, rw, alias=rng.choice([c.alias for c in HOUSE.values()])))
+            else:
+                rivals.append((HOUSE if house else RIVALS)[kind](rrole, theirs, rng, rw))
             joint = max(wd[k] + rw[k] for k in range(11)) if days else 0.0
-            duels.append({"duel": i, "status": "live", "role": role, "your_limit": int(round(ours)), "rival": "R",
-                          "deadline_tick": TICKS, "issues": ["price", "days"] if days else ["price"],
+            duels.append({"duel": i, "status": "live", "role": role, "your_limit": int(round(ours)), "rival": rivals[-1].alias,
+                          "deadline_tick": TICKS, "decay_per_round": DECAY, "issues": ["price", "days"] if days else ["price"],
                           "your_days_weight": wd, "rival_offer": None, "your_offer": None, "messages": [],
                           "rounds": 0, "_pie": value - cost + joint, "_spoke": [False, False], "_last_ours": None})
         done = {}
@@ -170,7 +285,7 @@ def play_wave(kinds: list, rng: random.Random, params: Optional[dict] = None, da
                 if p is not None:
                     rd = r.days()
                     d["rival_offer"] = {"id": len(d["messages"]), "price": p, "days": rd, "tick": t}
-                    d["messages"].append({"tick": t, "from": "R", "price": p, "days": rd})
+                    d["messages"].append({"tick": t, "from": r.alias, "price": p, "days": rd})
                     _spoke(d, 1)
             # 2) nuestra política: una aceptación por tick como mucho
             live = [d for d in duels if d["duel"] not in done]
@@ -221,20 +336,36 @@ VARIANTS = {
 }
 
 
+HOUSE_VARIANTS = {
+    "por defecto": {},
+    "--ladder": {"LADDER": (0.20, 0.12, 0.06)},
+    "--profiles": {"PROFILES": True},
+    "--ladder --profiles": {"LADDER": (0.20, 0.12, 0.06), "PROFILES": True},
+    "--profiles --logroll": {"PROFILES": True, "LOGROLL": True},
+    "--ladder --profiles --logroll": {"LADDER": (0.20, 0.12, 0.06), "PROFILES": True, "LOGROLL": True},
+}
+
+
 def simulate(n: int = 200, seed: int = 1, days: bool = False, variants: Optional[dict] = None,
-             mix: Optional[list] = None) -> dict:
+             mix: Optional[list] = None, house: bool = False, mute_share: float = 0.2) -> dict:
     """{variante: {tipo: {capture, deals, outside, n}}} con oleadas de WAVE duelos de tipos aleatorios.
-    Misma semilla por variante: todas juegan exactamente los mismos duelos."""
-    variants = variants or (dict(VARIANTS, **{"sin --days (actual)": {"PLAY_DAYS": False}}) if days else VARIANTS)
-    mix = mix or list(RIVALS)
+    Misma semilla por variante: todas juegan exactamente los mismos duelos. `house`: bots de la casa con alias
+    (`HOUSE`) más un `mute_share` de mudos."""
+    base = HOUSE_VARIANTS if house else VARIANTS
+    variants = variants or (dict(base, **{"sin --days (actual)": {"PLAY_DAYS": False}}) if days else base)
+    mix = mix or (list(HOUSE) + ["mudo"] if house else list(RIVALS))
     out = {}
     for vname, params in variants.items():
         rng = random.Random(seed)
         agg = {k: {"capture": 0.0, "deals": 0, "outside": 0, "n": 0} for k in mix + ["TOTAL"]}
         for _ in range(n):
-            kinds = [rng.choice(mix) for _ in range(WAVE)]
+            if house:
+                kinds = ["mudo" if rng.random() < mute_share else rng.choice([k for k in mix if k != "mudo"])
+                         for _ in range(WAVE)]
+            else:
+                kinds = [rng.choice(mix) for _ in range(WAVE)]
             p = {"PLAY_DAYS": True, **params} if days else params
-            for r in play_wave(kinds, random.Random(rng.random()), p, days):
+            for r in play_wave(kinds, random.Random(rng.random()), p, days, house):
                 for k in (r["kind"], "TOTAL"):
                     a = agg[k]
                     a["n"] += 1
@@ -261,10 +392,22 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=200, help="oleadas de %d duelos" % WAVE)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--days", action="store_true", help="duelos de precio + días")
+    ap.add_argument("--house", action="store_true", help="bots de la casa con alias (perfiles de Duelos I)")
+    ap.add_argument("--session", choices=sorted(SESSIONS), help="ticks, decay y simultáneos de Duelos II o III")
     a = ap.parse_args()
+    if a.session:
+        configure(a.session)
     print(f"captura media de la tarta (y % de duelos con trato) · {a.n} oleadas × {WAVE} duelos · "
-          f"{'precio + días' if a.days else 'solo precio'} · semilla {a.seed}")
-    print(table(simulate(a.n, a.seed, a.days)))
+          f"{TICKS} ticks · decay {DECAY} · {'precio + días' if a.days else 'solo precio'} · "
+          f"{'bots de la casa' if a.house else 'rivales genéricos'} · semilla {a.seed}")
+    print(table(simulate(a.n, a.seed, a.days, house=a.house)))
+
+
+def configure(session: str) -> None:
+    """Fija TICKS, DECAY y WAVE de la sesión (II: 16 ticks, 0,08, 6 a la vez; III: 12 ticks, 0,10, 4 a la vez)."""
+    global TICKS, DECAY, WAVE
+    cfg = SESSIONS[session]
+    TICKS, DECAY, WAVE = cfg["ticks"], cfg["decay"], cfg["wave"]
 
 
 if __name__ == "__main__":
