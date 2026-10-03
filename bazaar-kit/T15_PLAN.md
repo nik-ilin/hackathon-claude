@@ -34,3 +34,23 @@ python3 flagger.py                            # 5. dry run; --execute solo si lo
 Negociación 30 = duelos + escalera (mejores 3 tratos por dealer y nivel, niveles altos pesan más) + valor ganado
 en tratos con **otros equipos** a valores privados. Las compras a dealers solo puntúan por la escalera; el valor
 privado de RET-10 cuenta como protección de página y para futuros tratos.
+
+## Noticias y nuevos niveles
+
+Todo es solo lectura o dry run salvo `--execute`; sin flags nada cambia.
+
+```bash
+python3 news_watch.py --calibrate --db ../../intel/market.db   # fiabilidad por fuente con datos pasados (offline)
+python3 news_watch.py --json noticias.json                     # en vivo: noticias clasificadas + ventas sugeridas
+./run.sh t15 --news-sell --news-db ../../intel/market.db       # coordinador: abre venta al vendedor con demanda viva
+python3 new_levels.py                                          # taller: 3 sobrantes de UNA rareza + EV frente a pérdida
+python3 new_levels.py --workshop --workshop-margin 2           # dry run del envío al taller (solo si EV > pérdida + 2)
+```
+
+| Hallazgo (market.db hasta t746) | Consecuencia |
+|---|---|
+| Radio t403 «El Chato busca raras de Malasaña»: su menú ganó `buys rare ["MAL"]` (visto t467/t508, sin él en t265/t590) | Las noticias ciertas dejan huella en `/api/dealers`: `--news-sell` actúa si la fila está o si la fuente es fiable y estamos en su ventana. |
+| Tablón t499 «el Chato regala una legendaria»: ningún `gift.given` suyo | El Tablón es rumor (fiabilidad 0,33): nunca actúa sin confirmación en el menú. |
+| Boletín t643 «sobres de la Abuela en una hora»: pendiente hasta t763 | Revisar `sobres sin abrir` en `new_levels.py`. |
+| «One hour» = 120 ticks (30 s/tick; el domingo 15 s → 240) | La ventana se calcula con `tick_seconds` del reloj. |
+| Taller: t05, t12, t18, t16, t08, t10 ya convierten comunes en poco comunes | Solo si la media del valor privado de las poco comunes publicadas supera lo que perdemos + margen. |

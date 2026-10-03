@@ -75,6 +75,70 @@ class Workshop(unittest.TestCase):
         self.assertEqual(r["body"], {"cards": [5]})
 
 
+def rcard(set_, i, rarity, book):
+    return {"id": f"{set_}-{i:02d}", "rarity": rarity, "book": book, "page": i <= 3}
+
+
+# Catálogo con rarezas y book: LAT publicado (comunes 1-3 de 2 P, poco comunes 4-5 de 20 P y 40 P, rara 6 oculta),
+# RET sin publicar (su poco común de 500 P no puede salir del taller).
+RCAT = {"values": {"copy_marginals": [1.0, 0.25, 0.1], "page_bonus": 0.25},
+        "sets": [{"id": "LAT", "released": True,
+                  "cards": [rcard("LAT", 1, "common", 2), rcard("LAT", 2, "common", 2), rcard("LAT", 3, "common", 2),
+                            rcard("LAT", 4, "uncommon", 20), rcard("LAT", 5, "uncommon", 40),
+                            dict(rcard("LAT", 6, "rare", 90), hidden=True)]},
+                 {"id": "RET", "released": False, "cards": [rcard("RET", 4, "uncommon", 500)]}]}
+
+
+def rme(extra=()):
+    a = lambda i, ref, r, v: {"id": i, "kind": "card", "ref": ref, "rarity": r, "your_value": v}
+    return {"id": "t15", "affinity": {"LAT": 1.0, "RET": 1.0}, "assets": [
+        a(1, "LAT-01", "common", 2), a(2, "LAT-01", "common", 0.5), a(3, "LAT-01", "common", 0.5),
+        a(4, "LAT-02", "common", 2), a(5, "LAT-02", "common", 0.5),
+        a(10, "LAT-04", "uncommon", 20), a(11, "LAT-04", "uncommon", 5)] + list(extra)}
+
+
+class WorkshopRarity(unittest.TestCase):
+    def test_spares_never_mix_rarities_and_keep_one_copy(self):
+        sp = nl.workshop_spares(rme(), RCAT)
+        self.assertEqual(sorted(s["id"] for s in sp), [2, 3, 5])     # tres comunes; la poco común 11 no se mezcla
+        self.assertEqual({s["rarity"] for s in sp}, {"common"})
+        pool = nl.spare_pool(rme(), RCAT)
+        self.assertEqual([s["id"] for s in pool["uncommon"]], [11])  # 10 se queda (menor id)
+        self.assertNotIn(1, {s["id"] for v in pool.values() for s in v})
+        self.assertNotIn(4, {s["id"] for v in pool.values() for s in v})
+
+    def test_ev_uses_released_next_rarity_only(self):
+        plan = nl.workshop_plan(rme(), RCAT)
+        self.assertEqual((plan["rarity"], plan["to"]), ("common", "uncommon"))
+        # LAT-04 ya la tenemos dos veces (3.ª copia: 20 × 0,1 = 2 P), LAT-05 no (40 P); RET-04 no está publicada.
+        self.assertEqual(plan["pool"], 2)
+        self.assertEqual(plan["ev"], 21.0)
+        # Perdemos 2.ª y 3.ª copia de LAT-01 y 2.ª de LAT-02: 0,5 + 0,2 + 0,5 = 1,2 P (la página sigue completa).
+        self.assertEqual(plan["loss"], 1.2)
+        self.assertTrue(plan["recommend"])
+
+    def test_margin_blocks_low_ev(self):
+        self.assertFalse(nl.workshop_plan(rme(), RCAT, margin=30)["recommend"])
+        cheap = nl.workshop_plan(rme(), RCAT, values={"LAT-04": 1, "LAT-05": 2})
+        self.assertEqual(cheap["ev"], 1.5)
+        self.assertFalse(cheap["recommend"])                         # 1,5 < 1,2 + 2
+
+    def test_no_next_rarity_values_means_no_send(self):
+        plan = nl.workshop_plan(rme(), CATALOG)                      # catálogo sin book ni rarezas publicadas
+        self.assertFalse(plan["recommend"])
+
+    def test_committed_copies_reduce_pool_below_three(self):
+        offers = [{"maker": "t15", "status": "open", "give": {"assets": [{"id": 5}]}}]
+        plan = nl.workshop_plan(rme(), RCAT, offers)
+        self.assertEqual(plan["spares"], [])                         # 2 comunes y 1 poco común: no hay tres iguales
+        self.assertFalse(plan["recommend"])
+
+    def test_report_shows_ev_line(self):
+        txt = "\n".join(nl.report(ACTIVE, DEALERS, rme(), RCAT))
+        self.assertIn("common → uncommon", txt)
+        self.assertIn("RECOMENDADO", txt)
+
+
 class Packs(unittest.TestCase):
     def test_list_and_dry_run_open(self):
         packs = nl.unopened_packs(me())

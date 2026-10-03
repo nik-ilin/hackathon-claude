@@ -7,17 +7,18 @@ rasgos con un plan:
             negociar como con Chato pero comprobar SIEMPRE `flagger.offer_matches_words` antes de aceptar y pasar
             `flagger.py` (dry run; `--execute` para marcar) sobre sus hilos.
   taller    «Three spares. One surprise.»: se entregan tres cartas sobrantes a cambio de una sorpresa. Elegimos tres
-            copias SOBRANTES (nunca la única copia de una carta ni la que completa página: page_guard.tradeable_assets)
-            de menor valor privado. Mientras el endpoint no se conozca, `workshop_request()` devuelve None y no se
-            envía nada: al activarse, `how` trae la ruta («POST /api/...») y la función la extrae. Si el formato del
-            cuerpo no es `{"assets": [...]}`, se ajusta SOLO esa función.
+            copias SOBRANTES de UNA MISMA rareza (nunca la única copia de una carta ni la que completa página:
+            page_guard.tradeable_assets) de menor valor privado, y solo se envían si el valor esperado (media de
+            value_next de las cartas publicadas de la rareza siguiente) supera la pérdida + `--workshop-margin`.
+            La ruta sale del `how` (`POST /api/taller {"assets": [a, b, c]}` desde t706); sin ruta no se envía nada.
   sobres    lista los sobres propios sin abrir (regalos de la Abuela, sobre_plata...) y, con `--open-packs`, los abre
             (dry run salvo `--execute`).
 
     python3 new_levels.py                      # una pasada: estado de los niveles + plan + spares + sobres
     python3 new_levels.py --watch 60           # repite cada 60 s y avisa cuando algo pasa a activo
     python3 new_levels.py --open-packs         # dry run de abrir los sobres sin abrir
-    python3 new_levels.py --workshop           # dry run del envío al taller (si `how` ya trae la ruta)
+    python3 new_levels.py --workshop           # dry run del envío al taller (si `how` ya trae la ruta y EV compensa)
+    python3 new_levels.py --workshop --workshop-margin 5   # exigir más excedente esperado
     ... --execute                              # solo entonces escribe en el servidor
 """
 from __future__ import annotations
@@ -32,6 +33,7 @@ from collections import Counter
 from typing import Optional
 
 import page_guard as pg
+import trading as tr
 
 DEFAULT_URL = os.environ.get("BAZAAR_URL", "https://bazaar.causaprima.ai")
 WATCHED = ("picaros", "taller")
@@ -97,16 +99,35 @@ def plan_picaros(dealer: Optional[dict]) -> list:
     return out
 
 
-# ------------------------------------------------------------------ taller: tres spares seguros
+# ------------------------------------------------------------------ taller: tres spares de UNA rareza
 
-def workshop_spares(me: dict, catalog: dict, my_offers: list = (), n: int = SPARES) -> list:
-    """Hasta `n` copias sobrantes [{id, ref, your_value}] de menor valor privado. Por referencia se conserva siempre
-    una copia (la de menor id) y nunca se toca la protegida por una página completa ni una ya comprometida."""
+RARITIES = ("common", "uncommon", "rare", "epic", "legendary")
+WORKSHOP_MARGIN = 2.0
+
+
+def next_rarity(rarity: Optional[str]) -> Optional[str]:
+    return RARITIES[RARITIES.index(rarity) + 1] if rarity in RARITIES[:-1] else None
+
+
+def _rarity_of(a: dict, catalog: dict) -> Optional[str]:
+    if a.get("rarity"):
+        return a["rarity"]
+    for s in catalog.get("sets", []):
+        for c in s.get("cards", []):
+            if c.get("id") == a["ref"]:
+                return c.get("rarity")
+    return None
+
+
+def spare_pool(me: dict, catalog: dict, my_offers: list = ()) -> dict:
+    """rareza -> copias sobrantes [{id, ref, your_value, rarity}] de menor a mayor valor privado. Por referencia se
+    conserva siempre una copia (la de menor id no comprometida) y nunca se toca la protegida por una página completa
+    (page_guard) ni una ya comprometida en una oferta abierta."""
     assets = [a for a in me.get("assets") or [] if a.get("kind") == "card"]
     counts = Counter(a["ref"] for a in assets)
     committed = pg.committed_assets(list(my_offers or []), me.get("id"))
     by_id = {a["id"]: a for a in assets}
-    pool = []
+    pool: dict = {}
     for ref, c in counts.items():
         if c < 2:
             continue
@@ -115,9 +136,79 @@ def workshop_spares(me: dict, catalog: dict, my_offers: list = (), n: int = SPAR
         if len(staying) < 2:
             continue
         keep = staying[0]                                  # la copia que siempre se queda
-        pool += [by_id[i] for i in free if i != keep]
-    pool.sort(key=lambda a: (a.get("your_value") or 0, a["id"]))
-    return [{"id": a["id"], "ref": a["ref"], "your_value": a.get("your_value")} for a in pool[:n]]
+        for i in free:
+            if i != keep:
+                a = by_id[i]
+                pool.setdefault(_rarity_of(a, catalog), []).append(
+                    {"id": a["id"], "ref": a["ref"], "your_value": a.get("your_value"), "rarity": _rarity_of(a, catalog)})
+    for v in pool.values():
+        v.sort(key=lambda a: (a.get("your_value") or 0, a["id"]))
+    return pool
+
+
+def workshop_ev(me: dict, catalog: dict, spares: list, values: Optional[dict] = None) -> dict:
+    """Valor esperado del taller con esas copias: media del valor privado de UNA copia más (value_next, con bono de
+    página si la completa) de cada carta publicada (set released, no oculta) de la rareza siguiente, tras entregar las
+    tres; frente al valor privado que perdemos. Supone sorteo uniforme entre esas cartas («the pull is luck»).
+    `values` (ref -> value_next, p. ej. de /api/me/value o my_values) sustituye al modelo del catálogo."""
+    rarity = spares[0].get("rarity") if spares else None
+    to = next_rarity(rarity)
+    out = {"rarity": rarity, "to": to, "loss": None, "ev": None, "pool": 0, "gain": None}
+    val = tr.Valuation(catalog, me.get("affinity") or {})
+    counts = tr.counts_of(me.get("assets") or [])
+    removed = Counter(s["ref"] for s in spares)
+    if any(val.unit(r) is None for r in removed):
+        out["loss"] = round(sum(s.get("your_value") or 0 for s in spares), 2)  # sin book: valor del servidor
+    else:
+        out["loss"] = round(-val.delta(counts, Counter(), removed)[0], 2)
+    after = +(counts - removed)
+    pool = [r for r, c in val.cards.items() if c.get("released") and not c.get("hidden") and c.get("rarity") == to]
+    vals = []
+    for r in pool:
+        if values and r in values:
+            vals.append(float(values[r]))
+        elif val.unit(r) is not None:
+            vals.append(val.delta(after, Counter({r: 1}), Counter())[0])
+    if vals:
+        out.update(pool=len(vals), ev=round(sum(vals) / len(vals), 2))
+        out["gain"] = round(out["ev"] - out["loss"], 2)
+    return out
+
+
+def workshop_plan(me: dict, catalog: dict, my_offers: list = (), n: int = SPARES, margin: float = WORKSHOP_MARGIN,
+                  values: Optional[dict] = None) -> dict:
+    """Mejor envío al taller: por rareza, las `n` sobrantes más baratas; se elige la de mayor EV − pérdida.
+    recommend = EV > pérdida + margen (y hay `n` copias de UNA misma rareza)."""
+    best = None
+    for rarity, spares in spare_pool(me, catalog, my_offers).items():
+        if len(spares) < n:
+            continue
+        ev = workshop_ev(me, catalog, spares[:n], values)
+        cand = dict(ev, spares=spares[:n])
+        key = (cand["gain"] is not None, cand["gain"] if cand["gain"] is not None else -cand["loss"])
+        if best is None or key > best[0]:
+            best = (key, cand)
+    if best is None:
+        return {"spares": [], "recommend": False, "margin": margin,
+                "why": f"no hay {n} sobrantes seguras de una misma rareza"}
+    plan = dict(best[1], margin=margin)
+    plan["recommend"] = plan["ev"] is not None and plan["ev"] > plan["loss"] + margin
+    plan["why"] = (f"EV {plan['ev']} P ({plan['pool']} cartas {plan['to']}) frente a pérdida {plan['loss']} P + margen "
+                   f"{margin}" if plan["ev"] is not None else f"sin valores para la rareza {plan['to']}: no se envía")
+    return plan
+
+
+def workshop_spares(me: dict, catalog: dict, my_offers: list = (), n: int = SPARES) -> list:
+    """Hasta `n` copias sobrantes de UNA misma rareza [{id, ref, your_value, rarity}], de menor valor privado: la
+    rareza del mejor plan (EV − pérdida) si alguna llega a `n`; si no, la rareza con más sobrantes."""
+    plan = workshop_plan(me, catalog, my_offers, n)
+    if plan["spares"]:
+        return plan["spares"]
+    pool = spare_pool(me, catalog, my_offers)
+    if not pool:
+        return []
+    best = max(pool.values(), key=lambda v: (len(v), -sum(a.get("your_value") or 0 for a in v)))
+    return best[:n]
 
 
 _ROUTE_RE = re.compile(r"\b(POST)\s+(/api/[A-Za-z0-9_\-/{}]+)")
@@ -160,7 +251,7 @@ def open_packs(api, packs: list, execute: bool) -> list:
 # ------------------------------------------------------------------ una pasada
 
 def report(levels: dict, dealers: dict, me: Optional[dict] = None, catalog: Optional[dict] = None,
-           my_offers: list = ()) -> list:
+           my_offers: list = (), margin: float = WORKSHOP_MARGIN) -> list:
     lines = []
     for lid in WATCHED:
         lv, dl = level_of(levels, lid), dealer_of(dealers, lid)
@@ -168,11 +259,15 @@ def report(levels: dict, dealers: dict, me: Optional[dict] = None, catalog: Opti
         if lid == "picaros" and is_active(lv, dl):
             lines += plan_picaros(dl)
         if lid == "taller" and me is not None and catalog is not None:
-            spares = workshop_spares(me, catalog, my_offers)
-            lines.append(f"  spares para el taller (menor valor primero): "
+            plan = workshop_plan(me, catalog, my_offers, margin=margin)
+            spares = plan["spares"] or workshop_spares(me, catalog, my_offers)
+            lines.append(f"  spares para el taller ({plan.get('rarity') or 'una rareza'} → {plan.get('to') or '?'}, "
+                         f"menor valor primero): "
                          f"{[(s['id'], s['ref'], s['your_value']) for s in spares] or 'ninguno seguro'}")
+            lines.append(f"  valor esperado: {'RECOMENDADO' if plan['recommend'] else 'NO recomendado'} · {plan['why']}")
             req = workshop_request((lv or {}).get("how"), [s["id"] for s in spares])
-            lines.append(f"  envío: {req['method']} {req['path']} {json.dumps(req['body'])}" if req else
+            lines.append(f"  envío: {req['method']} {req['path']} {json.dumps(req['body'])}" if req and spares else
+                         "  envío: nada (sin sobrantes seguras de una rareza)" if req else
                          "  envío: pendiente (el taller aún no publica su ruta en `how`)")
     if me is not None:
         packs = unopened_packs(me)
@@ -185,6 +280,8 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--watch", type=float, default=0, help="segundos entre sondeos (0 = una pasada)")
     ap.add_argument("--open-packs", action="store_true", help="abrir los sobres sin abrir (dry run sin --execute)")
     ap.add_argument("--workshop", action="store_true", help="enviar los spares al taller (dry run sin --execute)")
+    ap.add_argument("--workshop-margin", type=float, default=WORKSHOP_MARGIN,
+                    help="solo se envía al taller si EV > pérdida + margen (P; por defecto 2)")
     ap.add_argument("--execute", action="store_true", help="escribe en el servidor (por defecto, nunca)")
     a = ap.parse_args(argv)
 
@@ -204,14 +301,17 @@ def main(argv: Optional[list] = None) -> int:
             if act and not seen.get(lid):
                 print(f"*** {lid} ACTIVO ***")
             seen[lid] = act
-        print("\n".join(report(levels, dealers, me, catalog, offers)))
+        print("\n".join(report(levels, dealers, me, catalog, offers, a.workshop_margin)))
         if me is not None and a.open_packs:
             open_packs(api, unopened_packs(me), a.execute)
         if me is not None and a.workshop:
-            spares = workshop_spares(me, catalog, offers)
+            plan = workshop_plan(me, catalog, offers, margin=a.workshop_margin)
+            spares = plan["spares"]
             req = workshop_request((level_of(levels, "taller") or {}).get("how"), [s["id"] for s in spares])
             if not req or len(spares) < SPARES:
-                print("taller: nada que enviar (ruta desconocida o menos de tres spares seguros)")
+                print("taller: nada que enviar (ruta desconocida o menos de tres spares seguros de una misma rareza)")
+            elif not plan["recommend"]:
+                print(f"taller: no compensa · {plan['why']}")
             elif a.execute:
                 print("taller:", api.call(req["method"], req["path"], req["body"]))
             else:
