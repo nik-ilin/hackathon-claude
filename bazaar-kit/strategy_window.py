@@ -31,7 +31,8 @@ BASE = ["./run.sh", "coord", "--execute", "--max-spend", "0", "--reserve", "5",
         "--ladder-fill", "--ladder-calibrated", "--chato-mirror", "on", "--dealer-sell-dups",
         "--dedupe-bids", "--deny-teams", "t05,t12,t13,t14", "--page-campaign", "none",
         "--pilar-sell", "SAL:1.25", "--pilar-from-tick", "905", "--pilar-until-tick", "1135",
-        "--news-sell", "--news-margin", "2", "--fever-priority", "--fever-wait", "1"]
+        "--news-sell", "--news-margin", "2", "--fever-priority", "--fever-wait", "1",
+        "--v10-commission", "--max-posts", "3"]
 if _NEWS_DB and Path(_NEWS_DB).is_file():
     BASE += ["--news-db", _NEWS_DB]
 

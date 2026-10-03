@@ -37,6 +37,7 @@ import intelligence as intel_mod
 import ladder_calibrated as lcal
 import page_campaign as pc
 import ladder_plus as lplus
+import v10_commission as v10c
 import page_guard as pg
 import performance as perf
 import team_sale as ts
@@ -67,7 +68,8 @@ def load_ledger(team):
         raise ValueError("El registro del coordinador pertenece a otro equipo")
     led.setdefault("team", team)
     for k, v in (("actions", []), ("spent_confirmed", 0), ("cash_received", 0), ("expiry_obs", []),
-                 ("blocked", {}), ("class_tick", {}), ("threads", []), ("negotiations", {}), ("campaign", None)):
+                 ("blocked", {}), ("class_tick", {}), ("threads", []), ("negotiations", {}), ("campaign", None),
+                 ("v10_commission", {"approvals": {}, "rejected_messages": {}})):
         led.setdefault(k, v)
     return led
 
@@ -163,9 +165,30 @@ def other_processes():
 
 # ------------------------------------------------------------------ reconciliación
 
-def reconcile(led, s, journal):
+def reconcile(led, s, journal, reader=None, args=None):
     """Pone al día las acciones con evidencia del servidor. Devuelve (nuevas liquidadas, ambiguas que bloquean)."""
     team, tick = s["me"]["id"], s["clock"]["tick"]
+    vstate = led.setdefault("v10_commission", {"approvals": {}, "rejected_messages": {}})
+    v10_changed = []
+    if reader is not None and getattr(args, "v10_commission", False) and team == "t15":
+        try:
+            official = reader.api.thread(v10c.THREAD_ID)
+            imported = v10c.sync_approval(vstate, official, team)
+            if imported:
+                v10_changed.extend(imported)
+                print(f"   V10 aprobación importada: {', '.join(imported)}")
+        except BazaarError as exc:
+            print(f"   V10 hilo #{v10c.THREAD_ID} no disponible: {exc.code}")
+    v10_changed.extend(v10c.reconcile_open_offers(vstate, s["offers"].get("offers", []), team))
+    v10_feed = v10c.reconcile_feed(vstate, s["feed"].get("events", []), team)
+    if v10_changed or v10_feed:
+        save(led)
+    for item in v10_feed:
+        print(f"   V10_COMMISSION {item}")
+    if getattr(args, "v10_commission", False):
+        vs = v10c.summary(vstate)
+        print(f"   V10 Team 5: {vs['posted']}/3 publicadas · {vs['settled_sales']} ventas liquidadas · "
+              f"{vs['commission_due_p']} P confirmadas para el cierre")
     sets = tr.settlements_for(s["feed"].get("events", []), team)
     market = [a for a in led["actions"] if a["type"] in ("accept", "list", "bid", "team_accept", "swap_list")]
     view = {"actions": market, "spent_confirmed": led["spent_confirmed"], "cash_received": led["cash_received"]}
@@ -665,6 +688,12 @@ def candidates(s, led, args, journal):
     if getattr(args, "fever_priority", False):  # --fever-priority (opt-in): ventas del barrio en fiebre, primero
         fever_priority(pilar, s, args)
     out += pilar
+    if getattr(args, "v10_commission", False):
+        rows = (s.get("leaderboard") or {}).get("teams", [])
+        top_teams = {str(x.get("team") or x.get("id") or "").lower() for x in rows[:6]}
+        out += v10c.listing_candidates(led.get("v10_commission") or {}, me,
+                                       s["clock"].get("tick_seconds"), top_teams or None,
+                                       unavailable_assets=committed_ids(s, led))
     out = dedupe_cancels(out)
     pl["capital"], pl["dealer_diag"], pl["open_bids"] = view.as_dict(), diag, scored
     pl["ladder"] = {d: len(x) for d, x in ladder.items()}
@@ -1695,6 +1724,8 @@ def rival_venue_blocker(c, s):
     Cancelar sigue permitido: retirar una puja de un venue rival nunca le suma."""
     if c["type"] not in ("list", "bid", "swap_list", "accept"):
         return None
+    if c.get("v10_approval"):
+        return None
     v = c.get("venue") or "rastro"
     for x in (s.get("venues") or {}).get("venues", []):
         if x.get("venue") == v and x.get("owner") not in (s["me"]["id"], "world", None):
@@ -1752,6 +1783,11 @@ def send(reader, led, s, c, args, journal):
     if any(a.get("key") == key and a["status"] in ("intent", "ambiguous", "submitted") for a in led["actions"]):
         print(f"   (ya enviada antes, no se repite: {describe(c)})")
         return None
+    if c.get("v10_approval"):
+        ok, why = v10c.validate_candidate(c, led.get("v10_commission") or {})
+        if not ok:
+            print(f"   V10_APPROVAL_BLOCK {describe(c)} · {why}")
+            return None
     # Última barrera antes de la red (prioridad 1): ningún módulo puede saltarse la protección de páginas completas.
     committed = committed_ids(s, led)
     protect = pg.guard_candidate(c, s, committed)
@@ -1780,11 +1816,14 @@ def send(reader, led, s, c, args, journal):
         rec["receive_assets"] = [x["id"] for x in (o.get("give") or {}).get("assets") or [] if isinstance(x, dict)]
     rec["venue"] = c.get("venue") or ("rastro" if c["type"] in ("list", "bid", "accept") else None)
     rec["to"] = c.get("to")
+    rec["approval_key"] = c.get("approval_key")
     led["actions"].append(rec)
     cls = CLASSES[c["type"]]
     led["class_tick"][cls] = tick
     cc = led.setdefault("class_count", {}).get(cls, [None, 0])
     led["class_count"][cls] = [tick, (cc[1] if cc[0] == tick else 0) + 1]
+    if c.get("v10_approval"):
+        led["v10_commission"]["approvals"][c["approval_key"]].update(status="posting", asset_id=c["asset"])
     save(led)  # antes de escribir en red
     pace(reader)  # las escrituras también respetan el límite de 5 peticiones por segundo
     ratio, basis = tr.expiry_ratio(led["expiry_obs"] + EXPIRY_EVIDENCE, s["clock"].get("tick_seconds") or 60.0)
@@ -1804,6 +1843,10 @@ def send(reader, led, s, c, args, journal):
                 give, want = {"cash": c["price"]}, {"cards": [c["ref"]]}
             resp = reader.api.list_offer(give, want, venue=c.get("venue") or "rastro", to=c.get("to"),
                                          expires_in_ticks=req)
+            if c.get("v10_approval"):
+                approval = led["v10_commission"]["approvals"][c["approval_key"]]
+                approval.update(status="posted" if resp.get("id") is not None else "posting",
+                                offer_id=resp.get("id"), posted_tick=tick)
             if resp.get("expires_tick") and resp.get("created_tick") is not None:
                 eff = resp["expires_tick"] - resp["created_tick"]
                 rec["effective_ticks"] = eff
@@ -1879,6 +1922,9 @@ def send(reader, led, s, c, args, journal):
     except BazaarError as e:
         rec["status"] = "rejected" if 400 <= e.status < 500 else "ambiguous"
         rec["error"] = f"{e.code}: {e.message}"
+        if c.get("v10_approval"):
+            approval = led["v10_commission"]["approvals"][c["approval_key"]]
+            approval["status"] = "approved" if rec["status"] == "rejected" else "posting"
         if c.get("neg") and c["neg"] in led["negotiations"]:
             n = led["negotiations"][c["neg"]]
             n["state"] = "ambigua" if rec["status"] == "ambiguous" else ("abandonada" if c["type"] == "team_open"
@@ -1967,7 +2013,7 @@ def cycle(reader, args, led, journal, execute, cache=None):
     tick, team = s["clock"]["tick"], s["me"]["id"]
     if execute and "since_tick" not in led:
         led["since_tick"] = tick
-    fresh, ambiguous = reconcile(led, s, journal)
+    fresh, ambiguous = reconcile(led, s, journal, reader=reader, args=args)
     own = led["actions"] + ma.load_json(ma.LEDGER).get("actions", [])
     accepts = [d for d in journal.records("decision") if d.get("action") in ("accept", "counter")]
     threads_known = set(led["threads"]) | {d.get("thread") for d in journal.records("decision")}
@@ -2181,6 +2227,8 @@ def main():
     p.add_argument("--no-rival-venues", action="store_true",
                    help="no publicar ni aceptar en venues de otros equipos (les suma market-making); usar con "
                         "--duende-venue rastro o nuestro venue")
+    p.add_argument("--v10-commission", action="store_true",
+                   help="importa la aprobación oficial de Team 5 y publica las ventas autorizadas en v10")
     p.add_argument("--duende-expiry", type=int, default=120, help="expires_in_ticks en El Duende (recomendación oficial)")
     p.add_argument("--max-posts", type=int, default=4, help="publicaciones/cancelaciones por tick (≤ límite del servidor)")
     p.add_argument("--intel", type=int, default=6, help="cartas a detallar en el informe de inteligencia (0 = ninguno)")
