@@ -1838,12 +1838,6 @@ def main():
     p.add_argument("--no-rival-venues", action="store_true",
                    help="no publicar ni aceptar en venues de otros equipos (les suma market-making); usar con "
                         "--duende-venue rastro o nuestro venue")
-    p.add_argument("--deny-teams", default="", help="equipos separados por coma con los que no negociar")
-    p.add_argument("--ladder-fill", action="store_true", help="alias de --dealer-ladder para llenar la escalera de vendedor")
-    p.add_argument("--pilar-sell", metavar="SET:FACTOR", default=None,
-                   help="vender a Pilar duplicados de uncommon/rare/epic del set indicado; suelo = pérdida de valor × factor")
-    p.add_argument("--pilar-from-tick", type=int, default=None, help="no abrir ventas a Pilar antes de este tick")
-    p.add_argument("--pilar-until-tick", type=int, default=None, help="no abrir ventas a Pilar después de este tick")
     p.add_argument("--duende-expiry", type=int, default=120, help="expires_in_ticks en El Duende (recomendación oficial)")
     p.add_argument("--max-posts", type=int, default=4, help="publicaciones/cancelaciones por tick (≤ límite del servidor)")
     p.add_argument("--intel", type=int, default=6, help="cartas a detallar en el informe de inteligencia (0 = ninguno)")
