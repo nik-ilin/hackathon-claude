@@ -53,7 +53,10 @@ def wilson(k: float, n: float, z: float = 1.645) -> tuple:
 
 def load_history(path) -> list:
     try:
-        return json.loads(Path(path).read_text())
+        data = json.loads(Path(path).read_text())
+        if isinstance(data, dict):
+            data = data.get("duels")
+        return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
     except (OSError, ValueError):
         return []
 

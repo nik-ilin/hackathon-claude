@@ -58,6 +58,15 @@ def live(i=900, rival="Rival Rojo", price=70, tick_start=0, deadline=16, role="b
 
 
 class Audit(unittest.TestCase):
+    def test_history_loader_accepts_server_envelope_and_plain_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "duels.json"
+            rows = [done(1), done(2)]
+            path.write_text(json.dumps({"source": "server", "duels": rows}))
+            self.assertEqual(len(L.load_history(path)), 2)
+            path.write_text(json.dumps(rows))
+            self.assertEqual(len(L.load_history(path)), 2)
+
     def test_uses_server_result_and_excludes_live_duels(self):
         raw = [done(1, status="deal", price=71, result=29.0), done(2, status="no_deal", result=0.0),
                dict(done(3), status="live", result=None)]

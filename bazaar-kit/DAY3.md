@@ -21,14 +21,21 @@ El sábado, v15 `auto` tenía 0 tratos reales pero 7,5 de mercado; el test sint�
    así de forma explícita. Son leads, no tratos ni puntos confirmados.
 3. **Duelos III:** no cerrar da cero. La práctica y simulación sugieren callar mientras el rival mejora, cerrar
    antes de agotar el plazo y escalonar aceptaciones (una por tick). `--day3` activa días, perfiles, ladder para mudos,
-   reconciliación y verificación de oferta. `--logroll` sigue opt-in porque fue neutro en el simulador.
+   reconciliación y verificación de oferta. `--learn` y `--logroll` siguen opt-in.
+
+El nuevo fixture de **23 duelos de Duelos II** registra 19 tratos, de ellos **7 con `result` negativo**, y 4 sin
+trato. No es una tasa general de la competición: es la muestra guardada de Team 15. El error de signo de días ya se
+corrigió en `duels.py` y se comprobó contra resultados del servidor. Para compradores, cada día resta `peso·día`;
+para vendedores, suma. Exigir **precio dentro del límite y utilidad total estrictamente positiva**. Un buen precio
+puede ser un mal trato al sumar días. `--learn` sólo mejora la política si existen duelos terminados y evidencia
+suficiente; el laboratorio local no tenía historia descargada, por lo que no se activa a ciegas.
 
 ### Duelos III: regla de decisión durante la oleada
 
 El alias es una pista histórica, no una identidad garantizada. La oferta **estructurada** y su evolución tienen
 prioridad sobre el texto del chat y sobre el perfil supuesto. Para cada duelo, registrar rol, límite privado, día,
 `deadline_tick`, oferta rival, utilidad total, tendencia y número de aceptaciones que compiten por el mismo plazo.
-Una aceptación solo es elegible si el precio queda dentro del límite y el margen con día no es negativo. No convertir
+Una aceptación solo es elegible si el precio queda dentro del límite y el margen con día es estrictamente positivo. No convertir
 la captura porcentual de la simulación directamente en puntos de leaderboard: faltan la tarta rival y la fórmula
 exacta de agregación.
 
@@ -94,7 +101,8 @@ gratuito según las reglas publicadas.
 
 **Duelos:** detener el coordinador y esperar a que libere `data/agent.lock` antes de `./run.sh duels --day3 --execute`.
 El runner prioriza ofertas dentro de límite, incluye siempre `days` en las ofertas propias de dos cuestiones,
-relee antes de aceptar y no reintenta una escritura ambigua sin reconciliar. Registrar `duel_points` privado antes
+relee antes de aceptar y no reintenta una escritura ambigua sin reconciliar. Leer `duels_fixture_days.json` y correr
+`python3 duel_lab.py --history duels_fixture_days.json audit` como revisión previa. Registrar `duel_points` privado antes
 y después. Tras la oleada, detener el runner antes de reiniciar `day3`.
 
 ## Medición durante la partida

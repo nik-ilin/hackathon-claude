@@ -28,6 +28,16 @@ class OperationsTests(unittest.TestCase):
         self.assertIsNone(result["rows"][0]["total_margin"])
         self.assertEqual(result["rows"][0]["state"], "unsafe")
 
+    def test_buyer_delivery_days_can_turn_good_price_into_bad_deal(self):
+        result = operations.duel_watch([{"duel": 5, "status": "live", "role": "buyer",
+                                       "your_limit": 100, "deadline_tick": 13,
+                                       "issues": ["price", "days"], "your_days_weight": 4,
+                                       "days_meaning": "each delivery day costs you this much cash",
+                                       "rival_offer": {"price": 80, "days": 6}}], 10)
+        self.assertEqual(result["rows"][0]["price_margin"], 20)
+        self.assertEqual(result["rows"][0]["total_margin"], -4)
+        self.assertFalse(result["rows"][0]["safe_to_accept"])
+
     def test_capital_and_market_signal_do_not_claim_broker_liveness(self):
         result = operations.build(duels=[], duel_error=None, tick=100, cash=500,
                                   offers=[{"status": "open", "give": {"cash": 90}}], reserve=100,

@@ -38,13 +38,12 @@ def duel_watch(duels: list[dict], tick: int | None) -> dict:
         if days_issue:
             try:
                 import duels as policy
-                table = policy.days_table(d)
                 day = offer.get("days")
-                days_known = table is not None and isinstance(day, int) and 0 <= day <= 10
+                days_known = policy.days_known(d) and isinstance(day, int) and 0 <= day <= 10
                 total_margin = policy.margin(d, price, day) if days_known and price_margin is not None else None
             except (KeyError, TypeError, ValueError):
                 total_margin = None
-        safe = price_margin is not None and price_margin >= 0 and total_margin is not None and total_margin >= 0
+        safe = price_margin is not None and price_margin >= 0 and total_margin is not None and total_margin > 0
         if left == 0:
             state, action = "expired", "Verificar resultado"
         elif not safe and price is None:
