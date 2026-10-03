@@ -9,6 +9,7 @@
 #   ./run.sh market                   -> análisis de colección y mercado (solo lectura)
 #   ./run.sh market --execute --cycles 8 -> operación entre equipos, máximo una acción por ciclo
 #   ./run.sh celestina [--loop]       -> casamentera de v15: imprime el anuncio (dry run); --execute para publicarlo
+#   ./run.sh t15 [--execute --ticks 120] -> coordinador con la configuración decidida por t15 (ver T15_PLAN.md)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -31,6 +32,10 @@ case "${1:-}" in
   coord)  shift; exec python3 coordinator.py "$@" ;;
   market) shift; exec python3 market_agent.py "$@" ;;
   celestina) shift; exec python3 celestina.py "$@" ;;
+  t15)    shift; exec python3 coordinator.py --no-rival-venues --duende-venue rastro \
+            --deny-teams t14,t12,t10,t18 --deny-margin 15 --ladder-fill --ladder-calibrated \
+            --pilar-sell SAL,LAV:1.25 --pilar-last-copy --allow-last-copy SAL-07 \
+            --reserve 5 --per-card 95 "$@" ;;
   broker) exec python3 starter_broker.py ;;
   market-broker) shift; exec python3 market_broker.py "$@" ;;
   agent)  shift; exec python3 starter_agent.py "$@" ;;
