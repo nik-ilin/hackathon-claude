@@ -43,6 +43,17 @@ class PlannerTest(unittest.TestCase):
         row = out["trades"][0]
         self.assertEqual((row["kind"], row["price"], row["surplus"]), ("proposal", 7, 2))
         self.assertIn("incierta", row["confidence"])
+        guide = out["sale_guide"][0]
+        self.assertEqual((guide["ref"], guide["floor"], guide["suggested"]),
+                         ("LAV-01", 7, 7))
+        self.assertEqual((guide["buyers"][0]["team"], guide["buyers"][0]["net"]),
+                         ("t04", 2))
+        self.assertEqual(guide['concession'], 0)
+        catalog = {row['ref']: row for row in out['catalog_rows']}
+        self.assertEqual((catalog['LAV-01']['stock'], catalog['LAV-01']['sell_floor']), (2, 7))
+        self.assertEqual(catalog['LAV-02']['stock'], 0)
+        self.assertGreater(catalog['LAV-02']['buy_ceiling'], 0)
+        self.assertEqual(catalog['LAV-01']['wanted_by'], ['t04'])
 
     def test_proposal_price_uses_observed_market_reference(self):
         out = build_rank(ME, CATALOG, {"tick": 10}, VENUES, {}, [], RIVALS, {},
@@ -71,6 +82,39 @@ class PlannerTest(unittest.TestCase):
         self.assertEqual((swaps[0]["give"], swaps[0]["receive"], swaps[0]["price"]),
                          (["LAV-01"], ["LAV-02"], 0))
         self.assertGreater(swaps[0]["surplus"], 0)
+        self.assertEqual(out["trades"][0]["action"], "Proponer venta")
+
+    def test_public_feed_shows_sale_leads_without_private_values(self):
+        rivals = {"teams": [
+            {"team": "t15", "held": ["LAV-01"], "sought": ["LAV-02"],
+             "duplicates_observed": ["LAV-01"]},
+            RIVALS["teams"][0],
+        ]}
+        out = build_rank({}, CATALOG, {"tick": 10}, VENUES,
+                         {"rastro": [bid()]}, [], rivals, {50: "t04"})
+        self.assertTrue(out["public_only"])
+        self.assertEqual(out["inventory"][0]["copies"], "≥2")
+        self.assertEqual((out["trades"][0]["kind"], out["trades"][0]["price"]),
+                         ("public-live", 12))
+        self.assertIsNone(out["trades"][0]["surplus"])
+        self.assertIsNone(out["sale_guide"][0]["floor"])
+
+    def test_guide_lists_free_surplus_without_inventing_buyers(self):
+        out = build_rank(ME, CATALOG, {"tick": 10}, VENUES, {}, [],
+                         {"teams": []}, {})
+        self.assertEqual(len(out["sale_guide"]), 1)
+        self.assertEqual(out["sale_guide"][0]["floor"], 7)
+        self.assertIsNone(out["sale_guide"][0]["suggested"])
+        self.assertEqual(out["sale_guide"][0]["buyers"], [])
+
+    def test_private_rank_prioritizes_sales_not_pure_purchases(self):
+        ask = {"id": 70, "maker": "t04", "status": "open", "venue": "rastro", "to": None,
+               "give": {"cash": 0, "assets": [{"id": 45, "kind": "card", "ref": "LAV-02"}], "types": []},
+               "want": {"cash": 3, "assets": [], "types": []}, "expires_tick": 20}
+        out = build_rank(ME, CATALOG, {"tick": 10}, VENUES,
+                         {"rastro": [ask]}, [], RIVALS, {})
+        self.assertEqual(out["trades"][0]["action"], "Proponer venta")
+        self.assertFalse(any(row["action"] == "Comprar" for row in out["trades"]))
 
 
 if __name__ == "__main__":
