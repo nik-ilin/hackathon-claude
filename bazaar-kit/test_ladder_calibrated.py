@@ -358,3 +358,58 @@ class Simulator(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ------------------------------------------------------------------ Chato v3: espejo de la concesión
+
+class ChatoMirror(unittest.TestCase):
+    """Hilos 989/998/1005: Chato v3 abre a 97, repite 97 mientras seguimos en 87 y cede 1 «You moved little, so did I»."""
+
+    def msgs(self):
+        return [chato_her(1, 715, 97, "cancelled"), ours(2, 716, 87), chato_her(3, 717, 97)]
+
+    def test_mirror_never_stands_still_nor_steps_by_one(self):
+        st = buy_st(self.msgs(), 717, "chato")
+        prof = PROF["chato|buy|rare"]
+        plain = lcal.decide_buy(st, prof, 95, 10, 717)
+        self.assertEqual((plain.action, plain.price), ("counter", 88))       # por encima del objetivo: pasos de 1
+        mir = lcal.decide_buy(st, prof, 95, 10, 717, mirror=True)
+        self.assertEqual((mir.action, mir.price), ("counter", 92))           # paso real de 5 (≥ ⌈10/4⌉)
+        self.assertIn("espejo", mir.reason)
+
+    def test_mirror_respects_ceiling_and_accepts_when_cannot_move(self):
+        st = buy_st(self.msgs(), 717, "chato")
+        d = lcal.decide_buy(st, PROF["chato|buy|rare"], 87, 10, 717, mirror=True)
+        self.assertNotEqual(d.action, "counter")                             # techo 87: nunca por encima
+        self.assertFalse(d.price and d.price > 87)
+
+    def test_mirror_sell_steps_down_for_real(self):
+        st = sell_st([pil(1, 50, 16, "cancelled"), ask(2, 51, 30), pil(3, 52, 16)], 52)
+        prof = PROF["pilar|sell|uncommon"]
+        self.assertEqual(lcal.decide_sell(st, prof, 10, 10, 52).price, 28)
+        self.assertEqual(lcal.decide_sell(st, prof, 10, 10, 52, mirror=True).price, 26)
+
+    def test_version_detection(self):
+        ev = [{"type": "persona.updated", "tick": 463, "payload": {"persona": "chato", "version": 2}},
+              {"type": "persona.updated", "tick": 583, "payload": {"persona": "chato", "version": 3}},
+              {"type": "persona.updated", "tick": 254, "payload": {"persona": "banco", "version": 7}}]
+        self.assertEqual(lcal.dealer_version("chato", None, ev), 3)
+        self.assertEqual(lcal.dealer_version("chato", {"version": 4}), 4)
+        self.assertIsNone(lcal.dealer_version("chato", {}, []))
+        self.assertTrue(lcal.mirrors("chato", 3))
+        self.assertFalse(lcal.mirrors("chato", 2))
+        self.assertFalse(lcal.mirrors("abuela", 9))
+        said = {"messages": [{"sender": "chato", "text": "Ninety-six. That's my move. You moved little, so did I."}]}
+        self.assertTrue(lcal.mirrors("chato", None, said))
+
+    def test_coordinator_flag_modes(self):
+        s = {"dealers": {"chato": {}}, "feed": {"events": [
+            {"type": "persona.updated", "payload": {"persona": "chato", "version": 3}}]}}
+        a = lambda m: type("A", (), {"chato_mirror": m})()
+        led = led0()
+        self.assertEqual(co.mirror_dealers(s, led, a("off")), set())
+        self.assertEqual(co.mirror_dealers(s, led, a("auto")), {"chato"})
+        self.assertEqual(led["dealer_versions"], {"chato": 3})               # se recuerda aunque salga del feed
+        self.assertEqual(co.mirror_dealers({"dealers": {}, "feed": {"events": []}}, led, a("auto")), {"chato"})
+        self.assertEqual(co.mirror_dealers({"dealers": {}, "feed": {"events": []}}, led0(), a("on")), {"chato"})
+        self.assertEqual(co.mirror_dealers({"dealers": {}, "feed": {"events": []}}, led0(), a("auto")), set())

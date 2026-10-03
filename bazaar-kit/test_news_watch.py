@@ -214,3 +214,68 @@ class CoordinatorFlag(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+SCHEDULE = {"now_hours": 8.5, "upcoming": [
+    {"at_hours": 9.0, "action": "bench", "note": "The Market Test"},
+    {"at_hours": 9.15, "action": "persona_patch", "params": {"id": "pilar"},
+     "note": "Salamanca fever: Doña Pilar pays 25 % over book for Salamanca until 17:30"},
+    {"at_hours": 11.15, "action": "persona_patch", "note": "The fever breaks", "params": {"id": "pilar"}}]}
+
+
+def sal_catalog():
+    card = lambda i, rarity, book: {"id": f"SAL-{i:02d}", "rarity": rarity, "book": book, "page": True}
+    return {"values": {"copy_marginals": [1.0, 0.25, 0.1], "page_bonus": 0.25},
+            "sets": [{"id": "SAL", "name": "Salamanca", "released": True,
+                      "cards": [card(1, "common", 2), card(7, "uncommon", 18), card(8, "uncommon", 18)]}]}
+
+
+class Fever(unittest.TestCase):
+    def test_parse_fever_window(self):
+        fv = nw.fevers(SCHEDULE)
+        self.assertEqual([(f["dealer"], f["set"], f["pct"], f["start"], f["end"]) for f in fv],
+                         [("pilar", "SAL", 25.0, 9.15, 11.15)])
+        st = nw.fever_state(fv[0], 8.5, 700)
+        self.assertEqual((st["state"], st["start_tick"], st["end_tick"]), ("próxima", 778, 1018))
+        self.assertEqual(nw.fever_state(fv[0], 10.0, 700)["state"], "activa")
+        self.assertEqual(nw.fever_state(fv[0], 11.2, 700)["state"], "pasada")
+        self.assertEqual(nw.schedule_now(SCHEDULE), 8.5)
+        self.assertEqual(nw.schedule_now([], {"t_hours": 7.6}), 7.6)
+
+    def test_fever_suggestions_only_when_active_and_profitable(self):
+        me = {"id": TEAM, "affinity": {"SAL": 0.5}, "assets": [
+            {"id": 1, "kind": "card", "ref": "SAL-07"}, {"id": 2, "kind": "card", "ref": "SAL-07"}]}
+        fv = [nw.fever_state(f, 10.0, 800) for f in nw.fevers(SCHEDULE)]
+        out = nw.fever_suggestions(fv, me, sal_catalog())
+        self.assertEqual([(s["asset"], s["ask"]) for s in out], [(1, 22), (2, 22)])  # 18 × 1,25 = 22 P
+        self.assertEqual(out[0]["floor"], 5)                     # 2.ª copia: 18 × 0,5 × 0,25 = 2,25 + 2
+        before = [nw.fever_state(f, 8.5, 700) for f in nw.fevers(SCHEDULE)]
+        self.assertEqual(nw.fever_suggestions(before, me, sal_catalog()), [])
+        rep = nw.live_report([], {"personas": []}, {"tick": 800, "t_hours": 10.0}, me, sal_catalog(),
+                             schedule=dict(SCHEDULE, now_hours=10.0))
+        self.assertEqual(len(rep["suggestions"]), 2)
+        self.assertIn("FIEBRE activa", "\n".join(nw.report_lines(rep)))
+
+
+class FeverPriority(unittest.TestCase):
+    def s(self, now_h):
+        return {"schedule": dict(SCHEDULE, now_hours=now_h), "clock": {"tick": 700}, "catalog": sal_catalog()}
+
+    def cands(self):
+        return [{"type": "dealer_sell_open", "dealer": "pilar", "ref": "card:SAL-07", "score": 1000, "blockers": []},
+                {"type": "dealer_sell_open", "dealer": "pilar", "ref": "card:LAT-01", "score": 1000, "blockers": []},
+                {"type": "dealer_sell_open", "dealer": "chato", "ref": "card:SAL-08", "score": 1000, "blockers": []}]
+
+    def test_active_fever_boosts_only_that_dealer_and_set(self):
+        out = co.fever_priority(self.cands(), self.s(10.0), args(fever_priority=True, fever_wait=1.0))
+        self.assertEqual([c["score"] for c in out], [11000, 1000, 1000])
+        self.assertIn("FIEBRE SAL activa", out[0]["notes"][0])
+
+    def test_upcoming_fever_waits_and_far_fever_does_not(self):
+        out = co.fever_priority(self.cands(), self.s(8.5), args(fever_priority=True, fever_wait=1.0))
+        self.assertTrue(out[0]["blockers"])
+        self.assertEqual(out[1]["blockers"], [])
+        far = co.fever_priority(self.cands(), self.s(7.0), args(fever_priority=True, fever_wait=1.0))
+        self.assertEqual(far[0]["blockers"], [])
+        none = co.fever_priority(self.cands(), {"clock": {"tick": 1}, "catalog": sal_catalog()}, args())
+        self.assertEqual([c["score"] for c in none], [1000, 1000, 1000])

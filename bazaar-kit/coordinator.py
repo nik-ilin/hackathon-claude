@@ -337,6 +337,7 @@ def candidates(s, led, args, journal):
     lc = ladder_cfg(args)
     if getattr(args, "news_sell", False):  # sell_thread_candidates sigue las ventas abiertas por una noticia
         s["news_floors"] = led.get("news_floor") or {}
+    s["mirror_dealers"] = mirror_dealers(s, led, args)
     pend_actions = [a for a in led["actions"]
                     if a["type"] in ("accept", "dealer_accept", "team_accept") and a["status"] in ("intent", "ambiguous", "submitted")]
     pend = [{"cost": a.get("cost", 0), "assets": a.get("assets") or []} for a in pend_actions if a["type"] != "team_accept"]
@@ -446,7 +447,9 @@ def candidates(s, led, args, journal):
             if cal:  # --ladder-calibrated: apertura extrema, paso corto, paciencia hasta final:true
                 key, cp_ = lcal.profile_for(cal_profiles(args), did, "buy", rarity or (item or "")[5:])
                 left = cp_.max_ticks - neg.conversation_ticks_used(t, tick)
-                d = lcal.decide_buy(st, cp_, ceiling, left, tick, name=f"calibrada {key}")
+                mirror = is_mirror(s, args, t, did)
+                d = lcal.decide_buy(st, cp_, ceiling, left, tick, name=f"calibrada {key}" + (" espejo" if mirror else ""),
+                                    mirror=mirror)
                 notes_mode = f"escalera calibrada {key} ({cp_.obs})" + (
                     " · FAROL: dice «final» sin final:true, seguimos regateando" if lcal.bluff_final(t, did) else "")
             else:
@@ -590,6 +593,8 @@ def candidates(s, led, args, journal):
         if c["type"] not in pg.NON_DELIVERING and not str(c["type"]).startswith("dealer_sell") and \
                 set(pg.delivery_of(c, s)[1]) & selling_assets:
             c["blockers"] = list(c.get("blockers") or []) + ["esa copia está en una conversación de venta a un vendedor"]
+    if getattr(args, "fever_priority", False):  # --fever-priority (opt-in): ventas del barrio en fiebre, primero
+        fever_priority(pilar, s, args)
     out += pilar
     out = dedupe_cancels(out)
     pl["capital"], pl["dealer_diag"], pl["open_bids"] = view.as_dict(), diag, scored
@@ -690,8 +695,9 @@ def sell_thread_candidates(s, t, args, lc, val, counts):
     if cal:  # --ladder-calibrated: suelo = valor privado; objetivo = mejor trato observado; solo final:true cierra
         loss, floor = pilar_floor(val, counts, ref)
         key, cp_ = sell_profile(args, s, "pilar" if pilar else did, did, ref, val)
+        mirror = is_mirror(s, args, t, did)
         d = lcal.decide_sell(st, cp_, floor, cp_.max_ticks - neg.conversation_ticks_used(t, tick), tick,
-                             name=f"calibrada {key}")
+                             name=f"calibrada {key}" + (" espejo" if mirror else ""), mirror=mirror)
     elif pilar:
         loss, floor = pilar_floor(val, counts, ref)
         d = lplus.decide_sell(st, floor, lplus.first_ask(floor, pc), pc,
@@ -824,6 +830,29 @@ def calibrated_sell_opens(s, led, cal_plan, busy, open_count):
     return out
 
 
+def mirror_dealers(s, led, args):
+    """--chato-mirror: vendedores que reflejan nuestra concesión (Chato v3). `on` = siempre; `auto` = versión ≥ 3 vista
+    en /api/dealers o en persona.updated del feed (se recuerda en el ledger); `off` (defecto) = nunca."""
+    mode = getattr(args, "chato_mirror", "off") or "off"
+    if mode == "off":
+        return set()
+    known = led.setdefault("dealer_versions", {})
+    out = set()
+    for did in lcal.MIRROR_MIN_VERSION:
+        v = lcal.dealer_version(did, (s.get("dealers") or {}).get(did), s["feed"].get("events", []))
+        if v is not None:
+            known[did] = max(int(known.get(did) or 0), v)
+        if mode == "on" or lcal.mirrors(did, known.get(did)):
+            out.add(did)
+    return out
+
+
+def is_mirror(s, args, t, did):
+    """Este hilo va en modo espejo: vendedor detectado o, con `auto`, el propio vendedor lo ha dicho en el hilo."""
+    mode = getattr(args, "chato_mirror", "off") or "off"
+    return did in (s.get("mirror_dealers") or ()) or (mode == "auto" and lcal.mirror_said(t, did))
+
+
 def news_sell_candidates(s, led, args, busy, open_count):
     """--news-sell: una noticia de demanda viva (fuente fiable dentro de su ventana, o fila explícita en el menú actual
     del vendedor) abre una venta a ese vendedor de una copia que page_guard deja salir; suelo = valor privado +
@@ -860,6 +889,33 @@ def news_sell_candidates(s, led, args, busy, open_count):
                     "notes": [g["text"], f"noticia #{g['news_id']} [{g['source']}] fiabilidad {g['reliability']}"
                               + (" · confirmada en el menú" if g["confirmed_by_menu"] else "")]})
     return out
+
+
+def fever_priority(cands, s, args):
+    """--fever-priority: con una fiebre ACTIVA de /api/schedule (p. ej. Pilar +25 % por SAL) las aperturas de venta de
+    ese barrio a ese vendedor pasan delante; si la fiebre empieza dentro de --fever-wait horas de juego, se esperan."""
+    sched = s.get("schedule")
+    if sched is None:
+        return cands
+    now_h, tick = nw.schedule_now(sched, s["clock"]), s["clock"]["tick"]
+    fv = [nw.fever_state(f, now_h, tick) for f in nw.fevers(sched, s["catalog"])]
+    cards = {c["id"]: sid["id"] for sid in s["catalog"].get("sets", []) for c in sid.get("cards", [])}
+    wait = getattr(args, "fever_wait", 1.0)
+    for c in cands:
+        if c.get("type") != "dealer_sell_open":
+            continue
+        set_id = cards.get(str(c.get("ref") or "")[5:])
+        for f in fv:
+            if f["dealer"] != c.get("dealer") or f["set"] != set_id:
+                continue
+            if f["state"] == "activa":
+                c["score"] = c.get("score", 0) + 10 ** 4
+                c["notes"] = list(c.get("notes") or []) + [f"FIEBRE {set_id} activa hasta t~{f['end_tick']}: "
+                                                          f"{f['dealer']} paga +{f['pct']:g} % sobre book"]
+            elif f["state"] == "próxima" and f["hours_to_start"] is not None and f["hours_to_start"] <= wait:
+                c["blockers"] = list(c.get("blockers") or []) + [f"esperar a la fiebre {set_id} (+{f['pct']:g} %, "
+                                                                f"empieza en t~{f['start_tick']})"]
+    return cands
 
 
 def news_floor_guard(cands, led, args):
@@ -1656,6 +1712,12 @@ def cycle(reader, args, led, journal, execute, cache=None):
         except BazaarError as e:
             s["news"] = []
             print(f"   NOTICIAS: /api/news no disponible ({e}); --news-sell sin efecto este tick")
+    if getattr(args, "fever_priority", False):  # --fever-priority: GET /api/schedule (persona_patch de fiebres)
+        try:
+            s["schedule"] = reader.call("schedule")
+        except BazaarError as e:
+            s["schedule"] = None
+            print(f"   FIEBRE: /api/schedule no disponible ({e}); --fever-priority sin efecto este tick")
     intel = open_intel(s["me"]["id"], cache)
     ingested = feed_intel(intel, s)  # reutiliza la instantánea: ninguna llamada extra a la API
     INTEL_STATE["intel"] = intel
@@ -1952,11 +2014,19 @@ def main():
                    help="con --ladder-calibrated: sobrescribe campos de los perfiles ({\"chato|buy|rare\": {\"step\": 4}})")
     g.add_argument("--ladder-budget", type=int, default=None,
                    help="con --ladder-calibrated: caja máxima de las COMPRAS del plan (por defecto, la libre para vendedores)")
+    g.add_argument("--chato-mirror", choices=["off", "auto", "on"], default="off",
+                   help="con --ladder-calibrated: Chato v3 refleja lo que cedemos; nunca quedarse quieto ni pasos de 1 "
+                        "(auto = versión ≥ 3 en /api/dealers, persona.updated o «so did I» en el hilo)")
     g = p.add_argument_group("noticias (opt-in, news_watch.py; sin ellos nada cambia)")
     g.add_argument("--news-sell", action="store_true",
                    help="con una noticia de demanda viva (fuente fiable en su ventana o fila en el menú del vendedor), "
                         "abrir venta a ese vendedor de copias que no rompen página; suelo = valor privado + margen")
     g.add_argument("--news-margin", type=float, default=2.0, help="con --news-sell: margen sobre el valor privado (P)")
+    g.add_argument("--fever-priority", action="store_true",
+                   help="fiebres de /api/schedule (Pilar +25 %% por SAL): priorizar esas ventas mientras duran y "
+                        "esperarlas si empiezan pronto")
+    g.add_argument("--fever-wait", type=float, default=1.0,
+                   help="con --fever-priority: horas de juego antes de la fiebre en que se esperan esas ventas")
     g.add_argument("--news-db", default=None, metavar="market.db",
                    help="con --news-sell: calibrar la fiabilidad por fuente con este market.db (solo lectura)")
     args = p.parse_args()
