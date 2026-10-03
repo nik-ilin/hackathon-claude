@@ -70,8 +70,10 @@ python3 duel_runner.py --execute      # sólo con clave y bloqueo exclusivo
 ```
 
 Cada registro tiene `action` (`accept`, `offer`, `wait`, `defer` o
-`already_sent`), `path`,
-`reason` y `feed`. `wait`, `defer` y `already_sent` nunca se envían al API. También puede
+`already_sent`), `path`, `trigger`, `facts`, `reason` y `feed`.
+`facts` expone límite, oferta, margen, umbral, tendencia y ticks restantes:
+permite ver qué número activó cada rama sin interpretar el texto de `why`.
+`wait`, `defer` y `already_sent` nunca se envían al API. También puede
 importarse `duel_tree.plan` directamente en otro agente. `--feed-file RUTA`
 permite leer un historial JSONL distinto.
 

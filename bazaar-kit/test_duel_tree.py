@@ -23,6 +23,21 @@ class DecisionTreeTests(unittest.TestCase):
         result = duel_tree.plan([live], first["tick"])
         self.assertEqual(result[0]["action"], "wait")
         self.assertIn("wait_for_better_offer", result[0]["path"])
+        self.assertEqual(result[0]["facts"]["own_limit"], 120)
+        self.assertEqual(result[0]["facts"]["rival_price"], 78)
+        self.assertEqual(result[0]["facts"]["margin"], 42)
+        self.assertEqual(result[0]["facts"]["ticks_left"], 10)
+
+    def test_explains_acceptance_trigger_with_real_practice_duel(self):
+        duels_done = json.loads((HERE / "duels_fixture_practice.json").read_text())
+        duel = next(d for d in duels_done if d["duel"] == 8)
+        first = duel["messages"][0]
+        live = dict(duel, status="live", messages=[first],
+                    rival_offer={"price": first["price"]})
+        result = duel_tree.plan([live], first["tick"])[0]
+        self.assertEqual(result["action"], "accept")
+        self.assertEqual(result["trigger"], "large_margin")
+        self.assertEqual(result["facts"]["margin"], 34)
 
     def test_one_acceptance_per_tick_is_explicit(self):
         candidates = [dict(type="duel_accept", duel=i, score=10, du=5, why="ok")

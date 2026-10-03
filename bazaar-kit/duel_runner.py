@@ -138,12 +138,14 @@ def run(b, execute, feed_file: Path | None = None):
                 if step["action"] in {"wait", "defer", "already_sent"}:
                     log({"tick": c["tick"], "duel": step["duel"],
                          "action": step["action"], "path": step["path"],
+                         "trigger": step["trigger"], "facts": step["facts"],
                          "reason": step["reason"], "feed": step["feed"], "sent": False})
                     continue
                 if cand["type"] == "duel_accept" and accepted:
                     continue
                 rec = {"tick": c["tick"], **{k: v for k, v in cand.items() if k != "score"}}
-                rec.update(action=step["action"], path=step["path"], feed=step["feed"])
+                rec.update(action=step["action"], path=step["path"],
+                           trigger=step["trigger"], facts=step["facts"], feed=step["feed"])
                 if not execute:
                     log({**rec, "sent": False})
                     continue
