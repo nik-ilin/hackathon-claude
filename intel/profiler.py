@@ -1,0 +1,285 @@
+"""Market profiler: turns intel/market.db into profiles of every actor and recommendations.
+
+    python3 intel/profiler.py          # once
+    python3 intel/profiler.py loop     # every 5 minutes (launchd: com.team15.profiler)
+
+Outputs (regenerated each cycle, nothing is sent to the server):
+  intel/REPORT.md              human-readable state of the market and of every actor
+  intel/recommendations.json   machine-readable parameters for our strategies (the tuner loads it)
+  tables profile_team / profile_dealer / price_index in market.db
+"""
+from __future__ import annotations
+
+import collections
+import json
+import os
+import sqlite3
+import statistics as st
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DB = os.path.join(HERE, "market.db")
+REPORT = os.path.join(HERE, "REPORT.md")
+RECS = os.path.join(HERE, "recommendations.json")
+DEALERS = {"abuela", "chato"}           # extended automatically from dealer snapshots
+US = "t15"
+
+
+def med(xs):
+    xs = [x for x in xs if x is not None]
+    return round(st.median(xs), 2) if xs else None
+
+
+def load(db):
+    q = lambda sql, *a: db.execute(sql, a).fetchall()  # noqa: E731
+    dealers = set(DEALERS)
+    for (payload,) in q("SELECT payload FROM json_snapshots WHERE kind='dealers'"):
+        for p in json.loads(payload).get("personas", []):
+            dealers.add(p["id"])
+    return q, dealers
+
+
+# ── dealers & the teams that haggle with them ───────────────────────────
+def haggles(q, dealers):
+    """One record per persona thread: who, what, prices on both sides, outcome."""
+    topics = {tid: json.loads(t) if t else None for tid, t in q("SELECT id, topic FROM threads")}
+    rarity_of_asset = dict(q("SELECT asset_id, rarity FROM provenance WHERE rarity IS NOT NULL"))
+    rarity_of_ref = dict(q("SELECT ref, rarity FROM provenance WHERE rarity IS NOT NULL"))
+    msgs = collections.defaultdict(list)
+    for tid, tick, team, with_, sender, price, final in q(
+            "SELECT thread, tick, team, with_, sender, price, final FROM thread_messages "
+            "WHERE kind='persona' ORDER BY thread, tick, id"):
+        msgs[tid].append((tick, team, with_, sender, price, final))
+    sett = collections.defaultdict(list)            # (team, dealer) -> [(tick, price)]
+    for tick, persona, a, b, price in q("SELECT tick, persona, party_a, party_b, price FROM settlements WHERE persona IS NOT NULL"):
+        team = a if a != persona else b
+        sett[(team, persona)].append((tick, price))
+    out = []
+    for tid, ms in msgs.items():
+        team = next((m[1] for m in ms if m[1]), None)
+        dealer = next((m[2] for m in ms if m[2] in dealers), None)
+        if not team or not dealer:
+            continue
+        topic = topics.get(tid) or {}
+        mode = "sell" if "sell" in topic else ("buy" if topic else "?")
+        if mode == "sell":
+            ids = topic["sell"].get("assets", [])
+            kind = rarity_of_asset.get(ids[0], "?") if len(ids) == 1 else f"lote{len(ids)}"
+        elif mode == "buy":
+            b = topic["buy"]
+            kind = b.get("pack") or b.get("rarity") or rarity_of_ref.get(b.get("card"), "carta")
+        else:
+            kind = "?"
+        d_prices = [m[4] for m in ms if m[3] == dealer and m[4] is not None]
+        t_prices = [m[4] for m in ms if m[3] == team and m[4] is not None]
+        final = next((m[4] for m in ms if m[3] == dealer and m[5]), None)
+        last_tick = ms[-1][0]
+        deal = next((p for t, p in sett.get((team, dealer), []) if last_tick - 3 <= t <= last_tick + 3), None)
+        steps = [abs(b - a) for a, b in zip(t_prices, t_prices[1:])]
+        out.append({"thread": tid, "team": team, "dealer": dealer, "mode": mode, "kind": kind,
+                    "dealer_open": d_prices[0] if d_prices else None, "dealer_last": d_prices[-1] if d_prices else None,
+                    "final": final, "team_open": t_prices[0] if t_prices else None, "rounds": len(t_prices),
+                    "step": med(steps), "deal": deal, "tick": ms[0][0]})
+    return out
+
+
+def dealer_profiles(hs):
+    """Per dealer × mode × kind: opening, finals, deal prices, concession per round."""
+    g = collections.defaultdict(list)
+    for h in hs:
+        g[(h["dealer"], h["mode"], h["kind"])].append(h)
+    prof = {}
+    for (dealer, mode, kind), rows in g.items():
+        conc = []
+        for h in rows:
+            if h["dealer_open"] is not None and h["dealer_last"] is not None and h["rounds"]:
+                conc.append(abs(h["dealer_open"] - h["dealer_last"]) / h["rounds"])
+        deals = [h["deal"] for h in rows if h["deal"] is not None]
+        best = (min(deals) if mode == "buy" else max(deals)) if deals else None
+        best_h = next((h for h in rows if h["deal"] == best), None)
+        prof[f"{dealer}|{mode}|{kind}"] = {
+            "threads": len(rows), "deals": len(deals),
+            "open_median": med([h["dealer_open"] for h in rows]),
+            "final_median": med([h["final"] for h in rows]),
+            "deal_median": med(deals), "deal_best": best,
+            "best_by": best_h and {"team": best_h["team"], "team_open": best_h["team_open"],
+                                   "step": best_h["step"], "rounds": best_h["rounds"]},
+            "dealer_concession_per_round": med(conc),
+            "rounds_median": med([h["rounds"] for h in rows]),
+        }
+    return prof
+
+
+# ── teams ───────────────────────────────────────────────────────────────
+def team_profiles(q, hs, dealer_prof):
+    teams = collections.defaultdict(lambda: collections.defaultdict(list))
+    for h in hs:
+        t = teams[h["team"]]
+        t["haggles"].append(h)
+    # capture: how far each deal sits inside the observed range for that dealer item
+    for h in hs:
+        p = dealer_prof.get(f"{h['dealer']}|{h['mode']}|{h['kind']}")
+        if h["deal"] is None or not p or p["open_median"] is None or p["deal_best"] is None:
+            continue
+        rng = abs(p["open_median"] - p["deal_best"])
+        if rng:
+            cap = (p["open_median"] - h["deal"]) / rng if h["mode"] == "buy" else (h["deal"] - p["open_median"]) / rng
+            teams[h["team"]]["capture"].append(max(0.0, min(1.0, cap)))
+    # P2P settlements: what each team buys/sells, by set and rarity, and price vs market
+    rar_price = collections.defaultdict(list)
+    rows = q("""SELECT s.id, s.tick, s.venue, s.price, s.fee, s.n_items, i.ref, i.rarity, i.set_id, i.frm, i.too
+                FROM settlements s JOIN settlement_items i ON i.settlement = s.id WHERE s.venue IS NOT NULL""")
+    for sid, tick, venue, price, fee, n, ref, rarity, set_id, frm, too in rows:
+        if n == 1 and rarity:
+            rar_price[rarity].append(price)
+    rmed = {r: st.median(v) for r, v in rar_price.items() if v}
+    for sid, tick, venue, price, fee, n, ref, rarity, set_id, frm, too in rows:
+        unit = price / max(1, n)
+        rel = unit / rmed[rarity] if rarity in rmed and rmed[rarity] else None
+        teams[too]["bought"].append((set_id, rarity, unit, rel, venue))
+        teams[frm]["sold"].append((set_id, rarity, unit, rel, venue))
+    # listings and bids (offer.listed): asks and wants
+    for maker, ga, gc, wc, wt, venue in q("SELECT maker, give_assets, give_cash, want_cash, want_types, venue FROM offers WHERE venue IS NOT NULL"):
+        ga, wt = json.loads(ga or "[]"), json.loads(wt or "[]")
+        for a in ga:
+            if isinstance(a, dict):
+                teams[maker]["asks"].append((a.get("set"), a.get("rarity"), (wc or 0) / max(1, len(ga))))
+        for t in wt:
+            if t.startswith("card:"):
+                teams[maker]["wants"].append((t[5:8], gc))
+    # leaderboard trajectory
+    lb = collections.defaultdict(list)
+    for ts, tick, team, name, rank, score, neg, mkt, deals, level, album in q(
+            "SELECT snap_ts, tick, team, name, rank, score, negotiating, market, deals, level, album_filled FROM leaderboard ORDER BY snap_ts"):
+        lb[team].append({"ts": ts, "tick": tick, "name": name, "rank": rank, "score": score, "neg": neg,
+                         "mkt": mkt, "deals": deals, "level": level, "album": album})
+    venues = {}
+    for (payload,) in q("SELECT payload FROM json_snapshots WHERE kind='venues' ORDER BY snap_ts DESC LIMIT 1"):
+        for v in json.loads(payload):
+            venues.setdefault(v.get("owner"), []).append(v)
+
+    prof = {}
+    for team in set(teams) | set(lb):
+        if not team or team in DEALERS or team.startswith("m"):     # skip dealers and pseudonyms
+            continue
+        t = teams[team]
+        traj = lb.get(team, [])
+        cur = traj[-1] if traj else {}
+        hour_ago = next((x for x in traj if x["ts"] >= time.time() - 3600), cur)
+        interest = collections.Counter()
+        for s, r, u, rel, v in t["bought"]:
+            interest[s] += 1
+        for s, gc in t["wants"]:
+            interest[s] += 1 + (gc or 0) / 30
+        for s, r, u, rel, v in t["sold"]:
+            interest[s] -= 0.5
+        for s, r, p in t["asks"]:
+            interest[s] -= 0.3
+        hg = t["haggles"]
+        prof[team] = {
+            "name": cur.get("name"), "rank": cur.get("rank"), "score": cur.get("score"),
+            "neg": cur.get("neg"), "mkt": cur.get("mkt"), "level": cur.get("level"), "album": cur.get("album"),
+            "score_delta_1h": round((cur.get("score") or 0) - (hour_ago.get("score") or 0), 2) if cur else None,
+            "dealer_threads": len(hg), "dealer_deals": sum(1 for h in hg if h["deal"] is not None),
+            "dealer_capture": med(t["capture"]),
+            "dealer_open_ratio": med([h["team_open"] / h["dealer_open"] for h in hg
+                                      if h["team_open"] and h["dealer_open"]]),
+            "dealer_step": med([h["step"] for h in hg]),
+            "dealer_modes": dict(collections.Counter(h["mode"] for h in hg)),
+            "p2p_bought": len(t["bought"]), "p2p_sold": len(t["sold"]),
+            "buy_price_vs_market": med([x[3] for x in t["bought"]]),
+            "sell_price_vs_market": med([x[3] for x in t["sold"]]),
+            "listings": len(t["asks"]), "bids": len(t["wants"]),
+            "set_interest": [s for s, _ in interest.most_common() if s and interest[s] > 0][:3],
+            "set_disinterest": [s for s, v in sorted(interest.items(), key=lambda kv: kv[1]) if s and v < 0][:3],
+            "venues": [f"{v['venue']} {v.get('fee_bps')}bps {v.get('rules', {}).get('mechanism')} trades={v.get('trades')}"
+                       for v in venues.get(team, [])],
+        }
+    return prof, rmed
+
+
+# ── recommendations for our strategies (the self-improvement feed) ───────
+def recommendations(dealer_prof, team_prof, rmed):
+    finals = {k: {"n": v["deals"] + (1 if v["final_median"] else 0),
+                  "median": v["final_median"] if v["final_median"] is not None else v["deal_median"]}
+              for k, v in dealer_prof.items() if (v["final_median"] or v["deal_median"]) is not None}
+    steps = {k: v["best_by"]["step"] for k, v in dealer_prof.items() if v.get("best_by") and v["best_by"]["step"]}
+    buyers_by_set = collections.defaultdict(list)
+    for team, p in team_prof.items():
+        if team == US:
+            continue
+        for s in p["set_interest"]:
+            buyers_by_set[s].append(team)
+    leaders = [t for t, p in sorted(team_prof.items(), key=lambda kv: kv[1]["rank"] or 99)[:3]]
+    return {
+        "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "dealer_finals": finals,                       # → strategy/dealers.PARAMS["FINALS"]
+        "dealer_best_steps": steps,                    # step used by the team that got the best price
+        "p2p_median_by_rarity": {r: round(v, 1) for r, v in rmed.items()},
+        "buyers_by_set": dict(buyers_by_set),          # who to target when selling a set
+        "leaders": leaders,                            # never trade on their venues
+    }
+
+
+def render(dealer_prof, team_prof, rmed, recs, q):
+    L = [f"# Inteligencia de mercado — {recs['generated']}", ""]
+    clock = q("SELECT payload FROM json_snapshots WHERE kind='clock' ORDER BY snap_ts DESC LIMIT 1")
+    if clock:
+        L.append(f"Ronda: {json.loads(clock[0][0]).get('round_name')}")
+    L += ["", "## Clasificación y perfil de equipos", "",
+          "| # | Equipo | Score | Δ1h | Neg | MM | Nivel | Álbum | Dealer: tratos/hilos | Captura rango | Apertura vs dealer | Paso | P2P compra/venta | Compra vs mercado | Venta vs mercado | Le interesa | Le sobra | Mercado propio |",
+          "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for team, p in sorted(team_prof.items(), key=lambda kv: kv[1]["rank"] or 99):
+        L.append(f"| {p['rank']} | {p['name'] or team} ({team}) | {p['score']} | {p['score_delta_1h']} | {p['neg']} | {p['mkt']} | "
+                 f"{p['level']} | {p['album']} | {p['dealer_deals']}/{p['dealer_threads']} | {p['dealer_capture']} | "
+                 f"{p['dealer_open_ratio']} | {p['dealer_step']} | {p['p2p_bought']}/{p['p2p_sold']} | "
+                 f"{p['buy_price_vs_market']} | {p['sell_price_vs_market']} | {', '.join(p['set_interest'])} | "
+                 f"{', '.join(p['set_disinterest'])} | {'; '.join(p['venues'])} |")
+    L += ["", "## Dealers: cómo ceden", "",
+          "| Dealer · modo · artículo | Hilos | Tratos | Apertura | Final (mediana) | Trato mediano | Mejor trato | Lo consiguió | Cesión/ronda | Rondas |",
+          "|---|---|---|---|---|---|---|---|---|---|"]
+    for k, v in sorted(dealer_prof.items()):
+        b = v["best_by"]
+        who = f"{b['team']} (abre {b['team_open']}, paso {b['step']}, {b['rounds']} r.)" if b else ""
+        L.append(f"| {k.replace('|', ' · ')} | {v['threads']} | {v['deals']} | {v['open_median']} | {v['final_median']} | "
+                 f"{v['deal_median']} | {v['deal_best']} | {who} | {v['dealer_concession_per_round']} | {v['rounds_median']} |")
+    L += ["", "## Precios P2P liquidados (mediana por carta suelta)", ""]
+    L += [f"- {r}: {round(v, 1)} P" for r, v in sorted(rmed.items())]
+    L += ["", "## A quién vender cada set", ""]
+    L += [f"- {s}: {', '.join(t)}" for s, t in sorted(recs["buyers_by_set"].items())]
+    L += ["", f"Líderes (no operar en sus mercados): {', '.join(recs['leaders'])}", ""]
+    return "\n".join(L)
+
+
+def run_once() -> None:
+    db = sqlite3.connect(DB)
+    q, dealers = load(db)
+    hs = haggles(q, dealers)
+    dprof = dealer_profiles(hs)
+    tprof, rmed = team_profiles(q, hs, dprof)
+    recs = recommendations(dprof, tprof, rmed)
+    db.executescript("""
+      CREATE TABLE IF NOT EXISTS profile_team (ts REAL, team TEXT, payload TEXT);
+      CREATE TABLE IF NOT EXISTS profile_dealer (ts REAL, key TEXT, payload TEXT);""")
+    now = time.time()
+    db.executemany("INSERT INTO profile_team VALUES (?,?,?)", [(now, t, json.dumps(p)) for t, p in tprof.items()])
+    db.executemany("INSERT INTO profile_dealer VALUES (?,?,?)", [(now, k, json.dumps(p)) for k, p in dprof.items()])
+    db.commit()
+    for path, text in ((REPORT, render(dprof, tprof, rmed, recs, q)), (RECS, json.dumps(recs, indent=1))):
+        with open(path + ".tmp", "w") as f:
+            f.write(text)
+        os.replace(path + ".tmp", path)
+    print(time.strftime("%H:%M:%S"), f"profiled {len(tprof)} teams, {len(dprof)} dealer items, {len(hs)} haggles", flush=True)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "loop":
+        while True:
+            try:
+                run_once()
+            except Exception as e:  # never die: keep profiling on the next cycle
+                print("profiler error:", repr(e), flush=True)
+            time.sleep(300)
+    else:
+        run_once()

@@ -155,7 +155,17 @@ class Tuner:
 
     # ── dealers ─────────────────────────────────────────────────────────
     def learn_dealer_finals(self) -> None:
-        """Median final price per (dealer, topic kind) from every public haggle we recorded."""
+        """Median final price per (dealer, topic kind) from every public haggle we recorded.
+        Prefers intel/recommendations.json (the profiler's richer view) when it is fresh."""
+        recs = os.path.join(ROOT, "intel", "recommendations.json")
+        if os.path.exists(recs) and time.time() - os.path.getmtime(recs) < 1800:
+            finals = json.load(open(recs)).get("dealer_finals") or {}
+            finals = {k: v for k, v in finals.items() if "?" not in k and v.get("median") is not None}
+            if finals and finals != self.j.get("dealer_finals"):
+                self.j.put("dealer_finals", finals)
+                S_dealers.PARAMS["FINALS"] = finals
+                tlog(f"dealer finals from profiler: {finals}")
+            return
         if not os.path.exists(INTEL):
             return
         db = sqlite3.connect(INTEL)

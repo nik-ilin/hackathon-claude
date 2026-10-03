@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS leaderboard (
 CREATE TABLE IF NOT EXISTS my_values (
   snap_ts REAL, tick INTEGER, ref TEXT, value_next REAL, held INTEGER, PRIMARY KEY (snap_ts, ref));
 CREATE TABLE IF NOT EXISTS me_snapshots (snap_ts REAL PRIMARY KEY, tick INTEGER, payload TEXT);
+CREATE TABLE IF NOT EXISTS board_snapshots (
+  snap_ts REAL, tick INTEGER, venue TEXT, offer_id INTEGER, maker TEXT, too TEXT,
+  give_cash INTEGER, give_assets TEXT, give_types TEXT, want_cash INTEGER, want_types TEXT,
+  created_tick INTEGER, expires_tick INTEGER, PRIMARY KEY (snap_ts, venue, offer_id));
+CREATE TABLE IF NOT EXISTS json_snapshots (snap_ts REAL, tick INTEGER, kind TEXT, payload TEXT,
+  PRIMARY KEY (snap_ts, kind));
+CREATE TABLE IF NOT EXISTS duel_snapshots (snap_ts REAL, tick INTEGER, duel INTEGER, payload TEXT,
+  PRIMARY KEY (snap_ts, duel));
 """
 
 
@@ -200,6 +208,37 @@ def backfill_provenance(b, db, max_misses: int = 40) -> int:
     return n
 
 
+def snapshot_json(db, tick: int, kind: str, payload, last: dict) -> bool:
+    """Store a JSON snapshot only when it changed since the last one of that kind."""
+    blob = json.dumps(payload, sort_keys=True)
+    if last.get(kind) == blob:
+        return False
+    last[kind] = blob
+    db.execute("INSERT OR REPLACE INTO json_snapshots VALUES (?,?,?,?)", (time.time(), tick, kind, blob))
+    db.commit()
+    return True
+
+
+def snapshot_boards(b, db, tick: int, venues: list) -> int:
+    ts, n = time.time(), 0
+    for v in venues:
+        if v.get("status") != "open":
+            continue
+        try:
+            offers = b.board(v["venue"]).get("offers", [])
+        except BazaarError:
+            continue
+        for o in offers:
+            g, w = o.get("give") or {}, o.get("want") or {}
+            db.execute("INSERT OR REPLACE INTO board_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (ts, tick, v["venue"], o.get("id"), o.get("maker"), o.get("to"), g.get("cash"),
+                        json.dumps(g.get("assets", [])), json.dumps(g.get("types", [])), w.get("cash"),
+                        json.dumps(w.get("types", [])), o.get("created_tick"), o.get("expires_tick")))
+            n += 1
+    db.commit()
+    return n
+
+
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "backfill"
     b = Bazaar(URL, KEY, wait_on_tick=False)
@@ -219,20 +258,44 @@ def main() -> None:
         print("snapshots done")
         print("assets crawled:", backfill_provenance(b, db))
     elif mode == "loop":
-        last_lb = 0.0
+        # read-only: public endpoints every cycle; our own state (me, duels) with the key if present
+        last_lb = last_board = last_slow = 0.0
+        last_json: dict = {}
+        venues: list = []
+        seen_threads: set = set()
         while True:
             try:
                 f = b.feed(limit=500)
                 n = ingest_feed(db, f.get("events", f))
                 clock = b.clock()
-                if time.time() - last_lb > 300:
-                    snapshot_leaderboard(b, db, clock.get("tick", 0))
-                    last_lb = time.time()
+                tick = clock.get("tick", 0)
+                now = time.time()
+                if now - last_lb > 120:
+                    snapshot_leaderboard(b, db, tick)
+                    last_lb = now
+                if now - last_board > 60 and not clock.get("paused"):
+                    venues = b.venues().get("venues", [])
+                    snapshot_json(db, tick, "venues", venues, last_json)
+                    snapshot_boards(b, db, tick, venues)
+                    last_board = now
+                if now - last_slow > 300:
+                    snapshot_json(db, tick, "dealers", b.dealers(), last_json)
+                    snapshot_json(db, tick, "levels", b.levels(), last_json)
+                    snapshot_json(db, tick, "schedule", b.schedule().get("upcoming", []), last_json)
+                    snapshot_json(db, tick, "clock", {k: clock.get(k) for k in ("round", "round_name", "tick_seconds", "limits", "doors")}, last_json)
+                    if KEY:
+                        snapshot_me(b, db, tick)
+                    last_slow = now
+                if KEY and not clock.get("paused"):
+                    for d in b.duels().get("duels", []):
+                        db.execute("INSERT OR REPLACE INTO duel_snapshots VALUES (?,?,?,?)",
+                                   (now, tick, d.get("duel"), json.dumps(d)))
+                    db.commit()
                 if n:
-                    print(time.strftime("%H:%M:%S"), "tick", clock.get("tick"), "+", n, "events", flush=True)
+                    print(time.strftime("%H:%M:%S"), "tick", tick, "+", n, "events", flush=True)
             except Exception as exc:  # keep recording through network blips
                 print("collector error:", exc, flush=True)
-            time.sleep(15)
+            time.sleep(10)
 
 
 if __name__ == "__main__":

@@ -9,5 +9,6 @@ case "$1" in
   broker)    [ -s state/broker_key.txt ] || { sleep 30; exit 0; }
              MODE=$(cat state/BROKER_MODE 2>/dev/null || echo v2); FLAGS=$(cat state/BROKER_FLAGS 2>/dev/null)
              exec $PY -u -m bazaar.broker --mode "$MODE" $FLAGS ;;
-  collector) unset BAZAAR_KEY; exec $PY -u intel/collector.py loop ;;
+  profiler)  exec $PY -u intel/profiler.py loop ;;
+  collector) exec $PY -u intel/collector.py loop ;;   # read-only: GETs only (me/duels need the key)
 esac
