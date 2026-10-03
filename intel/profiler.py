@@ -169,6 +169,8 @@ def team_profiles(q, hs, dealer_prof):
     venues = {}
     for (payload,) in q("SELECT payload FROM json_snapshots WHERE kind='venues' ORDER BY snap_ts DESC LIMIT 1"):
         for v in json.loads(payload):
+            if v.get("status") == "closed":     # replaced starter stalls stay listed as closed
+                continue
             venues.setdefault(v.get("owner"), []).append(v)
 
     # score deltas are only comparable inside a round: measure since the current round started
