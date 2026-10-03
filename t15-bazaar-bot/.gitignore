@@ -1,0 +1,14 @@
+# secrets and runtime state — never commit
+state/
+logs/
+*.log
+*.log.*
+broker_key.txt
+deal_history.json
+.env
+# data
+intel/*.db
+intel/*.db-*
+__pycache__/
+*.pyc
+*.bak_*

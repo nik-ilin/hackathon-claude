@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.team15.agent</string>
+  <key>ProgramArguments</key><array><string>/Users/Cibran/bazaar-bot/ops/run.sh</string><string>agent</string></array>
+  <key>EnvironmentVariables</key><dict><key>AGENT_ARGS</key><string></string></dict>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/Users/Cibran/bazaar-bot/logs/agent.log</string>
+  <key>StandardErrorPath</key><string>/Users/Cibran/bazaar-bot/logs/agent.log</string>
+</dict></plist>
