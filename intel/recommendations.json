@@ -1,33 +1,37 @@
 {
- "generated": "2026-10-03 09:02:23",
+ "generated": "2026-10-03 10:07:31",
  "dealer_finals": {
   "abuela|buy|sobre_barrio": {
-   "n": 1,
-   "median": 17
+   "n": 5,
+   "median": 21.5
   },
   "abuela|?|?": {
    "n": 10,
    "median": 20.0
   },
   "abuela|buy|uncommon": {
-   "n": 2,
-   "median": 25
+   "n": 8,
+   "median": 22
   },
   "abuela|sell|lote3": {
    "n": 1,
    "median": 16
   },
   "abuela|sell|common": {
-   "n": 4,
-   "median": 6
+   "n": 6,
+   "median": 6.0
+  },
+  "abuela|buy|common": {
+   "n": 10,
+   "median": 8
   },
   "chato|?|?": {
    "n": 4,
    "median": 22.5
   },
   "chato|buy|rare": {
-   "n": 1,
-   "median": 93
+   "n": 3,
+   "median": 92
   },
   "chato|buy|sobre_plata": {
    "n": 1,
@@ -40,53 +44,100 @@
   "abuela|sell|uncommon": {
    "n": 1,
    "median": 14
+  },
+  "abuela|buy|carta": {
+   "n": 20,
+   "median": 24
+  },
+  "chato|buy|uncommon": {
+   "n": 4,
+   "median": 27.0
+  },
+  "chato|sell|lote2": {
+   "n": 1,
+   "median": 26
+  },
+  "chato|buy|carta": {
+   "n": 6,
+   "median": 86.5
+  },
+  "chato|sell|?": {
+   "n": 3,
+   "median": 14.5
+  },
+  "abuela|sell|?": {
+   "n": 7,
+   "median": 5.5
+  },
+  "abuela|sell|lote2": {
+   "n": 1,
+   "median": 10
   }
  },
  "dealer_best_steps": {
   "abuela|buy|sobre_barrio": 1.0,
-  "abuela|buy|uncommon": 1,
+  "abuela|buy|uncommon": 2,
   "abuela|sell|lote3": 1.0,
   "abuela|sell|common": 1,
-  "chato|buy|rare": 3.0,
+  "abuela|buy|common": 1,
+  "chato|buy|rare": 4,
   "chato|buy|sobre_plata": 10,
   "chato|sell|uncommon": 2,
-  "abuela|sell|uncommon": 2
+  "abuela|sell|uncommon": 2,
+  "abuela|buy|carta": 1,
+  "chato|buy|uncommon": 3,
+  "chato|buy|carta": 1,
+  "chato|sell|?": 1.0,
+  "abuela|sell|?": 1
  },
  "p2p_median_by_rarity": {
   "common": 8.5,
-  "uncommon": 23,
-  "rare": 80
+  "uncommon": 25,
+  "rare": 76.0
  },
  "buyers_by_set": {
   "LAV": [
    "t04",
    "t08",
+   "t03",
    "t05",
    "t02",
+   "t13",
+   "t06",
    "t14"
   ],
   "LAT": [
    "t04",
-   "t18",
-   "t02"
-  ],
-  "SAL": [
    "t08",
    "t18",
-   "t05",
-   "t13",
-   "t06"
+   "t03"
   ],
   "MAL": [
-   "t08",
+   "t01",
    "t05",
    "t17",
-   "t02"
+   "t02",
+   "t10"
+  ],
+  "SAL": [
+   "t01",
+   "t08",
+   "t18",
+   "t03",
+   "t16",
+   "t06"
+  ],
+  "RET": [
+   "t18",
+   "t05",
+   "t02",
+   "t10",
+   "t13"
   ]
  },
  "leaders": [
-  "t13",
   "t12",
-  "t17"
+  "t18",
+  "t13"
  ]
 }
