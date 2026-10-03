@@ -566,6 +566,32 @@ class DealerSellTest(unittest.TestCase):
         st = self.state(opening=4, current=4, final=True)
         self.assertEqual(neg.decide_dealer_sell(st, neg.dealer_policy("picaros"), 13, 5).action, "abandon")
 
+    def test_ancla_la_primera_peticion_al_techo_observado_si_existe(self):
+        """playbook.py deriva, de data/feed_history.jsonl: pilar LAT-08 techo 19 -> abrir 21, paso 2."""
+        d = neg.decide_dealer_sell(self.state(opening=10), neg.dealer_policy("pilar"), 13, 6, ceiling_seen=19)
+        self.assertEqual((d.action, d.price), ("counter", 21))
+        self.assertIn("techo observado", d.reason)
+
+    def test_el_multiplo_es_solo_respaldo_sin_observacion(self):
+        # anclar al múltiplo de su puja de apertura es un ancla equivocada: con puja 50 y techo real 71,
+        # 2.2x son 110 y se gastan las rondas por encima de lo que paga
+        sin_techo = neg.decide_dealer_sell(self.state(opening=50), neg.dealer_policy("pilar"), 13, 6)
+        con_techo = neg.decide_dealer_sell(self.state(opening=50), neg.dealer_policy("pilar"), 13, 6,
+                                           ceiling_seen=71)
+        self.assertEqual(sin_techo.price, 110)
+        self.assertEqual(con_techo.price, 73)
+        self.assertIn("sin techo observado", sin_techo.reason)
+
+    def test_el_paso_de_venta_sigue_lo_observado_por_vendedor(self):
+        self.assertEqual(neg.dealer_policy("abuela").sell_step, 1)   # playbook: paso 1, 6 rondas
+        self.assertEqual(neg.dealer_policy("pilar").sell_step, 2)    # playbook: paso 2, 5 rondas
+        self.assertEqual(neg.dealer_policy("chato").sell_step, 4)    # playbook: paso 4, 5 rondas
+
+    def test_un_techo_bajo_el_suelo_no_manda_sobre_el_suelo(self):
+        d = neg.decide_dealer_sell(self.state(opening=4), neg.dealer_policy("pilar"), 110, 6, ceiling_seen=9)
+        self.assertEqual(d.action, "counter")
+        self.assertGreaterEqual(d.price, 110)
+
     def test_espera_si_aun_no_ha_pujado(self):
         st = neg.NegState(item="sell:7")
         self.assertEqual(neg.decide_dealer_sell(st, neg.dealer_policy("pilar"), 13, 6).action, "wait")

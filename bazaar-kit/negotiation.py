@@ -431,8 +431,9 @@ class DealerPolicy:
     accept_gap: int = 1
     min_viable_frac: float = 0.8     # si nuestro máximo < 80 % de su precio, mejor otro artículo
     secure: bool = False             # SECURE: cerrar un trato negociado válido en cuanto exista (ver ladder_mode)
-    sell_open_mult: float = 2.0      # VENTA: primera petición = múltiplo de su primera puja
+    sell_open_mult: float = 2.0      # VENTA: primera petición = múltiplo de su primera puja, solo sin techo observado.
     sell_gap_frac: float = 0.35      # VENTA: cada concesión nuestra cierra esta fracción de la brecha, bajando
+    sell_step: int = 2               # VENTA: paso en primas sobre un techo observado (derivado por playbook.py)
 
 
 # Rasgos leídos de /api/dealers el 2026-10-03 (patience / shrewdness / memory). La paciencia manda en cuántas
@@ -443,14 +444,18 @@ class DealerPolicy:
 #   picaros 0.40 / 0.70 / 0.30   impaciente; ofertas con truco -> validar siempre los assets
 DEALER_TRAITS = {
     "abuela":  dict(open_frac=0.45, gap_frac=0.30, max_counteroffers=3, max_ticks=8,
-                    sell_open_mult=2.4, sell_gap_frac=0.25),
+                    sell_open_mult=2.4, sell_gap_frac=0.25, sell_step=1),
     "chato":   dict(open_frac=0.55, gap_frac=0.40, max_counteroffers=2, max_ticks=5,
-                    sell_open_mult=1.8, sell_gap_frac=0.40),
+                    sell_open_mult=1.8, sell_gap_frac=0.40, sell_step=4),
     "pilar":   dict(open_frac=0.50, gap_frac=0.35, max_counteroffers=3, max_ticks=6,
-                    sell_open_mult=2.2, sell_gap_frac=0.30),
+                    sell_open_mult=2.2, sell_gap_frac=0.30, sell_step=2),
     "picaros": dict(open_frac=0.50, gap_frac=0.40, max_counteroffers=2, max_ticks=5,
-                    sell_open_mult=2.0, sell_gap_frac=0.35),
+                    sell_open_mult=2.0, sell_gap_frac=0.35, sell_step=3),
 }
+
+# `sell_step` sale de playbook.py sobre data/feed_history.jsonl (15 planes, 9 con cierre observado):
+#   abuela  paso 1, 6 rondas    pilar  paso 2, 5 rondas    chato  paso 4, 5 rondas
+# `picaros` no tiene observaciones todavía: 3 es interpolación, no medición.
 
 
 def dealer_policy(dealer: str, mode: str = "score") -> DealerPolicy:
@@ -468,10 +473,11 @@ def dealer_policy(dealer: str, mode: str = "score") -> DealerPolicy:
     t = DEALER_TRAITS.get(dealer)
     if t is None:  # vendedor nuevo: prudente, pero nunca a precio de apertura
         t = dict(open_frac=0.55, gap_frac=0.40, max_counteroffers=2, max_ticks=5,
-                 sell_open_mult=1.9, sell_gap_frac=0.35)
+                 sell_open_mult=1.9, sell_gap_frac=0.35, sell_step=2)
     return DealerPolicy(dealer, t["open_frac"], t["gap_frac"], t["max_counteroffers"], t["max_ticks"],
                         accept_on_concession=mode != "score", allow_opening_price=allow,
-                        sell_open_mult=t["sell_open_mult"], sell_gap_frac=t["sell_gap_frac"])
+                        sell_open_mult=t["sell_open_mult"], sell_gap_frac=t["sell_gap_frac"],
+                        sell_step=t["sell_step"])
 
 
 def price_floor(value_lost: float, margin: float = 0.0) -> int:
@@ -484,11 +490,18 @@ def price_floor(value_lost: float, margin: float = 0.0) -> int:
 
 
 def decide_dealer_sell(st: NegState, pol: DealerPolicy, floor: int, conv_ticks_left: int,
-                       total_ticks_left: int = 10 ** 9) -> Decision:
+                       total_ticks_left: int = 10 ** 9, ceiling_seen: Optional[int] = None) -> Decision:
     """Lado VENDEDOR: su precio es una PUJA, así que queremos el máximo y concedemos bajando.
 
     Simétrico a decide_dealer: nunca por debajo del suelo, nunca repite ni sube una petición ya hecha, y en modo
-    score nunca cierra a su puja de apertura (su apertura es su puja más BAJA: aceptarla captura rango ~0)."""
+    score nunca cierra a su puja de apertura (su apertura es su puja más BAJA: aceptarla captura rango ~0).
+
+    `ceiling_seen` es el techo observado para ESE vendedor y ESA carta, el `floor_seen` de playbook.py. Cuando
+    existe, la primera petición se ancla ahí (techo + `sell_step`), que es lo que hace playbook: pilar LAT-08
+    techo 19 -> abrir 21, paso 2; pilar SAL-10 techo 71 -> abrir 77. El múltiplo `sell_open_mult` queda sólo como
+    respaldo cuando no hay observación, porque anclarlo a su PUJA DE APERTURA es un ancla equivocada: si abre en
+    50 sobre una carta cuyo techo son 71, 2.2x son 110 y se gastan las rondas por encima de lo que paga.
+    """
     live, n = st.live, st.turns
 
     def valid(price: int) -> bool:
@@ -525,9 +538,13 @@ def decide_dealer_sell(st: NegState, pol: DealerPolicy, floor: int, conv_ticks_l
     bid = st.ref_ask
     lo = max(floor, bid + 1)  # pedir su puja o menos no tiene sentido: entonces se acepta
     if n == 0:
+        if ceiling_seen is not None and ceiling_seen >= floor:
+            p = max(int(ceiling_seen) + pol.sell_step, lo)
+            return Decision("counter", f"primera petición: techo observado {ceiling_seen} P + paso "
+                                       f"{pol.sell_step} P, con suelo {floor} P", p)
         p = max(int(pol.sell_open_mult * bid + 0.5), lo)
-        return Decision("counter", f"primera petición: {pol.sell_open_mult:.1f}x su puja de {bid} P, "
-                                   f"con suelo {floor} P", p)
+        return Decision("counter", f"primera petición: {pol.sell_open_mult:.1f}x su puja de {bid} P "
+                                   f"(sin techo observado), con suelo {floor} P", p)
     p = max(st.last_ours - math.ceil(pol.sell_gap_frac * (st.last_ours - bid)), lo)
     if p >= st.last_ours:
         p = st.last_ours - 1
