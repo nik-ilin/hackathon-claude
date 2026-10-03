@@ -247,6 +247,17 @@ def render(dealer_prof, team_prof, rmed, recs, q):
         who = f"{b['team']} (abre {b['team_open']}, paso {b['step']}, {b['rounds']} r.)" if b else ""
         L.append(f"| {k.replace('|', ' · ')} | {v['threads']} | {v['deals']} | {v['open_median']} | {v['final_median']} | "
                  f"{v['deal_median']} | {v['deal_best']} | {who} | {v['dealer_concession_per_round']} | {v['rounds_median']} |")
+    # Market Test: who beats the free stall (stall = the modal market score)
+    mm = [(p["mkt"], t, p["venues"]) for t, p in team_prof.items() if p.get("mkt") is not None]
+    if mm:
+        stall = st.mode([m for m, _, _ in mm])
+        L += ["", f"## Market Test — puesto gratuito = {stall}", ""]
+        for m, t, v in sorted(mm, reverse=True):
+            if m != stall:
+                tag = "SUPERA al puesto" if m > stall else "por DEBAJO del puesto"
+                L.append(f"- {t}: {m} ({tag}) · {'; '.join(v) or 'sin mercado propio'}")
+        for (tick, payload) in q("SELECT tick, payload FROM events WHERE type LIKE 'bench.%' ORDER BY tick DESC LIMIT 3"):
+            L.append(f"- evento tick {tick}: {payload[:160]}")
     L += ["", "## Precios P2P liquidados (mediana por carta suelta)", ""]
     L += [f"- {r}: {round(v, 1)} P" for r, v in sorted(rmed.items())]
     L += ["", "## A quién vender cada set", ""]
