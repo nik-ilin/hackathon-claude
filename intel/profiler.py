@@ -272,6 +272,23 @@ def render(dealer_prof, team_prof, rmed, recs, q):
               f"- Distancia al 1º: {si['gap_to_first']} · tendencia últimas instantáneas: {si['our_trend_last_snapshots']}"]
         L += [f"- Palanca {i}: {t}" for i, t in enumerate(si["levers"], 1)]
         L += ["- Parámetros aprendidos del mejor trato por dealer/artículo en `recommendations.json` → `self_improve.dealer_params`", ""]
+    # venue changes over the last ~hour of snapshots (fee cuts, new venues, first trades)
+    vs = q("SELECT tick, payload FROM json_snapshots WHERE kind='venues' ORDER BY snap_ts DESC LIMIT 7")
+    if len(vs) > 1:
+        def vmap(p):
+            return {v["venue"]: v for v in json.loads(p)}
+        new, old = vmap(vs[0][1]), vmap(vs[-1][1])
+        ch = []
+        for vid, v in new.items():
+            o = old.get(vid)
+            if o is None:
+                ch.append(f"{vid} nuevo de {v['owner']} ({v['fee_bps']}bps {v['rules'].get('mechanism')})")
+            else:
+                if o["fee_bps"] != v["fee_bps"]:
+                    ch.append(f"{vid} ({v['owner']}) comisión {o['fee_bps']}→{v['fee_bps']}bps")
+                if (v.get("trades") or 0) > (o.get("trades") or 0):
+                    ch.append(f"{vid} ({v['owner']}) tratos {o.get('trades') or 0}→{v['trades']}")
+        L += [f"## Cambios en mercados (ticks {vs[-1][0]}→{vs[0][0]})", ""] + [f"- {c}" for c in ch or ["sin cambios"]] + [""]
     clock = q("SELECT payload FROM json_snapshots WHERE kind='clock' ORDER BY snap_ts DESC LIMIT 1")
     if clock:
         L.append(f"Ronda: {json.loads(clock[0][0]).get('round_name')}")
