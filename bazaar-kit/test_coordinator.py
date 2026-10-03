@@ -57,11 +57,13 @@ class Policies(unittest.TestCase):
     def test_abuela_score_mode_uses_significant_steps_and_never_pays_the_opening_price(self):
         pol = neg.dealer_policy("abuela", "score")
         d = neg.decide_dealer(self.st([her(1, 41, 12)], 41), pol, 11, 8)
-        self.assertEqual((d.action, d.price), ("counter", 8))  # 65 % de 12: sin aperturas extremas
-        msgs = [her(1, 41, 12, "cancelled"), ours(2, 41, 8), her(3, 42, 12)]
+        # 45 % de 12: con patience 0.85 y shrewdness 0.20 aguanta una apertura baja, y la escalera paga
+        # cuota de rango capturada, así que abrir cerca de su precio regala el tramo que puntúa.
+        self.assertEqual((d.action, d.price), ("counter", 5))
+        msgs = [her(1, 41, 12, "cancelled"), ours(2, 41, 5), her(3, 42, 12)]
         d = neg.decide_dealer(self.st(msgs, 42), pol, 11, 7)
-        self.assertEqual((d.action, d.price), ("counter", 10))  # 8 + ceil(0.4 * 4): no pasos de 1 P
-        stalled = msgs[:2] + [her(3, 42, 12, "cancelled"), ours(4, 42, 10), her(5, 43, 12, "cancelled"),
+        self.assertEqual((d.action, d.price), ("counter", 8))  # 5 + ceil(0.30 * 7): no pasos de 1 P
+        stalled = msgs[:2] + [her(3, 42, 12, "cancelled"), ours(4, 42, 8), her(5, 43, 12, "cancelled"),
                               ours(6, 43, 11), her(7, 44, 12)]
         self.assertEqual(neg.decide_dealer(self.st(stalled, 44), pol, 20, 5).action, "abandon",
                          "estancada en su apertura: en modo score no se compra a precio inicial")
@@ -74,9 +76,14 @@ class Policies(unittest.TestCase):
         self.assertEqual(neg.decide_dealer(self.st(msgs, 42), pol, 11, 7).action, "accept")
         self.assertEqual(neg.decide_dealer(self.st(msgs, 42), pol, 9, 7).action, "abandon")
 
-    def test_chato_is_short(self):
+    def test_chato_is_short_but_no_longer_opens_at_his_own_price(self):
+        """El fallback anterior era open_frac=0.90 con UNA contraoferta y accept_on_concession=True: cerraba en la
+        parte baja del rango y gastaba una de las 3 casillas que puntúan en su nivel. Chato sigue siendo el corto
+        (patience 0.35 rompe el hilo), pero corto no es sumiso."""
         pol = neg.dealer_policy("chato", "score")
-        self.assertEqual((pol.open_frac, pol.max_counteroffers, pol.accept_on_concession), (0.9, 1, True))
+        self.assertEqual((pol.open_frac, pol.max_counteroffers, pol.accept_on_concession), (0.55, 2, False))
+        self.assertLess(pol.max_ticks, neg.dealer_policy("abuela", "score").max_ticks)
+        self.assertGreater(pol.gap_frac, neg.dealer_policy("abuela", "score").gap_frac)  # menos rondas, pasos mayores
 
     def test_restart_counts_previous_counteroffers_and_never_repeats(self):
         msgs = [her(1, 41, 12, "cancelled"), ours(2, 41, 8), her(3, 42, 11, "cancelled"), ours(4, 42, 10),
