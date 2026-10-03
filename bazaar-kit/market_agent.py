@@ -15,6 +15,7 @@ import time
 
 from bazaar_sdk import Bazaar, BazaarError
 from negotiation import InstanceLock, Journal
+import page_guard
 import trading
 
 HERE = Path(__file__).resolve().parent
@@ -261,6 +262,12 @@ def execute_one(reader, state, path, action, args):
                  committed_budget=state.get("committed", 0))
     if action not in fresh["actions"]:
         raise ValueError("La oportunidad ha cambiado: ejecuta de nuevo el análisis")
+    as_cand = {"type": {"sell": "accept", "buy": "accept"}.get(action["action"], action["action"]),
+               "offer": action.get("offer"), "asset": action.get("asset") if action["action"] != "buy" else None}
+    protect = page_guard.guard_candidate(as_cand, s, page_guard.committed_assets(s["offers"].get("offers", []),
+                                                                                 s["me"]["id"]))
+    if protect:  # prioridad 1: nunca romper una página completa
+        raise ValueError("PROTECTED_PAGE_BLOCK: " + "; ".join(protect))
     active = s["offers"].get("offers", [])
     limits = s["clock"].get("limits", {})
     if action["action"] in ("bid", "list"):
@@ -577,6 +584,10 @@ def execute_v2(reader, led, args, key):
     a = next((o for o in pl["opportunities"] if o["key"] == key), None)
     if a is None or a["blockers"]:
         raise ValueError("La oportunidad ha cambiado o está bloqueada: vuelve a analizar")
+    protect = page_guard.guard_candidate(a, s, page_guard.committed_assets(s["offers"].get("offers", []), team,
+                                                                           trading.resources([], team, pendings_v2(led)).locked_assets))
+    if protect:  # prioridad 1: nunca romper una página completa
+        raise ValueError("PROTECTED_PAGE_BLOCK: " + "; ".join(protect))
     if any(x.get("key") == key and x["status"] in ("intent", "ambiguous", "submitted") for x in led["actions"]):
         raise ValueError("Esa acción ya se envió (idempotencia)")
     if led.get("last_action_tick") == tick:

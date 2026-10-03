@@ -21,6 +21,7 @@ from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
+import page_guard as pg
 import trading as tr
 
 RARITY_SCARCITY = {"common": 0.1, "uncommon": 0.3, "rare": 0.6, "epic": 0.85, "legendary": 1.0}
@@ -636,8 +637,12 @@ def plan(snap: dict, cfg: IntelConfig, *, pendings: list = (), spent: int = 0, a
 
     def add(o):
         o.setdefault("blockers", [])
-        if not ok:
+        if not ok and not o.get("protected_page_cancel"):  # la protección no depende de la valoración
             o["blockers"].append("valoración no verificada")
+        protect = pg.guard_candidate(o, snap, res.locked_assets)  # prioridad 1: inviable, no "muy negativa"
+        if protect:
+            o["blockers"] = protect + o["blockers"]
+            o["protected_page_block"] = True
         o["key"] = tr.idem_key({**o, "give": o.get("venue"), "want": o.get("to")})
         out["opportunities"].append(o)
 
@@ -815,9 +820,14 @@ def plan(snap: dict, cfg: IntelConfig, *, pendings: list = (), spent: int = 0, a
                 break
 
     # 5. Reprecio de nuestras ofertas abiertas (sin guerra infinita) y retirada de las que ya no tienen sentido.
+    #    Primero, seguridad: una oferta abierta que ahora rompería una página completa se retira YA.
+    unsafe = pg.unsafe_open_offers(ours, team, counts, catalog, me["assets"])
+    for c in unsafe:
+        add(dict(c, blockers=[]))
+    unsafe_ids = {c["offer"] for c in unsafe}
     for o in ours:
         c = classify(o)
-        if not c or o.get("venue") not in venues:
+        if not c or o.get("venue") not in venues or o.get("id") in unsafe_ids:
             continue
         kind, ref, price, asset, _ = c
         st = states.get(ref)

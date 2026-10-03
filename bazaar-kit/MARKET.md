@@ -91,3 +91,17 @@ Novedades:
 - Publica en El Duende (v02) con 120 ticks, rebaja sin bajar del suelo y para las guerras de precios.
 - Repuja en escalera, publica trueques sin efectivo y pujas dirigidas con evidencia, y reprecia sus propias ofertas.
 - Detalles completos en ARCHITECTURE.md → «DAY 2 STRATEGY».
+
+## COMPLETED PAGE PROTECTION
+
+> Once a page is completed, the agent treats the minimum set of cards required to preserve that page as non-tradeable inventory. Only duplicate copies beyond the protected requirement may be sold or swapped.
+
+- **Restricción dura, prioridad 1**, por encima de cualquier ΔU, precio, liquidez o puntuación estratégica.
+- **Acciones cubiertas:** venta, publicación, trueque, lote, oferta dirigida, propuesta a equipos, vendedores, arbitraje y reprecio.
+- **Solo salen duplicados por encima del mínimo:** `tradeable_surplus = max(copias − comprometidas − 1, 0)`.
+- **Una acción que rompería una página es inviable:**
+  - el planificador y el coordinador la marcan con `BLOCKED: card belongs to completed page` antes de ordenar;
+  - `send` la vuelve a comprobar antes de la red.
+- **Ofertas abiertas que se vuelven inseguras** al completar la página se cancelan con prioridad máxima, sin `--cancel-unsafe`.
+- **Cada bloqueo se registra como `PROTECTED_PAGE_BLOCK`**, con página, carta, activo, acción y motivo.
+- **Cambiar la regla** requiere editar `page_guard.py` (`PROTECTION_ENABLED`, `PROTECTED_REQUIRED_COPIES`). Detalles en ARCHITECTURE.md → «COMPLETED PAGE PROTECTION».

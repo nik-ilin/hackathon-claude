@@ -129,3 +129,44 @@ CLOCK → SNAPSHOT (me, catálogo, /api/venues, /api/venues/{id}/offers de CADA 
 **Historial.** `data/market_history.jsonl` guarda resumen del libro por venue y carta, y liquidaciones deduplicadas, con ventana de 240 ticks y poda automática. La tendencia (UP/DOWN/STABLE) solo se calcula con al menos 6 puntos en 5 o más ticks; con menos, UNKNOWN.
 
 **Arbitraje entre venues.** Se informa, no se ejecuta: las dos patas no son atómicas.
+
+## COMPLETED PAGE PROTECTION · prioridad 1
+
+> Once a page is completed, the agent treats the minimum set of cards required to preserve that page as non-tradeable inventory. Only duplicate copies beyond the protected requirement may be sold or swapped.
+
+`page_guard.py` es la capa base de esta regla. La usan el planificador (`market_intel.plan`), el coordinador (candidatas y `send`) y `market_agent.py`, y ninguna estrategia ni flag de línea de comandos puede desactivarla. Solo un humano puede cambiarla, editando `PROTECTION_ENABLED` o `PROTECTED_REQUIRED_COPIES` en el código.
+
+**Orden de seguridad.**
+1. Nunca romper una página completa.
+2. Nunca comprometer dos veces un activo bloqueado.
+3. Nunca superar el efectivo libre ni la reserva.
+4. Optimización económica (ΔU).
+5. Estrategia de mercado.
+
+**Funciones.**
+
+| Función | Qué hace |
+|---|---|
+| `protected_page_cards(counts, catalog)` | Devuelve todas las referencias necesarias para mantener completas las páginas completas actuales. |
+| `protected_required_count(ref)` | Copias protegidas de la referencia: 1 en una página estándar. |
+| `tradeable_surplus(ref) = max(inventario − comprometidas − protegidas, 0)` | Copias que pueden salir. LAT-03 ×1 → 0, ×2 → 1, ×3 → 2. |
+| `validate_protected_assets(...)` | Simula el inventario tras la acción, descontando también las copias ya comprometidas en otras ofertas abiertas (se asume que se llenan). Si una página completa antes deja de estarlo después, la acción es **inviable**: devuelve `BLOCKED: card belongs to completed page — would break completed page <PAGE>`. No es un valor muy negativo que un optimizador pueda compensar. |
+| `delivery_of(candidata)` | Lee qué entregaría cualquier tipo de acción, a partir de sus campos (`deliver`, `assets`, `asset`, `give_ref`, `offer.give`, `want` de la oferta aceptada, `opp.deliver`). Cubre venta, publicación, trueque, lote, oferta dirigida, propuesta a un equipo, apertura de campaña de venta, vendedores, arbitraje, reprecio y tipos futuros que usen los mismos campos. |
+
+**Dónde se aplica (tres barreras).**
+1. **Planificador.** Cada oportunidad pasa por la protección al crearse. Si rompería una página, sale con el bloqueo y no se selecciona.
+2. **Coordinador, antes de ordenar.** `apply_guard` revisa todas las candidatas: mercado, campañas, vendedores y motor básico. Las que romperían una página quedan con `blockers` y fuera de la selección, no con una puntuación baja.
+3. **`send`, última barrera antes de la red.** Si una candidata llega sin bloqueo por cualquier vía, se recalcula la protección con las copias ya comprometidas en este tick. Si rompe una página, no se envía ni se registra la intención. `market_agent.py` aplica la misma barrera en sus dos rutas de escritura.
+
+**Ofertas abiertas.** Si una oferta propia publicada con la página incompleta pasa a ser necesaria para conservarla, `unsafe_open_offers` la retira como acción de seguridad. Las ofertas se acumulan por id y se cancela la que cruza el mínimo protegido.
+- La cancelación tiene puntuación 10⁷.
+- No requiere `--cancel-unsafe`.
+- No depende de que la valoración esté verificada.
+
+**Independiente del bono.** La protección no usa el valor estimado de `page_bonus`: si el modelo cambia o es incierto, la página sigue protegida.
+
+**Fallo cerrado.** Sin catálogo no se puede verificar la protección, y cualquier acción que entregue cartas se bloquea.
+
+**Registro.** Cada bloqueo emite `PROTECTED_PAGE_BLOCK page=<P> card=<REF> asset=<id> action=<tipo> reason=<motivo>`, una vez por combinación y proceso, y queda en `page_guard.EVENTS`.
+
+**Pruebas.** `test_page_guard.py`: 14 casos. Con la protección desactivada fallan 13; el que sigue pasando es el de página incompleta, como debe.

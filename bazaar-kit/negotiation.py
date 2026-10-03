@@ -308,6 +308,14 @@ def message(turn: int, price: int, item_name: str) -> str:
     return MESSAGES[turn % len(MESSAGES)].format(p=price, item=item_name)
 
 
+def dealer_message(dealer: str, turn: int, price: int, item_name: str) -> str:
+    """Texto para una contraoferta: la plantilla de Abuela no debe dirigirse a Chato."""
+    if dealer == "chato":
+        return (f"Voy directo al precio, Chato: {price} P por {item_name}. ¿Cerramos?"
+                if turn == 0 else f"Subo a {price} P por {item_name}. Es mi mejor oferta.")
+    return message(turn, price, item_name)
+
+
 # ------------------------------------------------------------------ modo primera compra (--first-purchase)
 
 @dataclass
@@ -403,7 +411,20 @@ def dealer_policy(dealer: str, mode: str = "score") -> DealerPolicy:
     if dealer == "abuela":
         return DealerPolicy("abuela", 0.65, 0.40, 3, 8, accept_on_concession=not (mode == "score"),
                             allow_opening_price=allow)
+    if dealer == "chato":
+        return chato_policy(mode)
     return DealerPolicy(dealer, 0.90, 0.50, 1, 4, accept_on_concession=True, allow_opening_price=allow)
+
+
+def chato_policy(mode: str = "score") -> DealerPolicy:
+    """Política específica para Chato: negociación corta y precio siempre rentable.
+
+    El máximo económico se calcula fuera, en coordinator.py, con el valor marginal privado,
+    margen mínimo, presupuesto por carta y reserva de efectivo. En modo score no se acepta
+    el precio de apertura, para que el cierre quede por debajo de su ancla.
+    """
+    return DealerPolicy("chato", 0.90, 0.50, 1, 4, accept_on_concession=True,
+                        allow_opening_price=mode != "score")
 
 
 def decide_dealer(st: NegState, pol: DealerPolicy, ceiling: int, conv_ticks_left: int,

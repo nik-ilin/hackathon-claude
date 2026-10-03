@@ -29,6 +29,7 @@ import campaigns as cp
 import market_agent as ma
 import market_intel as mi
 import negotiation as neg
+import page_guard as pg
 import trading as tr
 from bazaar_sdk import Bazaar, BazaarError
 
@@ -187,8 +188,16 @@ def candidates(s, led, args, journal):
         pl = tr.plan(s, cfg, pendings=pend, spent=led["spent_confirmed"])
     cap = max(0, min(pl["free_cash"], pl["budget_left"]))
     out = []
+    # 0. PRIORIDAD 1 — protección de páginas completas: una oferta propia abierta que rompería una página completa se
+    #    retira sin esperar a --cancel-unsafe (restricción dura, no depende de la valoración).
+    protect = pg.unsafe_open_offers(s["offers"].get("offers", []), team, counts, s["catalog"], me["assets"])
+    for c in protect:
+        out.append(dict(c, module="seguridad", blockers=[]))
+    protected_offers = {c["offer"] for c in protect}
     # 1. Seguridad: publicaciones propias que venden la última copia o por debajo del valor.
     for c in tr.unsafe_own_offers(s["offers"].get("offers", []), team, val, counts):
+        if c["offer"] in protected_offers:
+            continue
         c.update(module="seguridad", du=0.0, score=10 ** 6, blockers=[] if args.cancel_unsafe else
                  ["requiere --cancel-unsafe (puede ser una oferta de un compañero)"])
         out.append(c)
@@ -196,6 +205,8 @@ def candidates(s, led, args, journal):
     camp_in = {n.get("receive") for n in led.get("negotiations", {}).values() if n["state"] in cp.ACTIVE} - {None}
     camp_out = {n.get("deliver") for n in led.get("negotiations", {}).values() if n["state"] in cp.ACTIVE} - {None}
     for o in pl["opportunities"]:
+        if o["type"] == "cancel" and o.get("offer") in protected_offers:
+            continue  # ya está la cancelación de seguridad
         o = dict(o, module="mercado")
         gets = set(o.get("receive") or {}) | ({o["ref"]} if o["type"] == "bid" else set())
         gives = set(o.get("deliver") or {}) | ({o["ref"]} if o["type"] == "list" else set())
@@ -402,6 +413,18 @@ def campaign_candidates(s, led, args, pl, execute):
     return out, lines
 
 
+def committed_ids(s, led, exclude_key=None):
+    """Copias nuestras ya comprometidas: ofertas propias abiertas + acciones de este tick o ambiguas sin liquidar."""
+    tick = s["clock"]["tick"]
+    pend = []
+    for a in led.get("actions", []):
+        if a.get("key") == exclude_key or a.get("type") in pg.NON_DELIVERING:
+            continue
+        if a.get("status") == "ambiguous" or (a.get("status") in ("intent", "submitted") and a.get("tick") == tick):
+            pend += list(a.get("assets") or []) + ([a["asset"]] if a.get("asset") is not None else [])
+    return pg.committed_assets(s["offers"].get("offers", []), s["me"]["id"], pend)
+
+
 def _cards_of(c):
     """Cartas que una candidata adquiere o entrega (para no perseguir la misma por dos vías)."""
     if c["type"] in ("cancel", "team_cancel", "team_close", "dealer_close", "info"):
@@ -456,6 +479,11 @@ def send(reader, led, s, c, args, journal):
     if any(a.get("key") == key and a["status"] in ("intent", "ambiguous", "submitted") for a in led["actions"]):
         print(f"   (ya enviada antes, no se repite: {describe(c)})")
         return None
+    # Última barrera antes de la red (prioridad 1): ningún módulo puede saltarse la protección de páginas completas.
+    protect = pg.guard_candidate(c, s, committed_ids(s, led))
+    if protect:
+        print(f"   PROTECTED_PAGE_BLOCK {describe(c)} · {'; '.join(protect)} · NO SE ENVÍA")
+        return None
     rec = {"key": key, "type": c["type"], "module": c["module"], "kind": c["kind"], "tick": tick, "status": "intent",
            "offer": c.get("offer"), "asset": c.get("asset"), "assets": c.get("assets") or ([c["asset"]] if c.get("asset") else []),
            "ref": c.get("ref"), "price": c.get("price"), "cost": max(0, -(c.get("cash") or 0)) or (c.get("price") or 0
@@ -503,7 +531,8 @@ def send(reader, led, s, c, args, journal):
         elif c["type"] == "cancel":
             resp = reader.api.cancel(c["offer"])
         elif c["type"] == "dealer_counter":
-            resp = reader.api.say(c["thread"], neg.message(c.get("turns", 0), c["price"], c["ref"]), price=c["price"])
+            resp = reader.api.say(c["thread"], neg.dealer_message(c["dealer"], c.get("turns", 0),
+                                                                  c["price"], c["ref"]), price=c["price"])
             journal.append("decision", {"dealer": c["dealer"], "item": c["item"], "thread": c["thread"], "tick": tick,
                                         "action": "counter", "price": c["price"], "reason": c.get("reason"),
                                         "mode": f"coord-{args.mode}"})
@@ -515,25 +544,25 @@ def send(reader, led, s, c, args, journal):
         elif c["type"] == "dealer_close":
             resp = reader.api.close_thread(c["thread"])
         elif c["type"] == "team_open":
-            neg = cp.new_negotiation(c["opp"], tick, campaign_cfg(args))
-            neg["state"] = "ambigua"  # hasta saber si la conversación se abrió
-            led["negotiations"][neg["id"]] = neg
+            nrec = cp.new_negotiation(c["opp"], tick, campaign_cfg(args))
+            nrec["state"] = "ambigua"  # hasta saber si la conversación se abrió
+            led["negotiations"][nrec["id"]] = nrec
             save(led)
-            topic = {"campaign": neg["kind"], "card": neg.get("receive") or neg.get("deliver")}
+            topic = {"campaign": nrec["kind"], "card": nrec.get("receive") or nrec.get("deliver")}
             resp = reader.api.open_thread(c["team"], topic=topic, venue="rastro")
-            neg.update(thread=resp.get("id"), state="contactada", last_tick=tick)
+            nrec.update(thread=resp.get("id"), state="contactada", last_tick=tick)
             rec["thread"] = resp.get("id")
             led["campaign"]["stats"]["contacts"] += 1
         elif c["type"] == "team_propose":
-            neg = led["negotiations"][c["neg"]]
+            nrec = led["negotiations"][c["neg"]]
             assert cp.text_matches(c["offer"], c["text"]), "el texto no coincide con la estructura"
-            neg["state"] = "ambigua"
+            nrec["state"] = "ambigua"
             save(led)
             resp = reader.api.say(c["thread"], c["text"], offer=c["offer"])
             g, w = c["offer"]["give"], c["offer"]["want"]
-            neg["last_price"] = int(g.get("cash") or 0) if neg["kind"] != "sell" else int(w.get("cash") or 0)
-            neg["proposals"].append({"tick": tick, "offer": c["offer"], "text": c["text"]})
-            neg.update(state="propuesta", last_tick=tick)
+            nrec["last_price"] = int(g.get("cash") or 0) if nrec["kind"] != "sell" else int(w.get("cash") or 0)
+            nrec["proposals"].append({"tick": tick, "offer": c["offer"], "text": c["text"]})
+            nrec.update(state="propuesta", last_tick=tick)
             led["campaign"]["stats"]["proposals"] += 1
         elif c["type"] == "team_accept":
             resp = reader.api.accept(c["offer"], assets=c.get("assets") or None)
@@ -608,6 +637,9 @@ def cycle(reader, args, led, journal, execute):
     cands, pl, exposure = candidates(s, led, args, journal)
     camp_cands, camp_lines = campaign_candidates(s, led, args, pl, execute)
     cands += camp_cands
+    blocked = pg.apply_guard(cands, s, committed_ids(s, led))  # antes de ordenar: inviables, fuera de la selección
+    if blocked:
+        print(f"   PROTECTED_PAGE_BLOCK: {blocked} candidata(s) romperían una página completa; excluidas")
     m = metrics(s)
     print(f"\n[{VERSION} · tick {tick} · ronda {m['round']}] efectivo {m['cash']} P · libre {pl['free_cash']} P · "
           f"reservado en ofertas {pl['reserved_cash']} P · pendiente {pl['pending_cash'] - exposure} P · expuesto con "
