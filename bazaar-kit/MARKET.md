@@ -128,3 +128,21 @@ Novedades:
   - Nunca vende la copia que mantiene una página completa: con una sola copia, NO VENDER.
   - Ancla por encima del objetivo, concede de forma decreciente, no baja del suelo económico y cierra cerca del objetivo.
 - **Una sola vía por carta buscada:** los trueques duplicados que piden la misma carta se retiran automáticamente.
+
+## Market Test: broker propio (`market_broker.py`) y banco de pruebas (`sim_bench.py`)
+
+**Cómo puntúa (RULES.md).** Cada ~2 h todos los venues reciben el mismo libro sintético (`bench_offers`, ids `b<run>-<n>`). La nota es la fracción del excedente posible (entre los límites ocultos) que se realiza. Igualar al puesto gratuito da la mitad de los puntos y la media de los tres mejores, los puntos completos. Cada sesión cuenta el mejor venue abierto durante ella, y la ronda promedia sus sesiones. Un broker solo actúa en un venue `board`: en uno `auto` (el puesto incluido) el motor cruza antes. En un `board` sin broker no se cruza nada, así que el proceso debe estar vivo toda la sesión.
+
+**Qué hace el broker nuevo** (`./run.sh market-broker`; `--mode stall` = puesto exacto; `--probe 0` sin sondeo):
+1. **Suelo:** toda oferta que el puesto cruzaría (`starter_broker.bench_plan`) queda cruzada, quizá con otro socio.
+2. **Excedente máximo:** entre los emparejamientos que cumplen el suelo y cruzan por cotización, elige el de mayor excedente estimado (algoritmo húngaro). Así cruza pares que el emparejamiento ordenado del puesto deja fuera (pujas 10 y 8 contra asks 7 y 9: el puesto cruza 1, este 2) cuando el excedente estimado del par extra es positivo.
+3. **Límites estimados:** desde la primera cotización vista y un sombreado aprendido en la sesión. La relajación de las ofertas que se van sin cruzar mide el sombreado; mientras hay pocas, se usa el prior del 20 %.
+4. **Precio:** punto medio de las cotizaciones, como el puesto. Envía primero lo que tiene más prisa.
+5. **Sondeo** (3 por tick, activado por defecto): pares sobrantes que no cruzan por cotización pero sí por límites estimados. Solo funciona si el servidor valida contra límites reales, cosa que no está documentada. Si no, el servidor los rechaza sin coste y el sondeo se apaga solo tras 3 rechazos sin ningún acierto.
+6. **Vigilante:** vuelve al plan del puesto el resto de la sesión ante un error del planificador, un plan que no cubre los cruces del puesto, ≥ 3 rechazos propios (> 25 %) o un sombreado observado < 5 %.
+
+**Un resultado de construcción:** un par extra respecto al puesto siempre tiene excedente negativo *por cotización* (bid_extra ≤ bid_k < ask_k ≤ ask_extra). Validando por cotización, la única mejora posible es apostar a que el sombreado cubre ese hueco. Por eso la ganancia sin sondeo es pequeña.
+
+**Banco de pruebas:** `python3 sim_bench.py [--server quote|limit|libre] [--scenario dificil] [--sessions N]`. Reproduce el libro sintético con compradores y vendedores de límite oculto, sombreado, paciencia, relajación cuadrática y firmes, en 6 escenarios (`dificil` = 75 % firmes y 70 % impacientes, como el test de las ~21:30). Ejecuta el puesto, starter_broker, el broker nuevo y sus variantes, y un oráculo miope de referencia. Son resultados de un modelo, no de la API: sirven para comparar entre mecanismos, no para predecir la nota.
+
+Pruebas: `python3 -m unittest test_market_broker`.
