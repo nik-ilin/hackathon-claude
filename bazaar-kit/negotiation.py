@@ -61,6 +61,7 @@ class Ask:
     final: bool
     live: bool
     tick: int
+    expires: Optional[int] = None  # tick de caducidad de su oferta estructurada
 
 
 @dataclass
@@ -120,7 +121,9 @@ def state_from_thread(thread: dict, dealer: str, now_tick: int, cfg: Config) -> 
         if m.get("sender") == dealer:
             if not o:
                 continue
-            a = Ask(int(o["want"]["cash"]), o["id"], bool(o.get("final")), o.get("status") == "open", int(m.get("tick", 0)))
+            exp = o.get("expires_tick")
+            live = o.get("status") == "open" and (exp is None or int(exp) >= now_tick)  # caducada = no vigente
+            a = Ask(int(o["want"]["cash"]), o["id"], bool(o.get("final")), live, int(m.get("tick", 0)), exp)
             if st.opening is None:
                 st.opening = a.price
             if st.rounds and st.rounds[-1].reply is None:
@@ -401,6 +404,7 @@ class DealerPolicy:
     allow_opening_price: bool        # False en modo score: el precio de apertura no cuenta para la escalera
     accept_gap: int = 1
     min_viable_frac: float = 0.8     # si nuestro máximo < 80 % de su precio, mejor otro artículo
+    secure: bool = False             # SECURE: cerrar un trato negociado válido en cuanto exista (ver ladder_mode)
 
 
 def dealer_policy(dealer: str, mode: str = "score") -> DealerPolicy:
@@ -447,6 +451,10 @@ def decide_dealer(st: NegState, pol: DealerPolicy, ceiling: int, conv_ticks_left
         return Decision("abandon", f"sin margen económico (máximo {ceiling} P)")
     if st.current is None:
         return Decision("wait" if conv_ticks_left > 0 else "abandon", "aún no ha puesto precio")
+    if pol.secure and live and st.opening is not None and live.price < st.opening and valid(live.price):
+        # SECURE: ya ha concedido (precio vigente < apertura) y está dentro del máximo -> cerrar YA el trato negociado;
+        # no se arriesga un hueco de la escalera por ahorrar 1-3 P más.
+        return take(f"SECURE: ha rebajado de {st.opening} P a {live.price} P (≤ máximo {ceiling} P); se cierra")
     if st.awaiting_reply:
         return Decision("wait", "esperando su respuesta")
     out_of_time = conv_ticks_left <= 0 or total_ticks_left <= 0
@@ -477,6 +485,60 @@ def decide_dealer(st: NegState, pol: DealerPolicy, ceiling: int, conv_ticks_left
             return take(f"no queda oferta nueva por encima de {st.last_ours} P; {live.price} P es aceptable")
         return Decision("abandon", f"no queda oferta nueva entre {st.last_ours} P y {hi} P")
     return Decision("counter", f"[{pol.name}] cierra el {pol.gap_frac:.0%} de la brecha ({ask} P vigente)", p)
+
+
+# ------------------------------------------------------------------ escalera de vendedores (mejores tres tratos)
+
+LADDER_SLOTS = 3  # RULES.md: cuentan los tres mejores tratos negociados por nivel; uno que falta cuenta cero
+
+
+def qualifying_deals(dealer: str, threads: list = (), outcomes: list = ()) -> list:
+    """Tratos con `dealer` LIQUIDADOS y NEGOCIADOS (precio de cierre < su apertura; aceptar la apertura no cuenta).
+    Determinista: hilos `deal` del servidor (precio realmente liquidado) + resultados del diario, sin duplicar hilos."""
+    out = {}
+    for t in threads or []:
+        if t.get("with") != dealer or t.get("status") != "deal":
+            continue
+        st = state_from_thread(t, dealer, 10 ** 9, Config())
+        paid = settled_price(t, dealer)
+        if paid is not None and st.opening is not None and paid < st.opening:
+            out[t.get("id")] = {"thread": t.get("id"), "item": st.item, "opening": st.opening, "close": paid,
+                                "source": "servidor"}
+    for r in outcomes or []:
+        if r.get("dealer") != dealer or r.get("status") != "deal" or not r.get("settled"):
+            continue
+        op, cl = r.get("opening"), r.get("close_price")
+        if op is not None and cl is not None and cl < op and r.get("thread") not in out:
+            out[r.get("thread")] = {"thread": r.get("thread"), "item": r.get("item"), "opening": op, "close": cl,
+                                    "source": "diario"}
+    return sorted(out.values(), key=lambda x: str(x["thread"]))
+
+
+def ladder_mode(n_qualifying: int) -> str:
+    """SECURE hasta tener los tres tratos que puntúan con ese vendedor; después OPTIMIZE (mejorar los tres mejores)."""
+    return "SECURE" if n_qualifying < LADDER_SLOTS else "OPTIMIZE"
+
+
+def policy_for(dealer: str, mode: str, n_qualifying: int) -> DealerPolicy:
+    """Política base del vendedor; en SECURE acepta en cuanto concede dentro del máximo y cierra la brecha más deprisa.
+    Nunca relaja el máximo económico ni (en modo score) la regla de no aceptar la apertura."""
+    base = dealer_policy(dealer, mode)
+    if ladder_mode(n_qualifying) == "OPTIMIZE":
+        return base
+    return DealerPolicy(base.name, base.open_frac, max(base.gap_frac, 0.5), base.max_counteroffers, base.max_ticks,
+                        accept_on_concession=True, allow_opening_price=base.allow_opening_price,
+                        accept_gap=max(base.accept_gap, 3), min_viable_frac=base.min_viable_frac, secure=True)
+
+
+def dealer_accept_priority(mode: str, n_qualifying: int, ticks_to_expiry: Optional[int]) -> int:
+    """Prioridad ESTRATÉGICA (no un valor en primas inventado) de aceptar una oferta válida de un vendedor.
+    Orden: seguridad (≥ 10⁶) > cierre de vendedor que caduca / tercer trato > otras aceptaciones inmediatas > resto."""
+    score = 3 * 10 ** 5 if mode == "SECURE" else 10 ** 5 + 2 * 10 ** 3
+    if mode == "SECURE" and n_qualifying == LADDER_SLOTS - 1:
+        score += 10 ** 5  # el tercer trato llena el último hueco que puntúa
+    if ticks_to_expiry is not None:
+        score += 5 * 10 ** 4 if ticks_to_expiry <= 1 else 2 * 10 ** 4 if ticks_to_expiry <= 2 else 0
+    return score
 
 
 def conversation_ticks_used(thread: dict, now_tick: int) -> int:

@@ -170,3 +170,167 @@ CLOCK → SNAPSHOT (me, catálogo, /api/venues, /api/venues/{id}/offers de CADA 
 **Registro.** Cada bloqueo emite `PROTECTED_PAGE_BLOCK page=<P> card=<REF> asset=<id> action=<tipo> reason=<motivo>`, una vez por combinación y proceso, y queda en `page_guard.EVENTS`.
 
 **Pruebas.** `test_page_guard.py`: 14 casos. Con la protección desactivada fallan 13; el que sigue pasando es el de página incompleta, como debe.
+
+## EJECUCIÓN, CAPITAL Y CIERRE DE TRATOS
+
+La valoración privada (`trading.Valuation`) sigue siendo la única fuente de verdad económica. Esta capa no la cambia: hace que el agente **cierre** los buenos tratos, **libere** capital de compromisos débiles y **priorice** las ventanas de ejecución escasas. No baja ningún estándar económico.
+
+```
+OBSERVE → RECONCILE → VALUE → IDENTIFY → ALLOCATE (efectivo y activos, global) → FREE (cancelar lo débil si algo
+superior lo necesita) → CLOSE → VERIFY (liquidación) → LEARN → REPEAT
+```
+
+**Escalera de vendedores: SECURE / OPTIMIZE** (`negotiation.py`).
+- `qualifying_deals(dealer)` cuenta, de forma determinista, los tratos **liquidados** con precio de cierre **por debajo de la apertura**. Las fuentes son los hilos `deal` del servidor (precio realmente liquidado) y el diario; un hilo nunca se cuenta dos veces.
+- **SECURE** (< 3 tratos que puntúan): en cuanto el vendedor concede y su precio vigente es menor que su apertura, no supera el máximo económico y la oferta estructurada es válida, **se acepta**. No se arriesga un hueco de la escalera por ahorrar 1-3 P.
+- **OPTIMIZE** (≥ 3 tratos): se usa la política de regateo de siempre, para mejorar los tres mejores.
+- **Lo que no cambia:** nunca por encima del máximo económico, y en modo score nunca a precio de apertura.
+- **La escalera es prioridad, no valor.** No hay un equivalente en primas inventado. `dealer_accept_priority` ordena así:
+
+| Orden | Acción | Puntuación |
+|---|---|---|
+| 1 | Seguridad | ≥ 10⁶ |
+| 2 | Cierre válido de vendedor en SECURE | 3·10⁵ |
+| 2a | … tercer trato | +10⁵ |
+| 2b | … oferta que caduca en ≤ 1 tick | +5·10⁴ |
+| 2c | … oferta que caduca en ≤ 2 ticks | +2·10⁴ |
+| 3 | Aceptación de campaña | 10⁵ + 10³ |
+| 4 | Aceptación de mercado | 10⁴ + ΔU |
+
+  Sigue habiendo una sola aceptación por tick.
+- **Oferta caducada.** Una oferta del vendedor con `expires_tick` pasado ya no se considera vigente.
+
+**Capital en tres compartimentos** (`capital.py`).
+
+| Compartimento | Regla |
+|---|---|
+| Reserva dura | Intocable (`--reserve`). |
+| Liquidez de vendedores | Objetivo = el mayor máximo económico entre nuestras negociaciones activas (como se acepta una oferta por tick, basta con poder pagar la mayor). Sin negociaciones activas: `min(--dealer-liquidity, mejor máximo de una apertura viable)`. |
+| Capital de mercado | Lo único que pueden inmovilizar las pujas. El planificador de mercado ve `reserva dura + liquidez de vendedores aún no expuesta` como reserva, así que una puja no puede consumir esa liquidez. |
+
+Cada tick se imprime `CAPITAL efectivo · reserva dura · liquidez vendedores (objetivo) · pujas de mercado · expuesto con vendedores · pendiente · libre mercado · libre vendedores · presupuesto`.
+
+**Rebalanceo por cancelación.**
+- Las pujas abiertas son obligaciones reales: nunca se descuentan por su baja probabilidad de ejecución.
+- `score_open_bids` evalúa cada puja con el estado actual:
+  - efectivo inmovilizado;
+  - ΔU esperado = P × (ganancia − precio);
+  - eficiencia (ΔU esperado ÷ efectivo);
+  - confianza y edad;
+  - vida restante;
+  - si sigue siendo la mejor puja;
+  - si completa página.
+- Si una oportunidad superior necesita efectivo (cierre de vendedor, compra inmediata bloqueada solo por capital), `rebalance` cancela las pujas más débiles hasta liberar lo necesario. Condición: que la oportunidad valga más que el ΔU esperado de lo cancelado + `--min-cancel-gain`. La aceptación espera al tick siguiente, cuando el servidor ha confirmado las cancelaciones. Un contraoferta al vendedor sí puede salir en el mismo tick, porque él solo puede aceptarla después.
+
+**Pujas obsoletas.**
+- **Razones duras (siempre):** ya tenemos la carta, o la puja ya no compensa.
+- **Razones blandas** (puja vieja `--stale-age`, sin oferta enfrente, P < 5 %): solo cuando el capital de mercado libre baja de `--rebalance-threshold`.
+- **Sin churn:** se respetan la edad mínima, el delta mínimo de reprecio y el máximo de reprecios.
+
+**Evaluador canónico de ofertas propias.** `trading.evaluate_own_open_offer` reconstruye el efectivo cobrado y pagado, las cartas entregadas (`give`), las cartas pedidas (`want`), la comisión (0 como maker) y V(después) − V(antes).
+- Lo usan la seguridad (`unsafe_own_offers`) y el reprecio del planificador.
+- Antes, un trueque rentable (dar LAV-03, recibir SAL-07, ΔU +10,75) salía como "venta por 0 P". Ahora publicación, seguridad y cancelación dan el mismo ΔU.
+
+**Auditoría de exposición de activos.** Cada tick se construye `asset_id → obligaciones` (ofertas abiertas y aceptaciones pendientes).
+- Un activo en dos obligaciones se resuelve de forma conservadora: se conserva la más antigua (o la aceptación pendiente) y se retiran las demás, sin esperar a `--cancel-unsafe`.
+- `send` vuelve a comprobarlo antes de la red (`ASSET_EXPOSURE_BLOCK`).
+- La protección de páginas completas sigue intacta.
+
+**Límite de peticiones.**
+- `Bazaar(..., wait_on_tick=False, retries=3)`. El SDK solo reintenta lo seguro: `rate_limited` (la petición se rechazó sin ejecutarse) y fallos de red en lecturas. Una escritura con fallo de red queda ambigua hasta reconciliar; nunca se repite a ciegas.
+- Las escrituras se espacian 0,6 s.
+- `SlowCache` guarda por ticks el catálogo, los niveles, el leaderboard, los metadatos de vendedores y los venues, y se invalida con eventos del feed de lanzamiento, nivel, vendedor, venue o comisión. `me`, ofertas, tablones, hilos, reloj y feed se leen siempre.
+
+**Proceso vivo.**
+- `coordinator.py` (`run_loop`) es la única autoridad de escritura y recorre todos los ticks pedidos. Un tick sin oportunidades no implica nada sobre el siguiente, y un `rate_limited` o un fallo de red transitorio no lo detienen.
+- `market_agent.py` se usa solo para diagnóstico, simulación y pruebas heredadas: su bucle de varios ciclos se para cuando un ciclo no actúa.
+
+**Probabilidad de ejecución.**
+- Bandas de confianza por tamaño de muestra propia: 0 = HEURISTIC; 1-4 = EARLY DATA / LOW CONFIDENCE (el prior pesa el doble); 5-14 = LEARNING; 15 o más = LEARNED.
+- Cada publicación lleva `p_fill`, `sample_count` y `confidence_label`.
+
+**Rendimiento** (`performance.py`).
+- **REALIZADO:** solo operaciones liquidadas; efectivo atribuible + Δvalor verificado. Como maker no restamos la comisión que paga el otro.
+- **ABIERTO:** ofertas abiertas, que no son beneficio.
+- **ESTIMADO:** ΔU esperado de lo abierto.
+- **Métricas:** mediana de ticks hasta llenarse, tasa de llenado por venue y tipo, tratos y conversaciones con vendedores, abandonos, escalera por vendedor.
+
+**Diagnóstico por vendedor.** Cada tick, una línea por vendedor:
+- escalera n/3 y estrategia;
+- hilo, apertura, nuestra última oferta, su precio, máximo;
+- si hubo concesión y los ticks restantes;
+- la acción recomendada;
+- si no hay trato, el motivo: precio por encima del máximo, sin concesión, capital no disponible, oferta caducada, límite de contraofertas o de ticks, cupo, conversación cerrada.
+
+## MARKET & COUNTERPARTY INTELLIGENCE · capital global · venta táctica
+
+```
+BAZAAR API → snapshot() del coordinador (única ola de lecturas; SlowCache para catálogo, vendedores, niveles y venues)
+   → intelligence.ingest(snapshot) → data/market.db (SQLite) → update_models()
+   → MARKET MODEL (market_intel) + COUNTERPARTY MODEL (intelligence) → señales
+   → ALLOCATOR GLOBAL (coordinator + capital) → page_guard / exposición → EJECUCIÓN (solo coordinator.send)
+```
+
+**Reparto de responsabilidades.**
+
+| Responsabilidad | Módulo |
+|---|---|
+| Valor privado | `trading.Valuation` |
+| Valor de mercado | `market_intel` |
+| Creencias sobre contrapartes | `intelligence` (no ejecuta nada) |
+| Seguridad de páginas y activos | `page_guard` |
+| Capital y asignación global | `coordinator` + `capital` |
+| Ejecución | `coordinator.send` |
+
+**`data/market.db`.**
+- **Tablas:** teams, cards, venues, offers, offer_snapshots, settlements, market_snapshots, inventory_evidence, team_card_interest, team_set_interest, counterparty_profiles, reservation_estimates, interactions, dealer_interactions y model_metadata.
+- **Índices:** por tick, equipo, carta, venue y oferta.
+- **Ingesta idempotente:** claves primarias + UPSERT. Se guardan ofertas, no solo liquidaciones (primera y última vez vistas, estado, cancelaciones), a partir de tablones, `/api/me/offers`, ofertas en pie de nuestros hilos y el feed.
+- **Fallo degradado:** si la base de datos falla, el coordinador sigue con la instantánea.
+
+**Modelos.** Todos llevan confianza UNKNOWN, LOW, MEDIUM o HIGH, evidencia, y decaimiento con vida media de 120 ticks.
+- **`P_owns(team, carta)`:** solo con evidencia publicada (ask, carta ofrecida en trueque, oferta dirigida, liquidación). Sin evidencia vale 0 con confianza UNKNOWN, que no significa "no la tiene". Si después la vendió, baja.
+- **`P_wants(team, carta)` y `P_interest(team, colección)`:** suben con pujas, escaladas, trueques pedidos, compras y persistencia. Bajan si la vende, y la colección pesa menos si la está liquidando.
+- **`ReservationEstimate`:** cota inferior = su mayor puja; el techo queda en `None` (no se conoce). Solo con al menos 2 escaladas hay una estimación central débil (un paso más).
+- **Estrategia:** PAGE_COMPLETION, RARE_ACCUMULATION, CASH_ACCUMULATION, LIQUIDATION, ARBITRAGE, MARKET_MAKING, BROAD_COLLECTION o UNKNOWN, con probabilidades, confianza y evidencia.
+- **Otras consultas:**
+  - `counterparty_value` (creencia, no valor privado) y `trade_compatibility`;
+  - `best_counterparties(carta)` (quién la tiene) y `best_buyers(carta)` (quién la quiere);
+  - `context(team)` → `CounterpartyContext`, que pueden consumir las campañas.
+
+**Capital en cuatro compartimentos** (`capital.capital_view`). Las pujas abiertas cuentan enteras, nunca multiplicadas por P(ejecución).
+
+| Compartimento | Regla |
+|---|---|
+| Reserva dura | Intocable. |
+| Liquidez de vendedores | `--dealer-buffer-mode active_max` (por defecto): el mayor máximo económico activo. |
+| Colchón táctico | `--tactical-buffer` (30 P): oportunidades inmediatas o dirigidas. |
+| Capital pasivo | Límite = min(invertible − vendedores − táctico, `--max-passive-frac` × invertible). |
+
+- Las pujas pasivas solo usan `free_market_cash`: el planificador recibe `passive_cap`, mientras las compras inmediatas ven el colchón táctico.
+- **Exceso de capital pasivo:** se cancelan las peores pujas, con histéresis y edad mínima.
+- **Rebalanceo por cancelación:** como antes, la oportunidad superior se ejecuta cuando el servidor confirma las cancelaciones.
+
+**Higiene de obligaciones.**
+- Una sola puja y un solo trueque por carta buscada (`duplicate_pursuit_cancels`). El planificador cuenta los trueques que piden una carta como "ya buscada".
+- Un activo físico, una obligación.
+- **Protección por COPIA FÍSICA:** `protected_assets` elige la copia de menor id no comprometida; entregarla explícitamente se bloquea, salvo que la misma operación devuelva otra copia de esa carta.
+
+**Venta táctica** (`team_sale.py`, `--sale-target REF=PRECIO`, por defecto `LAT-10=86`).
+1. Verifica las copias físicas: con 1 copia no hay venta.
+2. Protege la copia de página y elige solo una excedente no comprometida.
+3. Identifica al comprador mediante la oferta estructurada.
+4. Fija el suelo económico = pérdida privada + margen; el objetivo es táctico y el suelo manda.
+5. Valida la estructura: maker, destinatario, venue, estado, caducidad, solo efectivo y exactamente una copia, sin extras.
+6. Compara la utilidad esperada de aceptar con la de publicar.
+7. Decide:
+   - **ACEPTAR** cerca del objetivo (no se pierde la venta por 1-3 P);
+   - **CONTRAOFERTA dirigida**: ancla ≈ objetivo × 1,12 y concesiones decrecientes (p. ej. 97 → 91 → 88 → 87), nunca por debajo del objetivo ni del suelo.
+
+   Mientras dura la negociación se suspende la venta pública de esa carta. Su aceptación tiene prioridad 2,8·10⁵, por debajo de la seguridad.
+
+**Corrección de reconciliación.** Un `dealer_accept` liquidado ya no queda pendiente para siempre porque el `dealer_open` del mismo hilo esté marcado `settled`. Antes contaba dos veces como obligación y no sumaba al gasto confirmado.
+
+**Sobres.** `tr.pack_analysis` da RAW_COLLECTION_EV, STRATEGIC_EV (con la reventa de duplicados × P(venta) HEURISTIC), P(página nueva) y P(duplicado). Sigue sin comprarse por rutina.
+
+**CLI** (solo lectura): `--capital-report`, `--open-bid-audit`, `--intel-db-stats`, `--intel-team tXX`, `--intel-card REF` y `--intel-counterparties REF`.

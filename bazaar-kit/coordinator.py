@@ -26,10 +26,14 @@ from collections import Counter
 from pathlib import Path
 
 import campaigns as cp
+import capital as ca
 import market_agent as ma
 import market_intel as mi
 import negotiation as neg
+import intelligence as intel_mod
 import page_guard as pg
+import performance as perf
+import team_sale as ts
 import trading as tr
 from bazaar_sdk import Bazaar, BazaarError
 
@@ -75,9 +79,51 @@ def metrics(s):
 
 # ------------------------------------------------------------------ observación
 
-def snapshot(reader):
-    s = ma.snapshot_v2(reader)
-    s["leaderboard"] = reader.call("leaderboard")  # IDs de equipo válidos para abrir conversaciones
+SLOW_TTL = {"catalog": 30, "levels": 10, "leaderboard": 10, "dealer": 5, "venues": 2}  # ticks
+INVALIDATE = ("release", "level", "persona", "venue", "patch", "unlock", "catalog", "fee")
+
+
+class SlowCache:
+    """Caché por ticks de recursos que cambian despacio (catálogo, niveles, metadatos de vendedores y venues, equipos).
+    Lo que cambia deprisa (me, ofertas, tablones, hilos, reloj, feed) se lee SIEMPRE. Un evento del feed de lanzamiento,
+    nivel, vendedor, venue o comisión invalida toda la caché."""
+
+    def __init__(self):
+        self.data, self.last_tick = {}, None
+
+    def get(self, reader, tick, method, *a):
+        key, ttl = (method,) + a, SLOW_TTL.get(method, 0)
+        hit = self.data.get(key)
+        if hit is not None and ttl and tick - hit[0] < ttl:
+            return hit[1]
+        v = reader.call(method, *a)
+        self.data[key] = (tick, v)
+        return v
+
+    def invalidate_from(self, events, tick):
+        since, self.last_tick = self.last_tick, tick
+        if since is None:
+            return False
+        for e in events or []:
+            kind = str(e.get("type") or e.get("kind") or e.get("event") or "").lower()
+            if int(e.get("tick") or 0) >= since and any(k in kind for k in INVALIDATE):
+                self.data.clear()
+                return True
+        return False
+
+
+def snapshot(reader, cache=None):
+    cache = cache if cache is not None else SlowCache()
+    clock = reader.call("clock")
+    tick = int(clock.get("tick") or 0)
+    feed = reader.call("feed", 400)
+    cache.invalidate_from(feed.get("events", []), tick)
+    s = {"clock": clock, "feed": feed, "catalog": cache.get(reader, tick, "catalog"), "me": reader.call("me"),
+         "venues": cache.get(reader, tick, "venues"), "board": reader.call("board"), "offers": reader.call("my_offers")}
+    s["threads"] = {st: reader.call("my_threads", st).get("threads", []) for st in ("open", "deal")}
+    s["team_threads"] = [t for t in s["threads"]["open"] if t.get("kind") != "persona"]
+    s["levels"] = cache.get(reader, tick, "levels")
+    s["leaderboard"] = cache.get(reader, tick, "leaderboard")  # IDs de equipo válidos para abrir conversaciones
     s["boards"] = {"rastro": s["board"]}
     for v in (s.get("venues") or {}).get("venues", []):  # El Duende (v02) y demás: GET /api/venues/{id}/offers
         if v.get("status") == "open" and v.get("venue") != "rastro" and v.get("owner") != s["me"]["id"]:
@@ -92,7 +138,7 @@ def snapshot(reader):
     s["dealers"] = {}
     for d in sorted(ids | {"chato"}):
         try:
-            s["dealers"][d] = reader.call("dealer", d)
+            s["dealers"][d] = cache.get(reader, tick, "dealer", d)
         except BazaarError:
             pass
     return s
@@ -131,7 +177,9 @@ def reconcile(led, s, journal):
             t = threads.get(a["thread"])
             if t and t.get("status") == "deal":
                 paid = neg.settled_price(t, a["dealer"])
+                # un hilo solo liquida UNA compra: el dealer_open del mismo hilo (marcado settled al abrir) no cuenta
                 if paid is not None and not any(x.get("thread") == a["thread"] and x["status"] == "settled"
+                                                and x["type"] in ("dealer_accept", "dealer_counter")
                                                 for x in led["actions"] if x is not a):
                     a.update(status="settled", paid=paid, settled_tick=tick)
                     led["spent_confirmed"] += paid
@@ -162,39 +210,118 @@ def dealer_exposure(s, dealers_mine):
     return out
 
 
+INTEL_STATE = {"intel": None}  # la capa de inteligencia la abre el ciclo; nunca ejecuta operaciones
+
+
+def capital_cfg(args):
+    return ca.CapitalConfig(hard_reserve=args.reserve, dealer_idle_liquidity=getattr(args, "dealer_liquidity", 40),
+                            min_cancel_gain=getattr(args, "min_cancel_gain", 2.0),
+                            capital_rebalance_threshold=getattr(args, "rebalance_threshold", 20),
+                            stale_age_ticks=getattr(args, "stale_age", 30),
+                            tactical_cash_buffer=getattr(args, "tactical_buffer", 30),
+                            max_passive_cash_fraction=getattr(args, "max_passive_frac", 0.5),
+                            dealer_cash_buffer_mode=getattr(args, "dealer_buffer_mode", "active_max"))
+
+
+def dealer_context(s, led, journal, val, counts, args):
+    """Escalera (tratos que puntúan por vendedor), nuestras negociaciones activas con su máximo ECONÓMICO (sin capital)
+    y el mejor máximo económico de una apertura viable (para la liquidez de vendedores cuando no hay ninguna activa)."""
+    deal = [t for t in s["threads"]["deal"] if t.get("kind") == "persona"]
+    open_dealer = [t for t in s["threads"]["open"] if t.get("kind") == "persona"]
+    outcomes = journal.records("outcome")
+    names = {n for n in set(s.get("dealers") or {}) | {t.get("with") for t in open_dealer + deal} if n}
+    ladder = {d: neg.qualifying_deals(d, deal, outcomes) for d in sorted(names)}
+    mine = set(led["threads"]) | {d.get("thread") for d in journal.records("decision")}
+    active = []
+    for t in open_dealer:
+        if t["id"] not in mine:
+            continue
+        item = neg.item_of(t.get("topic"))
+        value = val.next_copy(counts, item[5:]) if item and item.startswith("card:") else None
+        active.append({"thread": t, "item": item, "value": value,
+                       "econ": math.floor(min(args.per_card, (value or 0) - args.margin))})
+    viable = 0
+    for did, dealer in (s.get("dealers") or {}).items():
+        if not (did in (s["me"].get("unlocked") or []) or dealer.get("open_to_all")) or led["blocked"].get(did, 0) > \
+                s["clock"]["tick"]:
+            continue
+        for row in (dealer.get("menu") or {}).get("sells", []):
+            lp = row.get("list_price")
+            if "rarity" not in row or not lp:
+                continue
+            for ref, c in val.cards.items():
+                if c["released"] and c["rarity"] == row["rarity"] and not counts.get(ref) and not c.get("hidden"):
+                    econ = math.floor(min(args.per_card, val.next_copy(counts, ref) - args.margin))
+                    if econ >= lp * neg.dealer_policy(did, args.mode).min_viable_frac:
+                        viable = max(viable, econ)
+    return ladder, open_dealer, mine, active, viable
+
+
 def candidates(s, led, args, journal):
     team, tick = s["me"]["id"], s["clock"]["tick"]
     me, val = s["me"], tr.Valuation(s["catalog"], s["me"].get("affinity") or {})
     counts = tr.counts_of(me["assets"])
-    pend = [{"cost": a.get("cost", 0), "assets": a.get("assets") or []} for a in led["actions"]
-            if a["type"] in ("accept", "dealer_accept") and a["status"] in ("intent", "ambiguous", "submitted")]
+    ccfg = capital_cfg(args)
+    pend_actions = [a for a in led["actions"]
+                    if a["type"] in ("accept", "dealer_accept", "team_accept") and a["status"] in ("intent", "ambiguous", "submitted")]
+    pend = [{"cost": a.get("cost", 0), "assets": a.get("assets") or []} for a in pend_actions if a["type"] != "team_accept"]
     exposure = dealer_exposure(s, led["threads"])
-    pend.append({"cost": exposure})
-    cfg = tr.Config(reserve=args.reserve, margin=args.margin, per_card=args.per_card, max_spend=args.max_spend,
+    # Las contraofertas a vendedores ya aparecen en /api/me/offers (con `thread`): no contarlas dos veces.
+    thread_cash = sum(int((o.get("give") or {}).get("cash") or 0) for o in s["offers"].get("offers", [])
+                      if o.get("maker") == team and o.get("thread") and o.get("status") in tr.OPEN_STATES)
+    pend.append({"cost": max(0, exposure - thread_cash)})
+    # Capital: la liquidez de vendedores que aún no está expuesta se aparta ANTES de planificar el mercado, así ninguna
+    # puja pasiva (ni compra de mercado) puede consumirla. La reserva dura sigue siendo intocable.
+    ladder, open_dealer, mine_threads, active, viable = dealer_context(s, led, journal, val, counts, args)
+    if ccfg.dealer_cash_buffer_mode == "off":
+        target = 0
+    elif ccfg.dealer_cash_buffer_mode == "fixed":
+        target = ccfg.dealer_idle_liquidity
+    else:
+        target = ca.dealer_liquidity_target([a["econ"] for a in active], min(ccfg.dealer_idle_liquidity, viable))
+    dealer_need = max(0, target - exposure)
+    market_reserve = args.reserve + dealer_need
+    # Capital ANTES de planificar: las pujas abiertas cuentan enteras (obligaciones reales, nunca × P(ejecución)).
+    res0 = tr.resources(s["offers"].get("offers", []), team, pend)
+    budget0 = args.max_spend - led["spent_confirmed"]
+    view = ca.capital_view(me["cash"], args.reserve, max(0, res0.reserved_cash - thread_cash), exposure,
+                           max(0, res0.pending_cash - max(0, exposure - thread_cash)), target, budget0,
+                           ccfg.tactical_cash_buffer, ccfg.max_passive_cash_fraction)
+    cfg = tr.Config(reserve=market_reserve, margin=args.margin, per_card=args.per_card, max_spend=args.max_spend,
                     listing_ticks=args.listing_ticks, fill_prior=args.fill_prior,
                     allow_last_copy=frozenset(x for x in args.allow_last_copy.split(",") if x))
+    icfg = None
     if getattr(args, "engine", "basic") == "intel":
-        icfg = mi.IntelConfig(reserve=args.reserve, margin=args.margin, per_card=args.per_card, max_spend=args.max_spend,
-                              allow_last_copy=cfg.allow_last_copy, duende_venue=args.duende_venue,
-                              duende_expiry_ticks=args.duende_expiry, target_expiry_ticks=args.listing_ticks,
-                              history_window_ticks=args.history_window)
+        icfg = mi.IntelConfig(reserve=market_reserve, margin=args.margin, per_card=args.per_card,
+                              max_spend=args.max_spend, allow_last_copy=cfg.allow_last_copy,
+                              duende_venue=args.duende_venue, duende_expiry_ticks=args.duende_expiry,
+                              target_expiry_ticks=args.listing_ticks, history_window_ticks=args.history_window)
         ratio, _ = tr.expiry_ratio(led["expiry_obs"] + EXPIRY_EVIDENCE, s["clock"].get("tick_seconds") or 60.0)
         hist = mi.History(str(DATA / "market_history.jsonl"), args.history_window).load(s["clock"]["tick"])
         pl = mi.plan(s, icfg, pendings=pend, spent=led["spent_confirmed"], actions=led["actions"], history=hist,
-                     expiry_ratio=ratio)
+                     expiry_ratio=ratio, passive_cap=view.free_market_cash)
         books, _ = mi.build_books(s, mi.venues_from(s))
         hist.record(s["clock"]["tick"], books, mi.public_settlements(s["feed"].get("events", [])), time.time())
     else:
         pl = tr.plan(s, cfg, pendings=pend, spent=led["spent_confirmed"])
-    cap = max(0, min(pl["free_cash"], pl["budget_left"]))
+    scored = ca.score_open_bids(s, pl["states"], icfg, led["actions"]) if icfg and pl.get("states") else []
+    used = set()  # pujas ya asignadas a una cancelación de rebalanceo en este tick
     out = []
     # 0. PRIORIDAD 1 — protección de páginas completas: una oferta propia abierta que rompería una página completa se
     #    retira sin esperar a --cancel-unsafe (restricción dura, no depende de la valoración).
     protect = pg.unsafe_open_offers(s["offers"].get("offers", []), team, counts, s["catalog"], me["assets"])
     for c in protect:
         out.append(dict(c, module="seguridad", blockers=[]))
-    protected_offers = {c["offer"] for c in protect}
-    # 1. Seguridad: publicaciones propias que venden la última copia o por debajo del valor.
+    # 0b. Un activo físico en dos obligaciones de entrega: se resuelve ya, de forma conservadora.
+    for c in pg.exposure_conflicts(s["offers"].get("offers", []), team, pend_actions, me["assets"]):
+        out.append(dict(c, module="seguridad"))
+    # 0c. Una sola vía por carta buscada (varias pujas o trueques por la misma carta = duplicados y últimas copias).
+    swap_du = lambda o: tr.evaluate_own_open_offer(o, val, counts)["du"]
+    for c in pg.duplicate_pursuit_cancels(s["offers"].get("offers", []), team, swap_du):
+        if c["offer"] not in {x["offer"] for x in out}:
+            out.append(dict(c, module="seguridad"))
+    protected_offers = {c["offer"] for c in out}
+    # 1. Seguridad: publicaciones propias que venden la última copia o con ΔU < 0 (evaluador canónico).
     for c in tr.unsafe_own_offers(s["offers"].get("offers", []), team, val, counts):
         if c["offer"] in protected_offers:
             continue
@@ -215,33 +342,62 @@ def candidates(s, led, args, journal):
         if o["type"] == "accept":
             o["score"] = 10 ** 4 + o["du"]
         out.append(o)
-    # 3. Vendedores: conversaciones abiertas que son nuestras (no se tocan las ajenas).
-    mine_threads = set(led["threads"]) | {d.get("thread") for d in journal.records("decision")}
-    open_dealer = [t for t in s["threads"]["open"] if t.get("kind") == "persona"]
-    busy = {t["with"] for t in open_dealer}
+    # 3. Vendedores: conversaciones abiertas que son nuestras (no se tocan las ajenas). SECURE/OPTIMIZE por escalera.
+    diag = {}
+    rel = ca.releasable(scored, ccfg)
     for t in open_dealer:
         if t["id"] not in mine_threads:
             out.append({"type": "info", "module": "vendedores", "kind": "conversación ajena", "thread": t["id"],
                         "ref": str(t.get("topic")), "du": 0, "score": -1, "blockers": ["no es nuestra: no se toca"]})
-            continue
-        item = neg.item_of(t.get("topic"))
-        pol = neg.dealer_policy(t["with"], args.mode)
-        value = val.next_copy(counts, item[5:]) if item and item.startswith("card:") else None
-        ceiling = math.floor(min(args.per_card, cap + exposure, (value or 0) - args.margin))
-        st = neg.state_from_thread(t, t["with"], tick, neg.Config())
-        d = neg.decide_dealer(st, pol, ceiling, pol.max_ticks - neg.conversation_ticks_used(t, tick))
+    for a in active:
+        t, item, value = a["thread"], a["item"], a["value"]
+        did = t["with"]
+        n_q = len(ladder.get(did, []))
+        mode = neg.ladder_mode(n_q)
+        pol = neg.policy_for(did, args.mode, n_q)
+        avail = view.free_dealer_cash + exposure  # lo que el vendedor puede cobrar YA (incluida nuestra oferta vigente)
+        ceiling = max(0, math.floor(min(a["econ"], avail + rel)))  # capital liberable cancelando pujas débiles
+        st = neg.state_from_thread(t, did, tick, neg.Config())
+        left = pol.max_ticks - neg.conversation_ticks_used(t, tick)
+        d = neg.decide_dealer(st, pol, ceiling, left)
         kind = {"counter": "dealer_counter", "accept": "dealer_accept", "abandon": "dealer_close"}.get(d.action)
+        ttl = (st.live.expires - tick) if st.live and st.live.expires is not None else None
+        blockers, notes = [], [f"política {pol.name} modo {args.mode} · escalera {n_q}/{neg.LADDER_SLOTS} → {mode}"]
+        if kind in ("dealer_accept", "dealer_counter") and d.price and d.price > avail:
+            need = d.price - avail
+            cancels, _, why = ca.rebalance(scored, need, (value or 0) - d.price, ccfg, f"{did} {item}", used)
+            out += [dict(c, module="capital") for c in cancels]
+            used |= {c["offer"] for c in cancels}
+            if kind == "dealer_accept" or not cancels:
+                blockers.append(f"capital: faltan {need} P · {why}" +
+                                ("; se acepta cuando el servidor confirme las cancelaciones" if cancels else ""))
+            else:
+                notes.append(why)
+        if kind == "dealer_accept":
+            off = neg.find_offer(t, d.offer_id)
+            blockers += neg.validate_offer(off, dealer=did, team=team, thread_id=t["id"], item=item, ceiling=a["econ"],
+                                           cash=me["cash"], now_tick=tick,
+                                           resolve_asset=lambda x: f"card:{x.get('ref')}" if isinstance(x, dict) else None) \
+                if off else ["oferta del vendedor no encontrada en el hilo"]
         if kind:
-            out.append({"type": kind, "module": "vendedores", "kind": f"{t['with']}: {d.action}", "thread": t["id"],
-                        "dealer": t["with"], "item": item, "ref": item, "price": d.price, "offer": d.offer_id,
+            out.append({"type": kind, "module": "vendedores", "kind": f"{did}: {d.action} [{mode}]", "thread": t["id"],
+                        "dealer": did, "item": item, "ref": item, "price": d.price, "offer": d.offer_id,
                         "opening": st.opening, "ceiling": ceiling, "du": round((value or 0) - (d.price or 0), 2),
-                        "score": 10 ** 5, "reason": d.reason, "blockers": [], "turns": st.turns,
-                        "notes": [f"política {pol.name} modo {args.mode}"]})
+                        "dv": value, "cash": -(d.price or 0), "ladder_mode": mode,
+                        "score": neg.dealer_accept_priority(mode, n_q, ttl) if kind == "dealer_accept" else 10 ** 5,
+                        "reason": d.reason, "blockers": blockers, "turns": st.turns, "notes": notes})
+        diag[did] = dealer_diag(did, ladder.get(did, []), mode, t, st, ceiling, a["econ"], avail, left, ttl, d,
+                                blockers, pol)
     # 4. Vendedores: abrir una conversación por una carta ausente que venden.
     open_count = len(s["threads"]["open"])
+    busy = {t["with"] for t in open_dealer}
+    busy_items = {neg.item_of(t.get("topic")) for t in open_dealer} - {None}  # una carta, un vendedor a la vez
     for did, dealer in s["dealers"].items():
         unlocked = did in (me.get("unlocked") or []) or dealer.get("open_to_all")
         sells = (dealer.get("menu") or {}).get("sells", [])
+        n_q = len(ladder.get(did, []))
+        mode = neg.ladder_mode(n_q)
+        bonus = (5000 if n_q == neg.LADDER_SLOTS - 1 else 2000) if mode == "SECURE" else 0  # prioridad, no valor
         for row in sells:
             if "rarity" not in row:
                 continue
@@ -249,7 +405,7 @@ def candidates(s, led, args, journal):
                 if not c["released"] or c["rarity"] != row["rarity"] or counts.get(ref) or c.get("hidden"):
                     continue
                 value = val.next_copy(counts, ref)
-                ceiling = math.floor(min(args.per_card, cap, value - args.margin))
+                ceiling = math.floor(min(args.per_card, view.free_dealer_cash + rel, value - args.margin))
                 lp = row.get("list_price")
                 blockers = []
                 if not unlocked:
@@ -258,28 +414,250 @@ def candidates(s, led, args, journal):
                                     f"{u.get('early_min_deals')} tratos negociados con {u.get('early_deals_with')})")
                 if did in busy:
                     blockers.append(f"ya hay una conversación abierta con {did}")
+                if f"card:{ref}" in busy_items:
+                    blockers.append(f"ya negociamos {ref} con otro vendedor (dos cierres = un duplicado)")
                 if led["blocked"].get(did, 0) > tick:
                     blockers.append(f"{did} bloqueado hasta el tick {led['blocked'][did]} (cupo o enfriamiento)")
                 if open_count >= s["clock"]["limits"].get("max_open_threads_per_team", 6):
                     blockers.append("sin conversaciones libres")
                 if lp is None or ceiling < lp * neg.dealer_policy(did, args.mode).min_viable_frac:
                     blockers.append(f"máximo {ceiling} P frente a precio publicado {lp} P")
-                out.append({"type": "dealer_open", "module": "vendedores", "kind": f"abrir con {did}", "dealer": did,
-                            "ref": f"card:{ref}", "price": lp, "ceiling": ceiling, "du": round(value - (lp or 0), 2),
-                            "score": 10 ** 3 + value - (lp or 0), "blockers": blockers,
+                out.append({"type": "dealer_open", "module": "vendedores", "kind": f"abrir con {did} [{mode}]",
+                            "dealer": did, "ref": f"card:{ref}", "price": lp, "ceiling": ceiling,
+                            "du": round(value - (lp or 0), 2), "score": 10 ** 3 + bonus + value - (lp or 0),
+                            "blockers": blockers, "ladder_mode": mode,
                             "notes": [f"valor {value:.1f} P (con bono si completa página)",
                                       "precio real desconocido hasta su primera oferta",
-                                      "cuenta para la escalera solo si cerramos por debajo de su apertura"]})
+                                      f"escalera {n_q}/{neg.LADDER_SLOTS}: cuenta solo si cerramos por debajo de su apertura"]})
+        if did not in diag:
+            opens = [c for c in out if c["type"] == "dealer_open" and c["dealer"] == did]
+            best = max(opens, key=lambda c: (not c["blockers"], c["score"]), default=None)
+            diag[did] = dealer_diag(did, ladder.get(did, []), mode, None, None, best and best["ceiling"], None,
+                                    view.free_dealer_cash, None, None, None, best["blockers"] if best else
+                                    ["no vende nada que nos falte"], None, best)
         for row in sells:
             if "pack" in row:
                 pack = next((p for p in s["catalog"].get("packs", []) if p["id"] == row["pack"]), None)
                 if pack:
-                    ev, why = tr.pack_value(val, counts, pack)
+                    mv = {r: st.market.value for r, st in (pl.get("states") or {}).items() if st.market.value}
+                    pa = tr.pack_analysis(val, counts, pack, mv, draws=1500)
+                    ev = pa["raw_collection_ev"]
                     out.append({"type": "info", "module": "vendedores", "kind": f"sobre {row['pack']} ({did})",
                                 "ref": f"pack:{row['pack']}", "price": row.get("list_price"), "du": round(ev - row["list_price"], 1),
-                                "score": -1, "blockers": [f"no se compra por rutina: valor esperado {ev} P frente a "
-                                                          f"{row['list_price']} P publicado ({why}); la suerte no puntúa"]})
+                                "pack_analysis": pa,
+                                "score": -1, "blockers": [f"no se compra por rutina: RAW_COLLECTION_EV {ev} P · "
+                                                          f"STRATEGIC_EV {pa['strategic_ev']} P · P(página nueva) "
+                                                          f"{pa['p_new_page']} · P(duplicado) {pa['p_duplicate']} frente "
+                                                          f"a {row['list_price']} P publicado ({pa['assumptions']}); "
+                                                          "la suerte no puntúa"]})
+    # 5. Oportunidad inmediata de mercado bloqueada SOLO por capital: se liberan pujas débiles (una por tick).
+    blocked = [c for c in out if c["type"] == "accept" and ca.capacity_only(c) and ca.cost_of(c) <= view.budget_left]
+    for c in sorted(blocked, key=lambda c: -c.get("du", 0))[:1]:
+        need = ca.cost_of(c) - view.free_market_cash
+        cancels, _, why = ca.rebalance(scored, need, c.get("du", 0), ccfg, f"comprar {c.get('receive')}", used)
+        out += [dict(x, module="capital") for x in cancels]
+        used |= {x["offer"] for x in cancels}
+        c["blockers"] = list(c["blockers"]) + [why + ("; se ejecuta cuando el servidor confirme" if cancels else "")]
+    # 6. Pujas obsoletas (razones duras siempre; blandas solo con capital de mercado escaso) y exceso de capital
+    #    pasivo por encima del límite (se retiran las peores, no las más nuevas).
+    stale = [c for c in ca.stale_bid_cancels(scored, view, ccfg, args.margin) if c["offer"] not in used]
+    out += [dict(c, module="capital") for c in stale]
+    used |= {c["offer"] for c in stale}
+    out += [dict(c, module="capital") for c in ca.excess_cancels(scored, view, ccfg, used)]
+    # 7. Venta táctica de duplicados a una contraparte real (p. ej. LAT-10 ~86 P).
+    pl["tactical_sales"] = tactical_sales(s, led, args, val, pl, out)
+    # 8. Compras dirigidas ordenadas por un humano.
+    out += directed_buys(s, led, args, val, counts, view)
+    out = dedupe_cancels(out)
+    pl["capital"], pl["dealer_diag"], pl["open_bids"] = view.as_dict(), diag, scored
+    pl["ladder"] = {d: len(x) for d, x in ladder.items()}
     return out, pl, exposure
+
+
+def tactical_sales(s, led, args, val, pl, out):
+    """Para cada objetivo `--sale-target REF=PRECIO`: verifica copias físicas, protege la copia de página, identifica
+    comprador y propone ACEPTAR o CONTRAOFERTA dirigida. Sustituye a las candidatas genéricas sobre esa misma oferta
+    y suspende la venta pública de esa carta mientras haya negociación (la copia excedente es para el comprador)."""
+    reports = []
+    venues = mi.venues_from(s)
+    committed = committed_ids(s, led)
+    for ref, target in ts.parse_targets(getattr(args, "sale_target", None) or []):
+        st = (pl.get("states") or {}).get(ref)
+        market = {}
+        p_list = 0.2
+        if st is not None:
+            market = {"value": st.market.value, "confidence": st.market.confidence,
+                      "best_bid": st.best_bid.price if st.best_bid else None,
+                      "best_ask": st.best_ask.price if st.best_ask else None,
+                      "ask_fee": venues[st.best_ask.venue].fee(st.best_ask.price, 1) if st.best_ask and
+                      st.best_ask.venue in venues else 0}
+            v = venues.get(args.duende_venue) if hasattr(args, "duende_venue") else None
+            if v is not None:
+                anchor = ts.next_ask(ts.SaleConfig(ref, target, margin=args.margin), 0, None, [])
+                p_list, _ = mi.fill_probability("ask", anchor, st, v, mi.IntelConfig(margin=args.margin), led["actions"])
+        rep = ts.assess(s, ts.SaleConfig(ref, target, margin=args.margin), val, committed, led["actions"],
+                        INTEL_STATE.get("intel"), market, p_list, venues)
+        reports.append(rep)
+        own_offers = {c["offer"] for c in rep["candidates"] if c["type"] == "accept"}
+        negotiating = rep["state"] != "BLOCKED" and rep.get("buyer")
+        for c in out:
+            if c["type"] == "accept" and c.get("offer") in own_offers:
+                c["blockers"] = list(c.get("blockers") or []) + ["sustituida por la venta táctica (copia excedente elegida)"]
+            if negotiating and c["type"] == "list" and c.get("ref") == ref and not c.get("to"):
+                c["blockers"] = list(c.get("blockers") or []) + [f"venta táctica de {ref} en curso con {rep['buyer']}"]
+        out += [dict(c, module="venta táctica") for c in rep["candidates"]]
+    return reports
+
+
+def parse_directed_buys(specs):
+    """REF@EQUIPO=PRECIO → [(ref, team, price)]."""
+    out = []
+    for x in specs or []:
+        try:
+            left, price = str(x).split("=", 1)
+            ref, team = left.split("@", 1)
+            out.append((ref.strip(), team.strip(), int(price)))
+        except ValueError:
+            raise ValueError(f"--directed-buy mal formado: {x!r} (formato REF@EQUIPO=PRECIO)")
+    return out
+
+
+def directed_buys(s, led, args, val, counts, view):
+    """Compras dirigidas ORDENADAS POR UN HUMANO (`--directed-buy REF@EQUIPO=PRECIO`): una puja estructurada con `to`
+    (el equipo la acepta y se liquida sola; la comisión la paga quien acepta). Se envía UNA vez: si ya hay una
+    abierta, se envió antes o ya tenemos la carta, no se repite. Sin `--override-value` exige ΔU ≥ margen; con él,
+    salta SOLO esa regla. La reserva dura, el presupuesto y las obligaciones abiertas siguen mandando."""
+    out = []
+    team = s["me"]["id"]
+    for ref, buyer_from, price in parse_directed_buys(getattr(args, "directed_buy", None)):
+        gain = val.next_copy(counts, ref) if ref in val.cards else None
+        du = round(gain - price, 2) if gain is not None else None
+        blockers = []
+        if gain is None:
+            blockers.append(f"{ref} no está en el catálogo")
+        elif du < args.margin and not getattr(args, "override_value", False):
+            blockers.append(f"ΔU {du} P < margen (valor {gain} P, precio {price} P): requiere --override-value")
+        if counts.get(ref) and not getattr(args, "override_value", False):
+            blockers.append(f"ya tenemos {ref} (una orden con --override-value puede comprar otra copia)")
+        open_same = [o for o in s["offers"].get("offers", []) if o.get("maker") == team and o.get("to") == buyer_from
+                     and o.get("status") == "open" and f"card:{ref}" in ((o.get("want") or {}).get("types") or [])]
+        sent = [a for a in led["actions"] if a.get("type") == "bid" and a.get("ref") == ref and a.get("to") == buyer_from
+                and a.get("status") in ("intent", "ambiguous", "submitted", "settled")]
+        if open_same or sent:
+            blockers.append(f"ya enviada a {buyer_from} (oferta {[o['id'] for o in open_same] or [a.get('offer_id') for a in sent]})")
+        offer_in = seller_offer(s, ref, buyer_from, price)
+        if offer_in is not None:  # el equipo ya publicó la carta para nosotros: ACEPTAR su oferta estructurada
+            o, vid, fee = offer_in
+            p = int(o["want"]["cash"])
+            blockers = [b for b in blockers if not b.startswith("ya enviada")]
+            if p + fee > view.free_dealer_cash:
+                blockers.append(f"{p + fee} P > efectivo libre {view.free_dealer_cash} P (reserva dura, obligaciones "
+                                "abiertas y presupuesto incluidos)")
+            out.append({"type": "accept", "module": "manual", "kind": f"aceptar venta de {buyer_from}", "venue": vid,
+                        "offer": o["id"], "maker": buyer_from, "receive": {ref: 1}, "deliver": {}, "assets": [],
+                        "ref": ref, "price": p, "fee": fee, "cash": -(p + fee), "dv": gain,
+                        "du": round((gain or 0) - p - fee, 2), "score": 4 * 10 ** 5, "blockers": blockers,
+                        "manual_order": True, "reason": f"orden humana: aceptar oferta #{o['id']} de {buyer_from} "
+                                                        f"({ref} por {p} P + {fee} P de comisión en {vid})",
+                        "notes": ["estructura verificada: da exactamente una copia, pide solo efectivo ≤ precio ordenado"]})
+            continue
+        if price > view.free_dealer_cash:
+            blockers.append(f"{price} P > efectivo libre {view.free_dealer_cash} P (reserva dura, pujas abiertas y "
+                            "presupuesto incluidos)")
+        out.append({"type": "bid", "module": "manual", "kind": f"compra dirigida a {buyer_from}", "ref": ref,
+                    "to": buyer_from, "venue": args.duende_venue, "price": price, "cash": -price, "fee": 0,
+                    "dv": gain, "du": du, "expected_du": du, "score": 4 * 10 ** 5, "blockers": blockers,
+                    "expires_in": getattr(args, "directed_expiry", 20), "manual_order": True,
+                    "reason": f"orden humana: {price} P a {buyer_from} por {ref} (valor privado {gain} P"
+                              + (", ΔU negativo aceptado con --override-value)" if du is not None and du < args.margin else ")"),
+                    "notes": ["oferta estructurada dirigida; si no la aceptan caduca sin coste"]})
+    return out
+
+
+def seller_offer(s, ref, seller, max_price):
+    """Oferta estructurada ABIERTA de `seller` (pública o dirigida a nosotros) que da exactamente una copia de `ref`
+    y pide solo efectivo ≤ `max_price` en un venue abierto que no es nuestro. Devuelve (oferta, venue, comisión)."""
+    team, tick = s["me"]["id"], s["clock"]["tick"]
+    venues = mi.venues_from(s)
+    pool = list(s["offers"].get("offers", []))
+    for b in (s.get("boards") or {}).values():
+        pool += (b or {}).get("offers", [])
+    best = None
+    for o in pool:
+        g, w = o.get("give") or {}, o.get("want") or {}
+        assets = [a for a in g.get("assets") or [] if isinstance(a, dict)]
+        if (o.get("maker") != seller or o.get("status") != "open" or o.get("to") not in (None, team)
+                or (o.get("expires_tick") is not None and o["expires_tick"] <= tick) or o.get("venue") not in venues
+                or len(assets) != 1 or assets[0].get("ref") != ref or g.get("cash") or g.get("types")
+                or w.get("assets") or w.get("types") or w.get("cards") or not isinstance(w.get("cash"), int)
+                or not 0 < w["cash"] <= max_price):
+            continue
+        fee = venues[o["venue"]].fee(w["cash"], 1)  # al aceptar pagamos nosotros la comisión del venue
+        if w["cash"] + fee <= max_price and (best is None or w["cash"] + fee < best[0]["want"]["cash"] + best[2]):
+            best = (o, o["venue"], fee)
+    return best
+
+
+def dedupe_cancels(cands):
+    """Una sola cancelación por oferta: la de mayor prioridad."""
+    best = {}
+    for c in cands:
+        if c["type"] in ("cancel", "team_cancel") and c.get("offer") is not None:
+            if c["offer"] not in best or c.get("score", 0) > best[c["offer"]].get("score", 0):
+                best[c["offer"]] = c
+    return [c for c in cands if c["type"] not in ("cancel", "team_cancel") or c.get("offer") is None
+            or best.get(c["offer"]) is c]
+
+
+def dealer_diag(did, deals, mode, t, st, ceiling, econ, avail, left, ttl, d, blockers, pol, best_open=None):
+    """Por qué se cierra (o no) un trato con cada vendedor, en una línea legible."""
+    info = {"dealer": did, "qualifying": len(deals), "slots": neg.LADDER_SLOTS, "mode": mode,
+            "thread": t["id"] if t else None, "opening": st.opening if st else None,
+            "our_last": st.last_ours if st else None, "current": st.live.price if st and st.live else None,
+            "ceiling": ceiling, "econ_ceiling": econ, "capital_now": avail, "ticks_left": left, "expires_in": ttl,
+            "concession": None, "action": None, "why_no_deal": []}
+    if st:
+        info["concession"] = bool(st.current and st.opening is not None and st.current.price < st.opening)
+        info["action"] = f"{d.action.upper()} {d.price if d.price is not None else ''}".strip()
+        why = []
+        if blockers:
+            why += blockers
+        if d.action in ("abandon", "wait"):
+            live = st.live
+            if st.current is not None and live is None:
+                why.append("oferta caducada")
+            if live and econ is not None and live.price > econ:
+                why.append(f"precio {live.price} P por encima del máximo económico {econ} P")
+            elif live and ceiling is not None and live.price > ceiling:
+                why.append(f"capital no disponible ({avail} P ahora)")
+            if not info["concession"]:
+                why.append("sin concesión todavía")
+            if pol and st.turns >= pol.max_counteroffers:
+                why.append("límite de contraofertas")
+            if left is not None and left <= 0:
+                why.append("límite de ticks de la conversación")
+            why.append(d.reason)
+        info["why_no_deal"] = why
+    else:
+        info["action"] = "ABRIR " + best_open["ref"] if best_open and not best_open["blockers"] else "—"
+        info["why_no_deal"] = list(blockers or [])
+    return info
+
+
+def dealer_lines(diag):
+    out = []
+    for did, x in sorted(diag.items()):
+        yn = {True: "SÍ", False: "NO", None: "—"}[x["concession"]]
+        line = (f"{did.upper()} · escalera {x['qualifying']}/{x['slots']} · estrategia {x['mode']} · hilo "
+                f"#{x['thread'] or '—'} · apertura {x['opening'] or '—'} · nuestra última {x['our_last'] or '—'} · "
+                f"su precio {x['current'] or '—'} · máximo {x['ceiling'] if x['ceiling'] is not None else '—'} · "
+                f"concesión {yn} · ticks restantes {x['ticks_left'] if x['ticks_left'] is not None else '—'}"
+                f"{' (oferta caduca en ' + str(x['expires_in']) + ')' if x['expires_in'] is not None else ''} · "
+                f"acción recomendada: {x['action']}")
+        if x["why_no_deal"] and not str(x["action"]).startswith("ACCEPT"):
+            line += " · sin trato porque: " + "; ".join(dict.fromkeys(str(w) for w in x["why_no_deal"]))
+        out.append(line)
+    return out
 
 
 def campaign_cfg(args):
@@ -425,6 +803,13 @@ def committed_ids(s, led, exclude_key=None):
     return pg.committed_assets(s["offers"].get("offers", []), s["me"]["id"], pend)
 
 
+def double_commit(c, s, committed):
+    """Texto de bloqueo si la candidata entregaría un activo ya comprometido en otra obligación abierta."""
+    _, ids, _ = pg.delivery_of(c, s)
+    twice = sorted(set(ids) & set(committed))
+    return f"activo(s) {twice} ya comprometido(s) en otra obligación abierta" if twice else None
+
+
 def _cards_of(c):
     """Cartas que una candidata adquiere o entrega (para no perseguir la misma por dos vías)."""
     if c["type"] in ("cancel", "team_cancel", "team_close", "dealer_close", "info"):
@@ -490,9 +875,14 @@ def send(reader, led, s, c, args, journal):
         print(f"   (ya enviada antes, no se repite: {describe(c)})")
         return None
     # Última barrera antes de la red (prioridad 1): ningún módulo puede saltarse la protección de páginas completas.
-    protect = pg.guard_candidate(c, s, committed_ids(s, led))
+    committed = committed_ids(s, led)
+    protect = pg.guard_candidate(c, s, committed)
     if protect:
         print(f"   PROTECTED_PAGE_BLOCK {describe(c)} · {'; '.join(protect)} · NO SE ENVÍA")
+        return None
+    twice = double_commit(c, s, committed)
+    if twice:
+        print(f"   ASSET_EXPOSURE_BLOCK {describe(c)} · {twice} · NO SE ENVÍA")
         return None
     rec = {"key": key, "type": c["type"], "module": c["module"], "kind": c["kind"], "tick": tick, "status": "intent",
            "offer": c.get("offer"), "asset": c.get("asset"), "assets": c.get("assets") or ([c["asset"]] if c.get("asset") else []),
@@ -500,12 +890,14 @@ def send(reader, led, s, c, args, journal):
            if c["type"] == "dealer_accept" else 0), "du": c.get("du"), "thread": c.get("thread"),
            "dealer": c.get("dealer"), "item": c.get("item"), "opening": c.get("opening"), "ceiling": c.get("ceiling"),
            "reason": c.get("reason") or "; ".join(c.get("notes") or c.get("why") or []), "before": metrics(s),
-           "version": VERSION}
+           "version": VERSION, "cash": c.get("cash"), "dv": c.get("dv"), "expected_du": c.get("expected_du"),
+           "ladder_mode": c.get("ladder_mode"), "p_fill": c.get("p_fill"), "confidence": c.get("confidence_label")}
     if c.get("neg") and c["neg"] in led["negotiations"]:
         led["negotiations"][c["neg"]]["prev_state"] = led["negotiations"][c["neg"]]["state"]
     if c["type"] in ("accept", "team_accept"):
         pool = s["board"].get("offers", []) + s["offers"].get("offers", []) + \
-            [o for t in s["threads"]["open"] for o in t.get("standing_offers") or []]
+            [o for t in s["threads"]["open"] for o in t.get("standing_offers") or []] + \
+            [o for b in (s.get("boards") or {}).values() for o in (b or {}).get("offers", [])]
         o = next((x for x in pool if x.get("id") == c["offer"]), {})
         rec["receive_assets"] = [x["id"] for x in (o.get("give") or {}).get("assets") or [] if isinstance(x, dict)]
     rec["venue"] = c.get("venue") or ("rastro" if c["type"] in ("list", "bid", "accept") else None)
@@ -628,8 +1020,43 @@ def observed(a, s, flags):
 
 # ------------------------------------------------------------------ ciclo
 
-def cycle(reader, args, led, journal, execute):
-    s = snapshot(reader)
+def open_intel(team, cache=None):
+    """La capa de inteligencia se reutiliza entre ticks (en la caché del bucle) y falla de forma degradada."""
+    intel = getattr(cache, "intel", None) if cache is not None else None
+    if cache is None and INTEL_STATE.get("intel") is not None:  # análisis de un tick: no acumular conexiones
+        try:
+            INTEL_STATE["intel"].close()
+        except Exception:
+            pass
+        INTEL_STATE["intel"] = None
+    if intel is None:
+        try:
+            intel = intel_mod.Intelligence(DATA / "market.db", team)
+        except Exception as e:  # la base de datos nunca detiene al coordinador
+            print(f"   INTELIGENCIA no disponible ({type(e).__name__}); se sigue con la instantánea")
+            return None
+        if cache is not None:
+            cache.intel = intel
+    return intel
+
+
+def feed_intel(intel, s):
+    if intel is None:
+        return None
+    try:
+        n = intel.ingest(s)
+        m = intel.update_models(s["clock"]["tick"])
+        return {**n, **m}
+    except Exception as e:
+        print(f"   INTELIGENCIA: fallo al ingerir ({type(e).__name__}: {e}); se sigue con la instantánea")
+        return None
+
+
+def cycle(reader, args, led, journal, execute, cache=None):
+    s = snapshot(reader, cache)
+    intel = open_intel(s["me"]["id"], cache)
+    ingested = feed_intel(intel, s)  # reutiliza la instantánea: ninguna llamada extra a la API
+    INTEL_STATE["intel"] = intel
     tick, team = s["clock"]["tick"], s["me"]["id"]
     if execute and "since_tick" not in led:
         led["since_tick"] = tick
@@ -648,15 +1075,45 @@ def cycle(reader, args, led, journal, execute):
     cands, pl, exposure = candidates(s, led, args, journal)
     camp_cands, camp_lines = campaign_candidates(s, led, args, pl, execute)
     cands += camp_cands
-    blocked = pg.apply_guard(cands, s, committed_ids(s, led))  # antes de ordenar: inviables, fuera de la selección
+    committed = committed_ids(s, led)
+    blocked = pg.apply_guard(cands, s, committed)  # antes de ordenar: inviables, fuera de la selección
     if blocked:
         print(f"   PROTECTED_PAGE_BLOCK: {blocked} candidata(s) romperían una página completa; excluidas")
+    for c in cands:  # un activo físico solo puede estar en UNA obligación de entrega
+        twice = double_commit(c, s, committed)
+        if twice:
+            c["blockers"] = list(c.get("blockers") or []) + [twice]
     m = metrics(s)
     print(f"\n[{VERSION} · tick {tick} · ronda {m['round']}] efectivo {m['cash']} P · libre {pl['free_cash']} P · "
           f"reservado en ofertas {pl['reserved_cash']} P · pendiente {pl['pending_cash'] - exposure} P · expuesto con "
           f"vendedores {exposure} P · gasto confirmado {led['spent_confirmed']}/{args.max_spend} P · score {m['score']} "
           f"(neg {m['neg_points']}, ladder {m['ladder_points']}, rank {m['rank']}) · valor colección "
           f"{pl['model_value']}/{pl['server_value']} {'OK' if pl['valuation_verified'] else 'NO VERIFICADO'}")
+    if ingested:
+        print(f"   INTELIGENCIA market.db: +{ingested['offers']} ofertas nuevas, +{ingested['settlements']} liquidaciones, "
+              f"+{ingested['evidence']} evidencias · {ingested['teams']} equipos perfilados")
+    if pl.get("capital"):
+        print("   " + ca.CapitalView(**pl["capital"]).line())
+        if getattr(args, "capital_report", False) or getattr(args, "show", 0):
+            capc = [c for c in cands if c.get("capital_cancel") or c.get("duplicate_pursuit")]
+            print("   " + ca.CapitalView(**pl["capital"]).block(capc).replace("\n", "\n   "))
+    if getattr(args, "open_bid_audit", False):
+        print("   === OPEN BID AUDIT === (de peor a mejor; las pujas cuentan ENTERAS como obligación)")
+        for b in pl.get("open_bids") or []:
+            print(f"   #{b['offer']} {b['ref']} {b['venue']} {b['price']} P · creada t{b.get('created_tick')} · edad "
+                  f"{b['age']} · caduca t{b.get('expires_tick')} · valor {b.get('our_value')} · reserva "
+                  f"{b.get('reservation_price')} · ΔU esperado {b['expected_du']} · P {b['p_fill']} (n={b['sample_count']}, "
+                  f"{b['confidence']}) · eficiencia {b['efficiency']} · {b.get('market_position')} (rival "
+                  f"{b.get('best_competing_bid')}, ask {b.get('best_ask')}) · página {b.get('page_completion')} · "
+                  f"prioridad {b.get('strategic_priority')}")
+    for rep_ in pl.get("tactical_sales") or []:
+        print("   " + ts.report_block(rep_).replace("\n", "\n   "))
+    for line in dealer_lines(pl.get("dealer_diag") or {}):
+        print(f"   {line}")
+    performance = perf.realized(led["actions"], {d: [None] * n for d, n in (pl.get("ladder") or {}).items()},
+                                sum(1 for o in s["offers"].get("offers", []) if o.get("maker") == team
+                                    and o.get("status") == "open"))
+    print("   " + perf.line(performance))
     if flags:
         print("   AVISO actividad no registrada por este ordenador: " + "; ".join(flags))
     for line in camp_lines:
@@ -672,7 +1129,7 @@ def cycle(reader, args, led, journal, execute):
     if pl.get("states") is not None:
         pl_json["states"] = {r: st.short() for r, st in pl["states"].items() if st.bids or st.asks or st.copies != 1}
     ma.save(DATA / "coordinator_report.json", {"tick": tick, "metrics": m, "plan": pl_json, "candidates": cands,
-                                               "flags": flags})
+                                               "flags": flags, "performance": performance})
     if pl.get("states") is not None and getattr(args, "intel", 0):
         print(mi.intel_report(pl, limit=args.intel))
     max_posts = min(getattr(args, "max_posts", 1), s["clock"].get("limits", {}).get("offers_per_team_per_tick", 1))
@@ -706,6 +1163,54 @@ def cycle(reader, args, led, journal, execute):
 
 
 TRANSIENT = {"rate_limited", "network", "wait_for_tick"}
+
+
+def intel_reports(args, intel, team):
+    """Informes de solo lectura de la capa de inteligencia (no envían nada)."""
+    if intel is None:
+        return
+    j = lambda x: json.dumps(x, ensure_ascii=False, indent=1, default=str)
+    if getattr(args, "intel_db_stats", False):
+        print("=== MARKET.DB ===\n" + j(intel.stats()))
+    if getattr(args, "intel_team", None):
+        print(f"=== EQUIPO {args.intel_team} ===\n" + j(intel.context(args.intel_team).as_dict()))
+    if getattr(args, "intel_card", None):
+        ref = args.intel_card
+        print(f"=== CARTA {ref} ===\nquién la quiere:\n" + j(intel.best_buyers(ref)) +
+              "\nquién la tiene (evidencia publicada):\n" + j(intel.best_counterparties(ref)))
+    if getattr(args, "intel_counterparties", None):
+        print(f"=== MEJORES CONTRAPARTES para {args.intel_counterparties} ===\n" +
+              j(intel.best_counterparties(args.intel_counterparties)))
+
+
+def run_loop(api, reader, args, led, journal, cycle_fn=None):
+    """El coordinador es el proceso vivo: observa durante TODOS los ticks pedidos. Un tick sin oportunidades no
+    implica nada sobre el siguiente, y un límite de peticiones o un fallo de red transitorio no lo detiene (las
+    escrituras ambiguas siguen bloqueando hasta reconciliar). Devuelve los ticks recorridos."""
+    cycle_fn = cycle_fn or cycle
+    cache, done = SlowCache(), 0
+    total = args.ticks if args.execute else 1
+    import inspect
+    try:  # un envoltorio externo (memory_coordinator) puede no aceptar la caché
+        takes_cache = "cache" in inspect.signature(cycle_fn).parameters or \
+            any(p.kind == p.VAR_POSITIONAL for p in inspect.signature(cycle_fn).parameters.values())
+    except (TypeError, ValueError):
+        takes_cache = False
+    for i in range(total):
+        try:
+            if takes_cache:
+                cycle_fn(reader, args, led, journal, args.execute, cache)
+            else:
+                cycle_fn(reader, args, led, journal, args.execute)
+        except BazaarError as e:
+            if e.code not in TRANSIENT or not args.execute:
+                raise
+            print(f"   AVISO {e.code}: {e.message} · se reintenta en el siguiente tick (lo enviado está en el registro)")
+            save(led)
+        done += 1
+        if i + 1 < total and args.execute:
+            wait_next_tick(api)
+    return done
 
 
 def wait_next_tick(api):
@@ -742,6 +1247,32 @@ def main():
     p.add_argument("--max-posts", type=int, default=4, help="publicaciones/cancelaciones por tick (≤ límite del servidor)")
     p.add_argument("--intel", type=int, default=6, help="cartas a detallar en el informe de inteligencia (0 = ninguno)")
     p.add_argument("--history-window", type=int, default=240, help="ventana del historial de mercado en ticks")
+    p.add_argument("--dealer-liquidity", type=int, default=40,
+                   help="liquidez para vendedores sin negociación activa (P; con negociaciones = su mayor máximo)")
+    p.add_argument("--min-cancel-gain", type=float, default=2.0,
+                   help="ventaja mínima de una oportunidad sobre las pujas que cancela para liberar capital (P)")
+    p.add_argument("--rebalance-threshold", type=int, default=20,
+                   help="por debajo de este capital de mercado libre se retiran las pujas obsoletas (P)")
+    p.add_argument("--stale-age", type=int, default=30, help="edad en ticks a partir de la cual una puja es obsoleta")
+    p.add_argument("--tactical-buffer", type=int, default=30,
+                   help="colchón táctico para oportunidades inmediatas/dirigidas; las pujas pasivas no lo usan (P)")
+    p.add_argument("--max-passive-frac", type=float, default=0.5,
+                   help="fracción máxima de (efectivo − reserva dura) que pueden inmovilizar las pujas pasivas")
+    p.add_argument("--dealer-buffer-mode", choices=["active_max", "fixed", "off"], default="active_max",
+                   help="liquidez de vendedores: mayor máximo activo (por defecto), fija (--dealer-liquidity) o nada")
+    p.add_argument("--sale-target", action="append", default=None,
+                   help="venta táctica de un duplicado: REF=PRECIO objetivo (repetible). Por defecto LAT-10=86")
+    p.add_argument("--directed-buy", action="append", default=None,
+                   help="compra dirigida REF@EQUIPO=PRECIO (orden humana; se envía una vez como puja con `to`)")
+    p.add_argument("--override-value", action="store_true",
+                   help="permite que --directed-buy tenga ΔU < margen (solo esa regla; reserva y presupuesto siguen)")
+    p.add_argument("--directed-expiry", type=int, default=20, help="ticks de vida pedidos para la compra dirigida")
+    p.add_argument("--intel-team", help="informe de inteligencia de un equipo (solo lectura)")
+    p.add_argument("--intel-card", help="quién tiene / quién quiere una carta (solo lectura)")
+    p.add_argument("--intel-counterparties", help="mejores contrapartes para conseguir una carta (solo lectura)")
+    p.add_argument("--intel-db-stats", action="store_true", help="estadísticas de data/market.db")
+    p.add_argument("--capital-report", action="store_true", help="bloque === CAPITAL === con cancelaciones recomendadas")
+    p.add_argument("--open-bid-audit", action="store_true", help="auditoría de cada puja abierta")
     p.add_argument("--campaign", choices=["none", "all", "collect", "sell", "swap"], default="none",
                    help="campaña de negociación directa con equipos: abre conversaciones, envía propuestas y acepta")
     p.add_argument("--campaign-ticks", type=int, default=30, help="duración de la campaña en ticks")
@@ -753,8 +1284,11 @@ def main():
     if not 1 <= args.ticks <= 120:
         p.error("--ticks entre 1 y 120")
     DATA.mkdir(exist_ok=True)
+    # retries=3: el SDK solo reintenta lo seguro (rate_limited = rechazada sin ejecutar; fallos de red en LECTURAS).
+    # Una escritura con fallo de red nunca se repite a ciegas: queda ambigua hasta reconciliar. wait_for_tick no se
+    # reintenta aquí (wait_on_tick=False): lo gestiona el coordinador.
     api = Bazaar(os.environ.get("BAZAAR_URL", "https://bazaar.causaprima.ai"), os.environ["BAZAAR_KEY"],
-                 wait_on_tick=False, retries=0)
+                 wait_on_tick=False, retries=3)
     reader = ma.Reader(api)
     journal = neg.Journal(str(DATA))
     lock = neg.InstanceLock(str(DATA / "agent.lock"), {"version": VERSION})
@@ -766,25 +1300,31 @@ def main():
         holder = lock.acquire()
         if holder:
             raise SystemExit(f"Bloqueo ocupado por pid {holder.get('pid')} ({holder.get('version')})")
+    if args.sale_target is None:
+        args.sale_target = ["LAT-10=86"]
     try:
         me = api.me()
         led = load_ledger(me["id"])
-        for i in range(args.ticks if args.execute else 1):
-            try:
-                cycle(reader, args, led, journal, args.execute)
-            except BazaarError as e:
-                if e.code not in TRANSIENT or not args.execute:
-                    raise
-                print(f"   AVISO {e.code}: {e.message} · se reintenta en el siguiente tick (lo enviado está en el registro)")
-                save(led)
-            if i + 1 < args.ticks and args.execute:
-                wait_next_tick(api)
+        run_loop(api, reader, args, led, journal)
+        intel_reports(args, INTEL_STATE.get("intel"), me["id"])
     finally:
         if args.execute:
             lock.release()
 
 
+def _graceful_signals():
+    """Ctrl+C y `kill`/`kill -INT` paran el coordinador de forma limpia (libera el bloqueo, deja el registro
+    reconciliable) aunque se haya lanzado en segundo plano con nohup, donde el shell ignora SIGINT."""
+    import signal
+
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+
 if __name__ == "__main__":
+    _graceful_signals()
     try:
         main()
     except (ValueError, BazaarError) as e:

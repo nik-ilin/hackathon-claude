@@ -226,9 +226,10 @@ def guard_candidate(c: dict, snap: dict, committed_ids: Iterable = ()) -> list:
         return ["BLOCKED: sin catálogo no se puede verificar la protección de páginas completas"]  # falla cerrado
     own = set(ids)
     committed = refs_of_assets(set(committed_ids) - own, my_assets)
-    return validate_protected_assets(counts=counts, catalog=snap.get("catalog") or {}, deliver=deliver,
-                                     receive=receive, committed=committed, asset_ids=ids, my_assets=my_assets,
-                                     action_type=str(c.get("type")))
+    out = validate_protected_assets(counts=counts, catalog=snap.get("catalog") or {}, deliver=deliver,
+                                    receive=receive, committed=committed, asset_ids=ids, my_assets=my_assets,
+                                    action_type=str(c.get("type")))
+    return out or protected_asset_blockers(c, snap, committed_ids)
 
 
 def apply_guard(cands: list, snap: dict, committed_ids: Iterable = ()) -> int:
@@ -279,4 +280,122 @@ def unsafe_open_offers(my_offers: list, team: str, counts: Counter, catalog: dic
                     "du": 0.0, "score": 10 ** 7, "blockers": [], "why": why, "reason": "; ".join(why),
                     "protected_page_cancel": True, "notes": ["prioridad 1: nunca romper una página completa"],
                     "uncertainty": ""})
+    return out
+
+
+# ------------------------------------------------------------------ exposición de activos físicos
+
+def asset_exposure(my_offers: list, team: str, pending_actions: list = ()) -> dict:
+    """asset_id -> obligaciones de ENTREGA abiertas (ofertas propias abiertas + aceptaciones pendientes)."""
+    out = {}
+    for o in sorted(my_offers or [], key=lambda o: o.get("id", 0)):
+        if o.get("maker") != team or o.get("status") not in OPEN_STATES:
+            continue
+        for a in (o.get("give") or {}).get("assets") or []:
+            out.setdefault(a["id"] if isinstance(a, dict) else a, []).append(("offer", o["id"]))
+    for p in pending_actions or []:
+        for aid in p.get("assets") or []:
+            out.setdefault(aid, []).append(("pending", p.get("key") or p.get("offer")))
+    return out
+
+
+def exposure_conflicts(my_offers: list, team: str, pending_actions: list = (), my_assets: list = ()) -> list:
+    """Un mismo activo físico solo puede estar comprometido en UNA obligación. Si aparece en varias, se resuelve de
+    forma conservadora: se conserva la más antigua (o la aceptación pendiente) y se retiran las ofertas posteriores."""
+    refs = {a.get("id"): a.get("ref") for a in my_assets or []}
+    out, cancelled = [], set()
+    for aid, obs in asset_exposure(my_offers, team, pending_actions).items():
+        if len(obs) < 2:
+            continue
+        keep = next((o for o in obs if o[0] == "pending"), obs[0])
+        for kind, oid in obs:
+            if (kind, oid) == keep or kind != "offer" or oid in cancelled:
+                continue
+            cancelled.add(oid)
+            why = (f"EXPOSICIÓN DUPLICADA: el activo {aid} ({refs.get(aid, '?')}) está en {len(obs)} obligaciones "
+                   f"{[f'{k} {i}' for k, i in obs]}; se conserva {keep[0]} {keep[1]} y se retira la oferta {oid}")
+            log.warning(f"ASSET_EXPOSURE_CONFLICT asset={aid} card={refs.get(aid, '?')} obligations={obs} cancel={oid}")
+            out.append({"type": "cancel", "kind": "SEGURIDAD: activo comprometido dos veces", "offer": oid,
+                        "ref": refs.get(aid), "price": 0, "du": 0.0, "score": 10 ** 7 - 1, "blockers": [],
+                        "why": [why], "reason": why, "exposure_conflict": True, "notes": [], "uncertainty": ""})
+    return out
+
+
+# ------------------------------------------------------------------ protección por COPIA FÍSICA
+
+def protected_assets(counts: Counter, catalog: dict, my_assets: list, committed_ids: Iterable = ()) -> dict:
+    """asset_id -> (ref, [páginas]) de las copias físicas que mantienen completas las páginas completas.
+    Por referencia se protegen `protected_required_count` copias: las de menor id que NO estén comprometidas en otra
+    obligación (así la copia protegida es estable y nunca es la que ya está en una oferta)."""
+    req = protected_requirements(counts, catalog)
+    committed = set(committed_ids)
+    out = {}
+    for ref, (need, pages) in req.items():
+        ids = sorted(a["id"] for a in my_assets or [] if a.get("kind") == "card" and a.get("ref") == ref)
+        ordered = [i for i in ids if i not in committed] + [i for i in ids if i in committed]
+        for aid in ordered[:need]:
+            out[aid] = (ref, pages)
+    return out
+
+
+def tradeable_assets(ref: str, counts: Counter, catalog: dict, my_assets: list, committed_ids: Iterable = ()) -> list:
+    """Copias físicas de `ref` que se pueden entregar: ni protegidas por una página completa ni ya comprometidas."""
+    committed = set(committed_ids)
+    prot = protected_assets(counts, catalog, my_assets, committed)
+    return sorted(a["id"] for a in my_assets or [] if a.get("kind") == "card" and a.get("ref") == ref
+                  and a["id"] not in prot and a["id"] not in committed)
+
+
+def protected_asset_blockers(c: dict, snap: dict, committed_ids: Iterable = ()) -> list:
+    """Bloqueo si la acción entrega EXPLÍCITAMENTE la copia física protegida (además del control por cantidades)."""
+    me = snap.get("me") or {}
+    my_assets = me.get("assets") or []
+    counts = Counter(a["ref"] for a in my_assets if a.get("kind") == "card")
+    _, ids, receive = delivery_of(c, snap)
+    if not ids:
+        return []
+    prot = protected_assets(counts, snap.get("catalog") or {}, my_assets, set(committed_ids) - set(ids))
+    hits = [i for i in ids if i in prot and not receive.get(prot[i][0])]  # recibir otra copia en la misma operación
+    for i in hits:
+        _log_block(prot[i][1][0], prot[i][0], str(i), str(c.get("type")), "protected page copy")
+    return [f"BLOCKED: el activo {i} es la copia PROTEGIDA de {prot[i][0]} (página {','.join(prot[i][1])}); "
+            f"entregar otra copia" for i in hits]
+
+
+# ------------------------------------------------------------------ una sola vía por carta buscada
+
+def duplicate_pursuit_cancels(my_offers: list, team: str, value_of=None) -> list:
+    """Varias ofertas propias que piden LA MISMA carta son varias obligaciones para una sola necesidad (si se llenan
+    todas recibimos duplicados y, en trueques, podemos entregar las dos copias de un duplicado). Por carta se
+    conserva como mucho una puja (la más alta) y un trueque (el de mayor ΔU según `value_of(offer)`, si se da;
+    si no, el más antiguo) y se retiran los demás."""
+    groups = {}
+    for o in my_offers or []:
+        if o.get("maker") != team or o.get("status") != "open" or o.get("thread"):
+            continue
+        g, w = o.get("give") or {}, o.get("want") or {}
+        wanted = [t[5:] for t in list(w.get("types") or []) + [f"card:{x}" for x in w.get("cards") or []]
+                  if isinstance(t, str) and t.startswith("card:")]
+        if len(wanted) != 1 or w.get("cash"):
+            continue
+        kind = "bid" if g.get("cash") and not g.get("assets") else "swap" if g.get("assets") and not g.get("cash") else None
+        if kind:
+            groups.setdefault((wanted[0], kind), []).append(o)
+    out = []
+    for (ref, kind), offers in groups.items():
+        if len(offers) < 2:
+            continue
+        if kind == "bid":
+            keep = max(offers, key=lambda o: (int(o["give"].get("cash") or 0), o["id"]))
+        else:
+            keep = max(offers, key=lambda o: ((value_of(o) if value_of else 0) or 0, -o["id"]))
+        for o in offers:
+            if o is keep:
+                continue
+            why = (f"BÚSQUEDA DUPLICADA: {len(offers)} {'pujas' if kind == 'bid' else 'trueques'} propios piden {ref}; "
+                   f"se conserva la oferta {keep['id']} y se retira la {o['id']}")
+            out.append({"type": "cancel", "kind": "retirar búsqueda duplicada", "offer": o["id"], "venue": o.get("venue"),
+                        "ref": ref, "price": int((o.get("give") or {}).get("cash") or 0), "du": 0.0, "score": 2 * 10 ** 5,
+                        "blockers": [], "why": [why], "reason": why, "duplicate_pursuit": True, "notes": [],
+                        "uncertainty": ""})
     return out

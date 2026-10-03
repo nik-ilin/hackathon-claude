@@ -481,10 +481,23 @@ def fill_probability(side: str, price: int, st: MarketCardState, venue: Venue, c
     p0 = max(0.005, min(0.9, p0))
     rate, n = learned_rate(list(actions), venue.id, {"ask": "list", "bid": "bid", "targeted": "bid",
                                                      "swap": "swap_list"}[side])
+    label = fill_confidence(n)
     if rate is None:
-        return round(p0, 3), "HEURISTIC"
-    p = (n * rate + cfg.learn_k * p0) / (n + cfg.learn_k)
-    return round(max(0.02, min(0.9, p)), 3), f"LEARNED ({n} propias en {venue.id})"
+        return round(p0, 3), label
+    k = cfg.learn_k * (2 if n < 5 else 1)  # con muy pocos datos el prior pesa el doble: una muestra no manda
+    p = (n * rate + k * p0) / (n + k)
+    return round(max(0.02, min(0.9, p)), 3), f"{label} ({n} propias en {venue.id})"
+
+
+def fill_confidence(n: int) -> str:
+    """Banda de confianza de la tasa propia: 0 HEURISTIC · 1-4 EARLY DATA · 5-14 LEARNING · 15+ LEARNED."""
+    return "HEURISTIC" if n <= 0 else "EARLY DATA / LOW CONFIDENCE" if n < 5 else "LEARNING" if n < 15 else "LEARNED"
+
+
+def fill_stats(actions: list, venue: str, side: str) -> tuple[int, str]:
+    kind = {"ask": "list", "bid": "bid", "targeted": "bid", "swap": "swap_list"}[side]
+    _, n = learned_rate(list(actions), venue, kind)
+    return n, fill_confidence(n)
 
 
 _VENUES: dict = {}
@@ -604,7 +617,7 @@ def ticks_left(clock: dict) -> Optional[int]:
 # ------------------------------------------------------------------ planificador multi-venue
 
 def plan(snap: dict, cfg: IntelConfig, *, pendings: list = (), spent: int = 0, actions: list = (),
-         history: Optional[History] = None, expiry_ratio: float = 1.0) -> dict:
+         history: Optional[History] = None, expiry_ratio: float = 1.0, passive_cap: Optional[int] = None) -> dict:
     """Misma interfaz que trading.plan, ampliada: todas las oportunidades de todos los venues, con venue, ΔU inmediato
     o esperado, probabilidad de ejecución, coste de oportunidad y valor estratégico."""
     me, catalog, clock = snap["me"], snap["catalog"], snap["clock"]
@@ -623,6 +636,8 @@ def plan(snap: dict, cfg: IntelConfig, *, pendings: list = (), spent: int = 0, a
     res = tr.resources((snap.get("offers") or {}).get("offers", []), team, list(pendings))
     free = tr.free_cash(me["cash"], cfg.reserve, res)
     buy_cap = max(0, min(free, cfg.max_spend - spent))
+    # pujas PASIVAS: solo el capital de mercado (el coordinador aparta liquidez de vendedores y colchón táctico)
+    bid_cap = buy_cap if passive_cap is None else max(0, min(buy_cap, passive_cap))
     left = ticks_left(clock)
     urgency = 0.0 if left is None else max(0.0, min(1.0, 1 - left / 60))
     out = {"tick": tick, "team": team, "cash": me["cash"], "model_value": round(model + other, 2),
@@ -643,6 +658,9 @@ def plan(snap: dict, cfg: IntelConfig, *, pendings: list = (), spent: int = 0, a
         if protect:
             o["blockers"] = protect + o["blockers"]
             o["protected_page_block"] = True
+        side = {"list": "ask", "bid": "targeted" if o.get("to") else "bid", "swap_list": "swap"}.get(o.get("type"))
+        if side and o.get("venue"):
+            o["sample_count"], o["confidence_label"] = fill_stats(actions, o["venue"], side)
         o["key"] = tr.idem_key({**o, "give": o.get("venue"), "want": o.get("to")})
         out["opportunities"].append(o)
 
@@ -718,7 +736,13 @@ def plan(snap: dict, cfg: IntelConfig, *, pendings: list = (), spent: int = 0, a
         c = classify(o)
         if c and c[0] in ("ask", "swap"):
             selling[c[1]] += 1
-    buying = Counter(c[1] for o in ours if (c := classify(o)) and c[0] == "bid")
+    buying = Counter()  # cartas que ya perseguimos: pujas Y trueques que la piden (una sola vía por carta)
+    for o in ours:
+        c = classify(o)
+        if c and c[0] == "bid":
+            buying[c[1]] += 1
+        elif c and c[0] == "swap" and c[4]:
+            buying[c[4]] += 1
     for ref, st in states.items():
         if st.copies < 2 or selling.get(ref) or st.loss_if_sold is None:
             continue
@@ -774,7 +798,7 @@ def plan(snap: dict, cfg: IntelConfig, *, pendings: list = (), spent: int = 0, a
             if not v.allows(val.cards[ref], level):
                 continue
             last = last_of("bid", ref=ref)
-            bp = calculate_bid_price(st, v, cfg, buy_cap, last.get("price") if last else None, urgency)
+            bp = calculate_bid_price(st, v, cfg, bid_cap, last.get("price") if last else None, urgency)
             if bp["price"] is None:
                 continue
             p, basis = fill_probability("bid", bp["price"], st, v, cfg, actions)
@@ -835,13 +859,15 @@ def plan(snap: dict, cfg: IntelConfig, *, pendings: list = (), spent: int = 0, a
         if not st or age < cfg.min_offer_age_ticks:
             continue
         v = venues[o["venue"]]
-        if kind == "ask":
-            floor = math.ceil((st.loss_if_sold or 0) + cfg.margin)
-            if price < floor:
-                add({"type": "cancel", "kind": "retirar venta", "venue": v.id, "offer": o["id"], "ref": ref,
-                     "price": price, "du": 0, "score": 5000, "reason": f"reprecio: {price} P ya está bajo el suelo {floor} P",
+        if kind in ("ask", "swap"):
+            ev = tr.evaluate_own_open_offer(o, val, counts)  # el MISMO evaluador que usa la seguridad
+            if ev["du"] is not None and ev["du"] < cfg.margin:
+                add({"type": "cancel", "kind": "retirar venta" if kind == "ask" else "retirar trueque", "venue": v.id,
+                     "offer": o["id"], "ref": ref, "price": price, "du": 0, "score": 5000,
+                     "reason": f"reprecio: ΔU canónico {ev['du']} P < margen {cfg.margin} P ({ev['kind']})",
                      "notes": ["el valor de la copia cambió"], "uncertainty": ""})
                 continue
+        if kind == "ask":
             cp = competitive_sell_price(st, v, cfg, reprice_count(ref), price)
             if cp["price"] is not None and price - cp["price"] >= cfg.min_reprice_delta:
                 p_old, _ = fill_probability("ask", price, st, v, cfg, actions)
@@ -853,7 +879,7 @@ def plan(snap: dict, cfg: IntelConfig, *, pendings: list = (), spent: int = 0, a
                          "reason": f"reprecio: {price} → {cp['price']} P ({cp['reason']})",
                          "notes": [f"reprecio {reprice_count(ref) + 1}/{cfg.max_reprices_per_asset}"], "uncertainty": ""})
         elif kind == "bid" and st.best_bid and st.best_bid.price >= price:
-            bp = calculate_bid_price(st, v, cfg, buy_cap + price, price, urgency)
+            bp = calculate_bid_price(st, v, cfg, bid_cap + price, price, urgency)
             if bp["price"] and reprice_count(ref) < cfg.max_reprices_per_asset:
                 add({"type": "cancel", "kind": "repreciar puja", "venue": v.id, "offer": o["id"], "ref": ref,
                      "price": price, "du": 0.5, "score": 0.5,

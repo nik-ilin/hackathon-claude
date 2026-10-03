@@ -105,3 +105,26 @@ Novedades:
 - **Ofertas abiertas que se vuelven inseguras** al completar la página se cancelan con prioridad máxima, sin `--cancel-unsafe`.
 - **Cada bloqueo se registra como `PROTECTED_PAGE_BLOCK`**, con página, carta, activo, acción y motivo.
 - **Cambiar la regla** requiere editar `page_guard.py` (`PROTECTION_ENABLED`, `PROTECTED_REQUIRED_COPIES`). Detalles en ARCHITECTURE.md → «COMPLETED PAGE PROTECTION».
+
+## Ejecución y capital (proceso vivo recomendado: `coordinator.py`)
+
+- **El proceso vivo es `./run.sh coord --execute`.** `market_agent.py` queda para diagnóstico, simulación y pruebas heredadas, porque su bucle se para cuando un ciclo no actúa.
+- **Las pujas solo pueden usar el capital de mercado.** La liquidez de vendedores (el mayor máximo económico entre las negociaciones activas, o `--dealer-liquidity` sin ninguna) queda apartada.
+- **Rebalanceo:** si un cierre de vendedor o una compra inmediata superior necesita efectivo, se cancelan las pujas más débiles. Después se espera la confirmación del servidor y se ejecuta.
+- **Pujas obsoletas:**
+  - se retiran siempre si ya tenemos la carta o si ya no compensan;
+  - por edad o baja probabilidad, solo si el capital de mercado escasea (`--rebalance-threshold`, `--stale-age`).
+- **Trueques propios:** se valoran con la carta que recibimos (`trading.evaluate_own_open_offer`), el mismo evaluador en publicación, seguridad y cancelación.
+- **Un activo físico, una obligación:** las ofertas duplicadas se retiran automáticamente.
+- **Probabilidad de ejecución con banda de confianza:** HEURISTIC, EARLY DATA, LEARNING o LEARNED.
+- **Rendimiento separado en tres:** REALIZADO, ABIERTO y ESTIMADO.
+- Detalles en ARCHITECTURE.md → «EJECUCIÓN, CAPITAL Y CIERRE DE TRATOS».
+
+## Inteligencia de contrapartes y venta táctica
+
+- **`data/market.db`** (SQLite) se alimenta del MISMO snapshot del coordinador, sin llamadas extra. Contiene ofertas, liquidaciones, evidencia de posesión, interés por carta y colección, cotas de reserva y perfiles de estrategia, todos con confianza. Consultas: `./run.sh coord --intel-card LAT-10 --intel-team t14 --intel-db-stats`.
+- **Capital.** Las pujas pasivas no pueden usar ni la liquidez de vendedores ni el colchón táctico (`--tactical-buffer`), ni superar `--max-passive-frac`. El exceso se libera cancelando las peores pujas. `--capital-report` y `--open-bid-audit` lo muestran.
+- **Venta táctica** de un duplicado a una contraparte real: `--sale-target LAT-10=86` (por defecto).
+  - Nunca vende la copia que mantiene una página completa: con una sola copia, NO VENDER.
+  - Ancla por encima del objetivo, concede de forma decreciente, no baja del suelo económico y cierra cerca del objetivo.
+- **Una sola vía por carta buscada:** los trueques duplicados que piden la misma carta se retiran automáticamente.

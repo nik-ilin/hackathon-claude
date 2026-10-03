@@ -535,6 +535,51 @@ def pack_value(val: Valuation, counts: Counter, pack: dict, draws: int = 4000, s
     return round(acc / draws, 1), "cartas equiprobables dentro de cada rareza; tiradas agotadas ignoradas"
 
 
+def pack_analysis(val: Valuation, counts: Counter, pack: dict, market_value: Optional[dict] = None,
+                  p_sale: float = 0.3, draws: int = 4000, seed: int = 7) -> dict:
+    """Monte Carlo del sobre con el inventario ACTUAL, separando:
+    - RAW_COLLECTION_EV: ΔV de colección esperado (igual que pack_value);
+    - STRATEGIC_EV: RAW + valor revendible esperado de los duplicados = P(venta) × max(0, mercado − valor de la copia),
+      con P(venta) HEURISTIC (`p_sale`) y el valor de mercado de market_intel (sin dato de mercado, 0: no se inventa);
+    - P(completar al menos una página nueva) y P(al menos un duplicado).
+    SUPUESTO documentado: cartas equiprobables dentro de cada rareza; tiradas restantes NO verificadas → ignoradas."""
+    import random
+    rng = random.Random(seed)
+    market_value = market_value or {}
+    pools = {}
+    for slot in pack.get("slots", []):
+        for r in slot:
+            pools.setdefault(r, [c for c, x in val.cards.items() if x["released"] and x["rarity"] == r
+                                 and not x.get("hidden")])
+    base, pages0 = val.total(counts), val.complete_pages(counts)
+    raw = strat = 0.0
+    page_hits = dup_hits = 0
+    for _ in range(draws):
+        got = Counter()
+        for slot in pack.get("slots", []):
+            rarity = rng.choices(list(slot), weights=list(slot.values()))[0]
+            if pools.get(rarity):
+                got[rng.choice(pools[rarity])] += 1
+        after = Counter(counts)
+        after.update(got)
+        d = val.total(after) - base
+        resale, dup = 0.0, False
+        for ref, k in got.items():
+            for j in range(k):
+                n_before = counts.get(ref, 0) + j
+                if n_before >= 1:
+                    dup = True
+                    resale += p_sale * max(0.0, (market_value.get(ref) or 0.0) - val.copy_value(ref, n_before))
+        raw += d
+        strat += d + resale
+        page_hits += bool(val.complete_pages(after) - pages0)
+        dup_hits += dup
+    return {"raw_collection_ev": round(raw / draws, 2), "strategic_ev": round(strat / draws, 2),
+            "p_new_page": round(page_hits / draws, 3), "p_duplicate": round(dup_hits / draws, 3),
+            "assumptions": "cartas equiprobables dentro de cada rareza; tiradas restantes no verificadas (ignoradas); "
+                           f"P(venta de un duplicado) {p_sale} HEURISTIC"}
+
+
 # ------------------------------------------------------------------ caducidad de publicaciones
 
 def expiry_ratio(observations: list, tick_seconds: float) -> tuple[float, str]:
@@ -553,36 +598,64 @@ def listing_request(target_ticks: int, ratio: float) -> int:
 
 # ------------------------------------------------------------------ ofertas propias que violan la política
 
+def _wanted_refs(side: dict) -> Counter:
+    out = Counter()
+    for t in list(side.get("types") or []) + [f"card:{c}" for c in side.get("cards") or []]:
+        if isinstance(t, str) and t.startswith("card:"):
+            out[t[5:]] += 1
+    for a in side.get("assets") or []:
+        if isinstance(a, dict) and a.get("ref"):
+            out[a["ref"]] += 1
+    return out
+
+
+def evaluate_own_open_offer(o: dict, val: Valuation, counts: Counter) -> dict:
+    """EVALUADOR CANÓNICO de una oferta NUESTRA (somos maker) si alguien la acepta: lo que cobramos y pagamos, las
+    cartas que entregamos (`give`) Y las que recibimos (`want`), y ΔU = efectivo + V(después) − V(antes).
+    Como maker no pagamos comisión (la paga quien acepta). Venta, puja y trueque usan exactamente esta cuenta:
+    publicación, seguridad y cancelación no pueden discrepar sobre el mismo trueque."""
+    g, w = o.get("give") or {}, o.get("want") or {}
+    deliver = Counter(a["ref"] for a in g.get("assets") or [] if isinstance(a, dict) and a.get("ref"))
+    receive = _wanted_refs(w)
+    cash_in, cash_out = int(w.get("cash") or 0), int(g.get("cash") or 0)
+    kind = ("trueque" if deliver and receive else "venta" if deliver else "puja" if receive else "otra")
+    try:
+        dv, notes = val.delta(counts, receive, deliver)
+    except ValueError:
+        dv, notes = None, ["entrega copias que ya no tenemos"]
+    unknown = [r for r in list(receive) + list(deliver) if val.unit(r) is None]
+    du = None if dv is None or unknown else round(cash_in - cash_out + dv, 2)
+    return {"offer": o.get("id"), "kind": kind, "cash_in": cash_in, "cash_out": cash_out, "fee": 0,
+            "receive": receive, "deliver": deliver, "dv": dv, "du": du, "notes": notes, "unknown": unknown}
+
+
 def unsafe_own_offers(my_offers: list, team: str, val: Valuation, counts: Counter) -> list:
-    """Publicaciones nuestras abiertas que venden la última copia, venden por debajo del valor perdido o repiten el
-    mismo activo en varias ofertas. Candidatas a cancelar (nunca se cancelan solas: ver --cancel-unsafe)."""
+    """Publicaciones nuestras abiertas que venden la última copia, tienen ΔU < 0 si se llenan (con el evaluador
+    canónico: un trueque cuenta la carta que RECIBIMOS) o repiten el mismo activo en varias ofertas.
+    Candidatas a cancelar (nunca se cancelan solas: ver --cancel-unsafe)."""
     out, seen = [], {}
     for o in sorted(my_offers, key=lambda o: o.get("id", 0)):
         if o.get("maker") != team or o.get("status") != "open":
             continue
-        g, w = o.get("give") or {}, o.get("want") or {}
+        g = o.get("give") or {}
         assets = [a for a in g.get("assets") or [] if isinstance(a, dict)]
         if not assets or g.get("cash"):
             continue
-        give = Counter(a["ref"] for a in assets)
+        ev = evaluate_own_open_offer(o, val, counts)
         why = []
         for a in assets:
             if a["id"] in seen:
                 why.append(f"{a['ref']} (activo {a['id']}) ya está en la oferta {seen[a['id']]}")
             seen.setdefault(a["id"], o["id"])
-        for ref, k in give.items():
-            if counts.get(ref, 0) - k < 1:
+        for ref, k in ev["deliver"].items():
+            if counts.get(ref, 0) - k + ev["receive"].get(ref, 0) < 1:
                 why.append(f"vende la última copia de {ref}")
-        try:
-            dv, notes = val.delta(counts, Counter(), give)
-        except ValueError:
-            dv, notes = None, []
-        price = int(w.get("cash") or 0)
-        if dv is not None and price + dv < 0:
-            why.append(f"precio {price} P < valor perdido {-dv:.1f} P")
-        why += [n for n in notes if "ROMPERÍA" in n]
+        if ev["du"] is not None and ev["du"] < 0:
+            got = f"{ev['cash_in']} P" + (f" + {dict(ev['receive'])}" if ev["receive"] else "")
+            why.append(f"ΔU {ev['du']} P si se llena ({ev['kind']}: recibe {got}, Δvalor {ev['dv']} P)")
+        why += [n for n in ev["notes"] if "ROMPERÍA" in n]
         if why:
             out.append({"type": "cancel", "kind": "cancelar publicación propia", "offer": o["id"],
-                        "ref": ",".join(give), "price": price, "dv_if_filled": dv, "why": why,
-                        "expires": o.get("expires_tick")})
+                        "ref": ",".join(ev["deliver"]), "price": ev["cash_in"], "dv_if_filled": ev["dv"],
+                        "du_if_filled": ev["du"], "why": why, "expires": o.get("expires_tick")})
     return out

@@ -40,10 +40,10 @@ def integrated(path=agent_memory.DEFAULT):
         agent_memory.annotate(result[0], report)
         return result
 
-    def cycle(reader, args, ledger, journal, execute):
+    def cycle(reader, args, ledger, journal, execute, cache=None):
         latest.clear()
         try:
-            return original_cycle(reader, args, ledger, journal, execute)
+            return original_cycle(reader, args, ledger, journal, execute, cache)
         finally:
             if 'snapshot' in latest:
                 try:

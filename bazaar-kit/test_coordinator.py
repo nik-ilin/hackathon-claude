@@ -93,10 +93,17 @@ class Budget(unittest.TestCase):
         s = full(snap(mine, cash=150, board=board, offers=[offer(20, {"cash": 15}, {"types": ["card:SAL-01"]},
                                                                  maker=TEAM)]))
         led = {"actions": [], "spent_confirmed": 0, "threads": [], "blocked": {}, "class_tick": {}, "expiry_obs": []}
-        cands, pl, _ = co.candidates(s, led, args(), neg.Journal(tempfile.mkdtemp()))
+        cands, pl, _ = co.candidates(s, led, args(dealer_liquidity=0), neg.Journal(tempfile.mkdtemp()))
         buy = next(c for c in cands if c.get("type") == "accept")
         self.assertEqual(pl["free_cash"], 150 - 100 - 15)  # 35 P libres: la compra (12 + 2) cabe
         self.assertFalse(buy["blockers"])
+        # con liquidez para vendedores (la abuela vende algo viable) el mercado ve menos capital, la compra aún cabe
+        cands, pl, _ = co.candidates(s, led, args(), neg.Journal(tempfile.mkdtemp()))
+        target = pl["capital"]["dealer_liquidity_target"]
+        self.assertGreater(target, 0)
+        self.assertEqual(pl["free_cash"], 150 - 100 - 15 - target)
+        self.assertEqual(pl["capital"]["free_dealer_cash"], 35)
+        self.assertFalse(next(c for c in cands if c.get("type") == "accept")["blockers"])
         # una puja abierta más grande y una conversación con un vendedor que podría aceptar nuestra contraoferta
         s["offers"]["offers"][0]["give"]["cash"] = 30
         t = dealer_thread(7, [her(1, 41, 12, "cancelled"), ours(2, 41, 8, status="open")])
@@ -130,7 +137,10 @@ class Budget(unittest.TestCase):
         s = full(snap(mine, offers=own))
         led = {"actions": [], "spent_confirmed": 0, "threads": [], "blocked": {}, "class_tick": {}, "expiry_obs": []}
         cands, _, _ = co.candidates(s, led, args(), neg.Journal(tempfile.mkdtemp()))
-        self.assertTrue(all(c["blockers"] for c in cands if c["type"] == "cancel"), "sin --cancel-unsafe no se cancela")
+        self.assertTrue(all(c["blockers"] for c in cands if c["type"] == "cancel" and not c.get("exposure_conflict")),
+                        "sin --cancel-unsafe no se cancela")
+        dup = [c for c in cands if c.get("exposure_conflict")]
+        self.assertEqual([(c["offer"], c["blockers"]) for c in dup], [(32, [])], "activo en dos ofertas: se retira ya")
         cands, _, _ = co.candidates(s, led, args(cancel_unsafe=True), neg.Journal(tempfile.mkdtemp()))
         self.assertEqual(co.select(cands, led, 50)[0]["type"], "cancel")
 
@@ -184,6 +194,13 @@ class FakeReader:
         return copy.deepcopy({k: self.s[k] for k in ("catalog", "me", "venues", "board", "offers", "clock")})
 
     def call(self, method, *a):
+        direct = {"catalog": "catalog", "me": "me", "venues": "venues", "my_offers": "offers", "clock": "clock"}
+        if method in direct:
+            return copy.deepcopy(self.s[direct[method]])
+        if method == "board":
+            return copy.deepcopy(self.s["board"]) if not a or a[0] == "rastro" else {"offers": []}
+        if method == "leaderboard":
+            return {"teams": []}
         if method == "feed":
             return self.s["feed"]
         if method == "my_threads":
