@@ -260,7 +260,17 @@ def self_improve(dealer_prof, team_prof, q):
         levers.append((gap, f"negociación: captura con dealers {me['dealer_capture']} vs {lead['dealer_capture']} del líder; "
                             f"tratos/hilos {me.get('dealer_deals')}/{me.get('dealer_threads')} → abrir más bajo y pasos cortos (ver dealer_params)"))
     levers.sort(reverse=True)
-    return {"gap_to_first": round((lead.get("score") or 0) - (me.get("score") or 0), 2),
+    # our live score breakdown (GET /api/me → score): which component actually moves
+    parts = {}
+    row = q("SELECT payload FROM me_snapshots ORDER BY snap_ts DESC LIMIT 1")
+    if row:
+        sc = json.loads(row[0][0]).get("score") or {}
+        parts = {k: sc.get(k) for k in ("neg_points", "duel_points", "ladder_points", "mm_points",
+                                        "bench_efficiency", "bench_points", "negotiating", "market")}
+        if parts.get("neg_points") is not None:
+            parts["p2p_points"] = round(parts["neg_points"] - (parts.get("duel_points") or 0)
+                                        - (parts.get("ladder_points") or 0), 3)
+    return {"gap_to_first": round((lead.get("score") or 0) - (me.get("score") or 0), 2), "score_parts": parts,
             "our_trend_last_snapshots": trend, "levers": [t for _, t in levers], "dealer_params": params}
 
 
@@ -270,6 +280,8 @@ def render(dealer_prof, team_prof, rmed, recs, q):
     if si:
         L += ["## Bucle de automejora (t15)", "",
               f"- Distancia al 1º: {si['gap_to_first']} · tendencia últimas instantáneas: {si['our_trend_last_snapshots']}"]
+        if si.get("score_parts"):
+            L.append("- Desglose propio (/api/me): " + " · ".join(f"{k} {v}" for k, v in si["score_parts"].items()))
         L += [f"- Palanca {i}: {t}" for i, t in enumerate(si["levers"], 1)]
         L += ["- Parámetros aprendidos del mejor trato por dealer/artículo en `recommendations.json` → `self_improve.dealer_params`", ""]
     # venue changes over the last ~hour of snapshots (fee cuts, new venues, first trades)

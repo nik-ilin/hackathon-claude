@@ -1,5 +1,5 @@
 {
- "generated": "2026-10-03 11:42:25",
+ "generated": "2026-10-03 12:10:19",
  "dealer_finals": {
   "abuela|buy|sobre_barrio": {
    "n": 7,
@@ -10,7 +10,7 @@
    "median": 20.0
   },
   "abuela|buy|uncommon": {
-   "n": 30,
+   "n": 32,
    "median": 24.0
   },
   "abuela|sell|lote3": {
@@ -18,11 +18,11 @@
    "median": 16
   },
   "abuela|sell|common": {
-   "n": 11,
-   "median": 6.0
+   "n": 12,
+   "median": 6
   },
   "abuela|buy|common": {
-   "n": 32,
+   "n": 34,
    "median": 8
   },
   "chato|?|?": {
@@ -30,7 +30,7 @@
    "median": 22.5
   },
   "chato|buy|rare": {
-   "n": 12,
+   "n": 14,
    "median": 89
   },
   "chato|buy|sobre_plata": {
@@ -38,8 +38,8 @@
    "median": 181
   },
   "chato|sell|uncommon": {
-   "n": 5,
-   "median": 15
+   "n": 6,
+   "median": 14.5
   },
   "abuela|sell|uncommon": {
    "n": 4,
@@ -47,14 +47,14 @@
   },
   "chato|buy|uncommon": {
    "n": 12,
-   "median": 31.0
+   "median": 31
   },
   "chato|sell|lote2": {
    "n": 1,
    "median": 26
   },
   "chato|sell|?": {
-   "n": 6,
+   "n": 7,
    "median": 14
   },
   "abuela|sell|?": {
@@ -66,8 +66,8 @@
    "median": 10
   },
   "pilar|sell|uncommon": {
-   "n": 1,
-   "median": 19
+   "n": 3,
+   "median": 18
   },
   "pilar|sell|?": {
    "n": 2,
@@ -89,62 +89,70 @@
   "chato|sell|rare": 15.0
  },
  "p2p_median_by_rarity": {
-  "common": 8,
+  "common": 8.0,
   "uncommon": 21,
   "rare": 74.0
  },
  "buyers_by_set": {
-  "SAL": [
-   "t16",
-   "t02",
+  "MAL": [
+   "t17",
+   "t08"
+  ],
+  "LAV": [
+   "t04",
    "t06",
-   "t08",
-   "t09",
-   "t18",
-   "t03"
+   "t02",
+   "t03",
+   "t09"
   ],
   "LAT": [
-   "t16",
-   "t13",
    "t04",
    "t14",
+   "t13",
    "t03"
   ],
   "RET": [
+   "t05",
+   "t14",
+   "t10",
+   "t12",
+   "t06",
    "t02",
    "t13",
-   "t06",
-   "t09",
-   "t14",
    "t18",
-   "t10",
-   "t05"
+   "t09"
   ],
-  "LAV": [
-   "t02",
-   "t04",
-   "t06",
+  "SAL": [
    "t08",
-   "t09",
-   "t12",
-   "t03"
-  ],
-  "MAL": [
-   "t01",
-   "t17",
-   "t08"
+   "t06",
+   "t02",
+   "t03",
+   "t16",
+   "t18",
+   "t09"
   ]
  },
  "leaders": [
-  "t14",
+  "t12",
   "t13",
   "t18"
  ],
  "self_improve": {
-  "gap_to_first": 13.14,
-  "our_trend_last_snapshots": 0.25,
+  "gap_to_first": 17.98,
+  "score_parts": {
+   "neg_points": 24.2,
+   "duel_points": 2.48,
+   "ladder_points": 0.033,
+   "mm_points": 0.0,
+   "bench_efficiency": 0.933,
+   "bench_points": 0.5,
+   "negotiating": 6.75,
+   "market": 7.5,
+   "p2p_points": 21.687
+  },
+  "our_trend_last_snapshots": -1.66,
   "levers": [
-   "negociaci\u00f3n: captura con dealers 0.14 vs 0.75 del l\u00edder; tratos/hilos 4/35 \u2192 abrir m\u00e1s bajo y pasos cortos (ver dealer_params)",
+   "negociaci\u00f3n: captura con dealers 0.14 vs 0.5 del l\u00edder; tratos/hilos 4/35 \u2192 abrir m\u00e1s bajo y pasos cortos (ver dealer_params)",
    "market-making: 1 trato en nuestro mercado propio (l\u00edderes con 1-2 tratos sacan 12.5 vs puesto 7.5)"
   ],
   "dealer_params": {
@@ -170,7 +178,7 @@
     "open_frac": 3.0,
     "step": 1,
     "cap": 6,
-    "target_final": 6.0
+    "target_final": 6
    },
    "abuela|buy|common": {
     "open_frac": 0.33,
@@ -200,7 +208,7 @@
     "open_frac": 1.62,
     "step": 2,
     "cap": 14,
-    "target_final": 15
+    "target_final": 14.5
    },
    "abuela|sell|uncommon": {
     "open_frac": 2.0,
@@ -212,7 +220,7 @@
     "open_frac": 0.27,
     "step": 3,
     "cap": 26,
-    "target_final": 31.0
+    "target_final": 31
    },
    "chato|sell|lote2": {
     "open_frac": 1.38,
