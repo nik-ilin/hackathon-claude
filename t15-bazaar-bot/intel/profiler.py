@@ -81,6 +81,17 @@ def haggles(q, dealers):
                     "dealer_open": d_prices[0] if d_prices else None, "dealer_last": d_prices[-1] if d_prices else None,
                     "final": final, "team_open": t_prices[0] if t_prices else None, "rounds": len(t_prices),
                     "step": med(steps), "deal": deal, "tick": ms[0][0]})
+    # Card refs missing from provenance: infer rarity from the dealer's opening price,
+    # nearest to that dealer's median opening for known rarities (else "carta" mixes 30 and 86).
+    opens = collections.defaultdict(list)
+    for h in out:
+        if h["mode"] == "buy" and h["kind"] in ("common", "uncommon", "rare") and h["dealer_open"]:
+            opens[(h["dealer"], h["kind"])].append(h["dealer_open"])
+    for h in out:
+        if h["kind"] == "carta" and h["dealer_open"]:
+            refs = {k: med(v) for (d, k), v in opens.items() if d == h["dealer"]}
+            if refs:
+                h["kind"] = min(refs, key=lambda k: abs(refs[k] - h["dealer_open"]))
     return out
 
 

@@ -1,5 +1,5 @@
 {
- "generated": "2026-10-03 10:31:36",
+ "generated": "2026-10-03 10:40:57",
  "dealer_finals": {
   "abuela|buy|sobre_barrio": {
    "n": 6,
@@ -10,8 +10,8 @@
    "median": 20.0
   },
   "abuela|buy|uncommon": {
-   "n": 8,
-   "median": 22
+   "n": 19,
+   "median": 24
   },
   "abuela|sell|lote3": {
    "n": 1,
@@ -22,7 +22,7 @@
    "median": 6
   },
   "abuela|buy|common": {
-   "n": 10,
+   "n": 23,
    "median": 8
   },
   "chato|?|?": {
@@ -30,8 +30,8 @@
    "median": 22.5
   },
   "chato|buy|rare": {
-   "n": 4,
-   "median": 92
+   "n": 8,
+   "median": 89.0
   },
   "chato|buy|sobre_plata": {
    "n": 1,
@@ -45,21 +45,13 @@
    "n": 1,
    "median": 14
   },
-  "abuela|buy|carta": {
-   "n": 24,
-   "median": 24.0
-  },
   "chato|buy|uncommon": {
-   "n": 4,
-   "median": 27.0
+   "n": 6,
+   "median": 29.0
   },
   "chato|sell|lote2": {
    "n": 1,
    "median": 26
-  },
-  "chato|buy|carta": {
-   "n": 7,
-   "median": 86
   },
   "chato|sell|?": {
    "n": 3,
@@ -84,57 +76,54 @@
   "chato|buy|sobre_plata": 10,
   "chato|sell|uncommon": 2,
   "abuela|sell|uncommon": 2,
-  "abuela|buy|carta": 1,
   "chato|buy|uncommon": 3,
-  "chato|buy|carta": 3.0,
   "chato|sell|?": 1.0,
   "abuela|sell|?": 1
  },
  "p2p_median_by_rarity": {
-  "common": 8.5,
+  "common": 8,
   "uncommon": 25,
   "rare": 76.0
  },
  "buyers_by_set": {
-  "LAV": [
-   "t06",
-   "t03",
-   "t08",
-   "t14",
-   "t13",
-   "t04",
+  "MAL": [
+   "t01",
+   "t17",
+   "t05",
    "t02"
   ],
   "SAL": [
-   "t06",
-   "t18",
-   "t03",
-   "t08",
-   "t16",
-   "t01"
-  ],
-  "MAL": [
-   "t17",
-   "t05",
    "t01",
-   "t10",
-   "t02"
+   "t06",
+   "t03",
+   "t16",
+   "t18",
+   "t08"
   ],
   "RET": [
    "t05",
-   "t18",
-   "t13",
    "t04",
-   "t10",
-   "t02"
+   "t13",
+   "t18",
+   "t02",
+   "t10"
   ],
   "LAT": [
-   "t18",
-   "t03",
-   "t08",
-   "t14",
+   "t04",
    "t13",
-   "t04"
+   "t03",
+   "t18",
+   "t14",
+   "t08"
+  ],
+  "LAV": [
+   "t04",
+   "t06",
+   "t03",
+   "t14",
+   "t09",
+   "t02",
+   "t08"
   ]
  },
  "leaders": [
