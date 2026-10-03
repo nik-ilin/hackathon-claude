@@ -267,9 +267,6 @@ def self_improve(dealer_prof, team_prof, q):
         sc = json.loads(row[0][0]).get("score") or {}
         parts = {k: sc.get(k) for k in ("neg_points", "duel_points", "ladder_points", "mm_points",
                                         "bench_efficiency", "bench_points", "negotiating", "market")}
-        if parts.get("neg_points") is not None:
-            parts["p2p_points"] = round(parts["neg_points"] - (parts.get("duel_points") or 0)
-                                        - (parts.get("ladder_points") or 0), 3)
     return {"gap_to_first": round((lead.get("score") or 0) - (me.get("score") or 0), 2), "score_parts": parts,
             "our_trend_last_snapshots": trend, "levers": [t for _, t in levers], "dealer_params": params}
 
