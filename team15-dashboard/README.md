@@ -15,12 +15,16 @@ Si ya hay un recolector de feed y un `.env` en otro checkout, reutilízalos sin 
 ## Qué muestra
 
 - Inventario t15, duplicados libres y valor marginal que perderíamos al dar uno.
+- Guía **por cada duplicado libre**: mínimo rentable (pérdida marginal + 2 P, redondeado hacia arriba), precio sugerido cuando hay un comprador observado, todos los equipos interesados y valor neto esperado. Si nadie pidió la carta, sólo muestra el mínimo y no inventa un comprador.
+- Margen de concesión por carta: diferencia entre precio sugerido y mínimo rentable si negociamos una propuesta que acepte el rival. Las pujas activas se valoran con su comisión real y no se presentan como precios negociables.
+- Radio del feed con titular, momento, coincidencia con nuestros duplicados y decisión prudente. Una noticia sobre raras de Malasaña, por ejemplo, no altera el precio de nuestras comunes de ese barrio. Los rumores con plazo anunciado se marcan como vencidos después de ese plazo.
+- Tabla con **todo el catálogo**, sin paginación: stock propio, copias libres, mínimo de venta, máximo de compra de la siguiente copia, equipos a los que se vio la carta y equipos que la pidieron. La compra máxima es un límite de valor privado sin comisión; la capacidad de efectivo con reserva se muestra aparte. La tabla permite buscar sin ocultar cartas por defecto.
 - Cartas que nos faltan y valor privado de recibirlas; incluye el bono de completar página cuando corresponde.
 - Por equipo: referencias observadas en su mano, demandas declaradas y cartas ofrecidas. La ausencia de una referencia en el feed no se interpreta como que no la tenga.
 - Ranking de ventas de duplicados, primero ofertas **activas** que t15 podría aceptar, luego propuestas dirigidas y por último canjes alternativos. Muestra oferta, venue, precio, comisión y `ΔU = efectivo neto + cambio en valor de colección`.
 - Propuestas de venta dirigidas basadas en una demanda declarada, marcadas como condicionales. El precio toma el mayor entre nuestro mínimo rentable (valor perdido + 2 P), la referencia de mercado del feed y una puja histórica de ese equipo. Las referencias históricas no se presentan como ofertas vigentes.
 - Hasta tres posibles canjes por equipo cuando ese equipo pide uno de nuestros duplicados y ofrece una carta que nos falta. Se calcula el cambio de valor de nuestra colección; la aceptación del rival sigue siendo incierta.
-- Puntos actuales que devuelve `/api/me`. Los puntos futuros por operación se indican como desconocidos: la regla pública describe el componente de negociación, pero no da una conversión exacta de `ΔU` a puntos del leaderboard.
+- Puntos actuales que devuelve `/api/me`. La regla pública confirma que el valor ganado en trades a precios privados contribuye a la puntuación de negociación (30 % del total); no publica una conversión exacta de `ΔU` a puntos del leaderboard, por lo que el panel ordena por ganancia neta y marca los puntos futuros como desconocidos.
 
 El alias del maker en un libro público sólo se asocia con un equipo si existe un evento del feed que une **el mismo ID de oferta** con ese equipo. Ofertas anónimas sin esa prueba no reciben una atribución inventada.
 

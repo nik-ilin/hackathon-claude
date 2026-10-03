@@ -25,6 +25,7 @@ sys.path.insert(0, str(KIT))
 import dashboard as public_dashboard
 
 from planner import build_rank
+from radio import interpret, radio_event
 
 URL = os.environ.get("BAZAAR_URL", "https://bazaar.causaprima.ai").rstrip("/")
 
@@ -65,6 +66,22 @@ class Model:
         self.cached = None
         self.cached_at = 0.0
         self.catalog = None
+        self.radio_tail = public_dashboard.Tail()
+        self.radio_news = {}
+
+    def _read_radio(self) -> list[dict]:
+        events = []
+        for path in self.public.stores:
+            events.extend(self.radio_tail.read(path))
+        try:
+            events.extend(self.reader.get('/api/feed?limit=500').get('events') or [])
+        except Exception:
+            pass  # El historial local puede seguir disponible durante un fallo de red.
+        for event in events:
+            item = radio_event(event)
+            if item and item['id'] is not None:
+                self.radio_news[item['id']] = item
+        return list(self.radio_news.values())
 
     def snapshot(self, max_age: float = 12.0) -> dict:
         with self.lock:
@@ -119,6 +136,8 @@ class Model:
                           rivals, listing_teams, reserve=self.reserve,
                           market_refs={ref: {"fair": card.fair, "confidence": card.confidence}
                                        for ref, card in public.oracle.cards.items()})
+        rank['radio'] = interpret(self._read_radio(), self.catalog or {}, rank.get('sale_guide') or [],
+                                  int(public.clock.get('tick') or 0))
         rank["warnings"] = warnings + public.errors + rank["warnings"]
         rank["board_count"] = sum(map(len, boards.values()))
         rank["venue_count"] = len(boards)
@@ -148,6 +167,15 @@ h3{font-size:17px;margin:0 0 5px}.sub{color:var(--muted);max-width:70ch;margin:9
 .metric{padding:8px 22px 17px 0}.metric+.metric{border-left:1px solid var(--line);padding-left:22px}.metric small{display:block;color:var(--muted)}
 .metric strong{display:block;font:700 28px/1.2 Georgia,serif;margin-top:4px}
 .warning{background:#fff1e9;border-left:4px solid var(--red);padding:10px 14px;margin:10px 0}
+.jump{display:flex;gap:16px;flex-wrap:wrap;margin:-9px 0 23px;font-size:13px;font-weight:700}.jump a{text-decoration:none;border-bottom:1px solid var(--teal)}
+.guide{margin:0 0 30px}.guide-head{display:flex;justify-content:space-between;gap:18px;align-items:baseline;margin-bottom:13px}.guide-head p{margin:0;color:var(--muted)}
+.sale-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:10px}.sale-card{background:var(--surface);border:1px solid var(--line);border-top:4px solid var(--teal);padding:16px 18px}
+.sale-card.no-buyer{border-top-color:var(--muted)}.sale-top{display:flex;justify-content:space-between;align-items:baseline;gap:12px}.sale-top h3{font:700 24px Georgia,serif;margin:0}.sale-top small{color:var(--muted)}
+.sale-numbers{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:15px 0}.sale-numbers>div+div{border-left:1px solid var(--line);padding-left:12px}.sale-numbers strong{display:block;font:700 22px Georgia,serif;white-space:nowrap}
+.sale-buyers{display:flex;flex-wrap:wrap;gap:5px;margin-top:9px}.buyer-chip{background:var(--blue);color:var(--teal);padding:3px 7px;font-size:12px}.buyer-chip.proposed{background:#f8edd5;color:#865b02}
+.sale-note{color:var(--muted);font-size:13px;margin:0}.guide-empty{padding:15px;border:1px dashed var(--line);color:var(--muted)}
+.radio{border-top:2px solid var(--ink);padding-top:14px;margin:5px 0 30px}.radio-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:10px}.radio-item{background:#fff;border:1px solid var(--line);padding:14px 16px}.radio-item h3{margin:4px 0}.radio-item p{margin:6px 0}.radio-item small{color:var(--muted)}.radio-action{border-left:3px solid var(--saffron);padding-left:9px;font-weight:700}
+.catalog{border-top:2px solid var(--ink);padding-top:15px;margin-top:32px}.catalog-head{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:end}.catalog-head p{color:var(--muted);margin:0 0 12px}.catalog-search{padding:8px 10px;border:1px solid var(--line);font:inherit;min-width:240px}.catalog-table{overflow-x:auto}#catalog-table{background:#fff;min-width:1030px}#catalog-table th{position:sticky;top:0;background:var(--ink);color:#fff;z-index:1;padding:9px}#catalog-table td{padding:8px 9px;vertical-align:top}#catalog-table tbody tr:hover{background:var(--blue)}#catalog-table .dim{color:var(--muted)}#catalog-table .strong{font-weight:700;color:var(--teal)}#catalog-table .blocked{color:var(--red)}
 .layout{display:grid;grid-template-columns:240px minmax(0,1fr);gap:26px}.sidebar{border-right:1px solid var(--line);padding-right:20px}
 .team-button{display:flex;justify-content:space-between;width:100%;text-align:left;border:0;border-bottom:1px solid var(--line);background:transparent;padding:10px 5px;color:var(--ink)}
 .team-button[aria-pressed=true]{background:var(--blue);font-weight:700;color:var(--teal)}.team-button small{color:var(--muted)}
@@ -181,10 +209,47 @@ def render(data: dict) -> str:
              f'<div class="metric"><small>Valor de colección</small><strong>{fmt(data.get("collection_value"))} P</strong></div>',
              f'<div class="metric"><small>{"Puntos propios en vivo" if live else "Puntos del leaderboard (con retraso)"}</small><strong>{fmt(score.get("score"))}</strong></div>',
              f'<div class="metric"><small>Ofertas visibles · venues</small><strong>{data.get("board_count",0)} · {data.get("venue_count",0)}</strong></div>',
-             '</div>']
+             '</div><nav class="jump"><a href="#guide">Venta rápida</a><a href="#radio">Radio y decisión</a><a href="#ranking">Ranking</a><a href="#catalogo">Catálogo completo</a></nav>']
     for warning in data.get("warnings") or []:
         parts.append('<div class="warning">' + esc(warning) + '</div>')
-    parts += ['<div class="layout"><aside class="sidebar"><h2>Compradores</h2><div class="teams">',
+    guide = data.get("sale_guide") or []
+    parts += ['<section id="guide" class="guide"><div class="guide-head"><div><h2>¿En cuánto vender cada carta?</h2>',
+              '<p>Mínimo al proponer una venta que el rival acepte: al menos +2 P sin comisión nuestra. El valor ganado en trades cuenta para negociación; los puntos exactos por venta no se publican.</p></div></div><div class="sale-grid">']
+    if not guide:
+        parts.append('<div class="guide-empty">No hay duplicados libres verificados para vender ahora.</div>')
+    for card in guide:
+        best = card["best"]
+        public_only = card["loss"] is None
+        target = f'{fmt(card["suggested"])} P' if best else '—'
+        gain = f'+{fmt(best["net"])} P' if best and best["net"] is not None else '—'
+        note = (f'Perdemos {fmt(card["loss"])} P de colección al dar una. '
+                + (f'La venta indicada deja {gain} de valor neto para t15.' if best else 'Aún no hay un comprador detectado.')) if not public_only else 'Duplicado observado en el feed; confirma copias libres y valor privado antes de vender.'
+        if card.get('concession') is not None:
+            note += f' Puedes ceder hasta {fmt(card["concession"])} P frente al precio sugerido y aún conservar al menos +2 P netos, si el rival acepta nuestra propuesta.'
+        free_label = f'{card["free"]} libre' if card["free"] == 1 else f'{card["free"]} libres' if isinstance(card["free"], int) else str(card["free"])
+        parts += [f'<article class="sale-card{"" if best else " no-buyer"}"><div class="sale-top"><h3>{esc(card["ref"])}</h3><small>{esc(free_label)}</small></div>',
+                  '<div class="sale-numbers">',
+                  f'<div><span class="label">Mínimo rentable</span><strong>{fmt(card["floor"])}{ " P" if card["floor"] is not None else ""}</strong></div>',
+                  f'<div><span class="label">Pedir al comprador</span><strong>{target}</strong></div>',
+                  f'<div><span class="label">Valor neto estimado</span><strong class="gain">{gain}</strong></div></div>',
+                  f'<p class="sale-note">{esc(note)}</p><div class="sale-buyers">']
+        for buyer in card["buyers"]:
+            state = 'puja activa' if buyer["active"] else 'propuesta'
+            gain_text = f' · +{fmt(buyer["net"])} P netos' if buyer["net"] is not None else ''
+            parts.append(f'<span class="buyer-chip{"" if buyer["active"] else " proposed"}">{esc(buyer["team"])} · {fmt(buyer["price"])} P{gain_text} · {state}</span>')
+        if not card["buyers"]:
+            parts.append('<span class="label">Ningún equipo pidió esta carta en el feed reciente.</span>')
+        parts.append('</div></article>')
+    parts.append('</div></section>')
+    parts += ['<section id="radio" class="radio"><h2>Radio: qué hacer con cada señal</h2>',
+              '<p class="sub">La radio publica rumores. Una noticia no confirma el precio ni la voluntad de compra: contrástala con una oferta o cotización real.</p><div class="radio-list">']
+    if not data.get('radio'):
+        parts.append('<div class="guide-empty">Aún no hay noticias de radio en el feed disponible.</div>')
+    for news in data.get('radio') or []:
+        parts += [f'<article class="radio-item"><small>{esc(news["source"])} · tick {esc(news["tick"])}</small>',
+                  f'<h3>{esc(news["headline"])}</h3><p>{esc(news["body"])}</p>',
+                  f'<p class="radio-action">{esc(news["action"])}</p></article>']
+    parts += ['</div></section><div id="ranking" class="layout"><aside class="sidebar"><h2>Compradores</h2><div class="teams">',
               '<button class="team-button" data-team="all" aria-pressed="true">Todos <small>↗</small></button>']
     for team in teams:
         code = team["team"]
@@ -234,7 +299,29 @@ def render(data: dict) -> str:
     parts += ['</tbody></table></section><section class="panel"><h2>Cómo leer los puntos</h2>',
               '<p>El <b>valor neto (+P)</b> suma el efectivo y el cambio en nuestra colección, después de la comisión. Es la medida privada usada para ordenar trades. El servidor transforma el valor de negociación en puntos de la ronda; la fórmula exacta por operación no está publicada, así que el panel no inventa puntos futuros.</p>',
               '<p>«Oferta activa» significa que hay una estructura aceptable visible en un venue. «Proponer venta» usa una demanda observada; el precio es nuestro mínimo rentable o una puja histórica y requiere que el rival acepte.</p>',
-              '</section></div><div class="foot">Sólo lecturas GET · datos renovados cada 15 s · ',
+              '</section></div>']
+    catalog_rows = data.get('catalog_rows') or []
+    capacity = data.get('buy_capacity')
+    parts += ['<section id="catalogo" class="catalog"><div class="catalog-head"><div><h2>Todo el catálogo · Team 15</h2>',
+              '<p>Venta mínima = pérdida privada de dar una + 2 P; si es la última copia o está bloqueada, se muestra sólo como referencia. Compra máxima = valor de recibir la siguiente copia − 2 P, antes de comisiones si aceptamos una oferta ajena.</p>',
+              f'<p>Capacidad de compra hoy con reserva: <b>{fmt(capacity)} P</b>. Equipos con carta o interés = observaciones del feed, no inventario confirmado.</p>' if capacity is not None else '<p>Sin mano privada verificada: precios de compra y venta desconocidos.</p>',
+              '</div><label>Buscar carta o equipo<br><input id="catalog-search" class="catalog-search" type="search" placeholder="Ej. MAL-05 o t16"></label></div>',
+              '<div class="catalog-table"><table id="catalog-table"><thead><tr><th>Carta</th><th>Rareza</th><th>Stock t15</th><th>Libre</th><th>Venta mín.</th><th>Compra máx.</th><th>Les vimos</th><th>La pidieron</th></tr></thead><tbody>']
+    for row in catalog_rows:
+        released = row['released']
+        stock = row['stock']
+        free = row['free']
+        sell = f'{fmt(row["sell_floor"])} P' if row['sell_floor'] is not None else '—'
+        buy = f'{fmt(row["buy_ceiling"])} P' if row['buy_ceiling'] is not None else '—'
+        sell_class = 'strong' if isinstance(free, int) and free > 0 else 'dim'
+        if not released:
+            buy = 'Aún no disponible'
+        parts.append(f'<tr><td><b>{esc(row["ref"])}</b><span class="label">{esc(row["set"])}</span></td>'
+                     f'<td>{esc(row["rarity"] or "—")}</td><td>{esc(stock)}</td><td>{esc(free)}</td>'
+                     f'<td class="{sell_class}">{sell}</td><td>{buy}</td>'
+                     f'<td>{esc(", ".join(row["held_by"]) or "—")}</td><td>{esc(", ".join(row["wanted_by"]) or "—")}</td></tr>')
+    parts += ['</tbody></table></div><p class="sub">Se muestran todas las cartas del catálogo en una sola tabla. Los precios de compra son límites de valor, no indican que tengamos efectivo o un vendedor dispuesto.</p></section>',
+              '<div class="foot">Sólo lecturas GET · datos renovados cada 15 s · ',
               time.strftime('%H:%M:%S', time.localtime(data.get('built_at') or time.time())),
               ' · clave nunca enviada al navegador</div></div><script>',
               "const buttons=document.querySelectorAll('.team-button');const rows=document.querySelectorAll('.trade,.team-row,.team-profile');"
@@ -245,6 +332,9 @@ def render(data: dict) -> str:
               "buttons.forEach(b=>b.addEventListener('click',()=>choose(b.dataset.team)));choose(selected);"
               "const pause=document.getElementById('pause');pause.checked=sessionStorage.getItem('t15.pause')==='1';"
               "pause.addEventListener('change',()=>sessionStorage.setItem('t15.pause',pause.checked?'1':'0'));"
+              "const search=document.getElementById('catalog-search');search.value=sessionStorage.getItem('t15.catalog')||'';"
+              "function filterCatalog(){const q=search.value.trim().toLowerCase();document.querySelectorAll('#catalog-table tbody tr').forEach(r=>r.hidden=!!q&&!r.textContent.toLowerCase().includes(q));sessionStorage.setItem('t15.catalog',search.value)}"
+              "search.addEventListener('input',filterCatalog);filterCatalog();"
               "setInterval(()=>{if(!pause.checked)location.reload()},15000);",
               '</script></body></html>']
     return ''.join(parts)
