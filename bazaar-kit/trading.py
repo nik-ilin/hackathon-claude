@@ -268,6 +268,21 @@ def free_cash(cash: int, reserve: int, res: Resources) -> int:
     return cash - reserve - res.reserved_cash - res.pending_cash
 
 
+def own_bids(my_offers: list, team: str) -> list:
+    """Pujas propias abiertas fuera de conversaciones: efectivo a cambio de una sola carta.
+    [{offer, ref, price, venue, created}]."""
+    out = []
+    for o in my_offers:
+        if o.get("maker") != team or o.get("status") not in OPEN_STATES or o.get("thread"):
+            continue
+        g, w = o.get("give") or {}, o.get("want") or {}
+        refs = list(w.get("cards") or []) + [t[5:] for t in w.get("types") or [] if str(t).startswith("card:")]
+        if g.get("cash") and not g.get("assets") and len(refs) == 1 and not w.get("assets") and not w.get("cash"):
+            out.append({"offer": o["id"], "ref": refs[0], "price": int(g["cash"]), "venue": o.get("venue"),
+                        "created": o.get("created_tick")})
+    return out
+
+
 # ------------------------------------------------------------------ plan de oportunidades
 
 @dataclass

@@ -48,7 +48,8 @@ EXPIRY_EVIDENCE = [{"requested": 4, "effective": 1, "tick_seconds": 60.0, "sourc
 CLASSES = {"accept": "aceptar", "dealer_accept": "aceptar", "dealer_counter": "mensaje", "list": "publicar",
            "bid": "publicar", "cancel": "publicar", "dealer_open": "conversación", "dealer_close": "conversación",
            "team_accept": "aceptar", "team_propose": "mensaje", "team_open": "conversación", "team_cancel": "publicar",
-           "team_close": "cierre", "swap_list": "publicar"}
+           "team_close": "cierre", "swap_list": "publicar", "dealer_sell_open": "conversación",
+           "dealer_sell_counter": "mensaje", "dealer_sell_accept": "aceptar"}
 QUOTA = {"persona_quota", "cooloff", "sold_out", "locked"}
 
 
@@ -193,6 +194,26 @@ def reconcile(led, s, journal):
                 a["status"] = "released"  # conversación terminada sin trato
             elif a["type"] == "dealer_counter" and tick > a["tick"] + 1:
                 a["status"] = "released"  # superada por la respuesta del vendedor
+        if a["type"] in ("dealer_sell_accept", "dealer_sell_counter") and a["status"] in ("submitted", "ambiguous",
+                                                                                          "intent"):
+            t = threads.get(a["thread"])  # VENTA a un vendedor (--dealer-sell-dups): cobramos su give.cash
+            if t and t.get("status") == "deal":
+                got = neg.settled_sell_price(t, a["dealer"])
+                if got is not None and not any(x.get("thread") == a["thread"] and x["status"] == "settled"
+                                               and x["type"] in ("dealer_sell_accept", "dealer_sell_counter")
+                                               for x in led["actions"] if x is not a):
+                    a.update(status="settled", price=got, received=got, settled_tick=tick)
+                    led["cash_received"] += got
+                    journal.append("outcome", {"dealer": a["dealer"], "item": a["item"], "thread": a["thread"],
+                                               "status": "deal", "side": "sell", "close_price": got, "settled": True,
+                                               "context": "normal", "opening": a.get("opening"),
+                                               "note": f"coordinador {VERSION}"})
+                else:
+                    a["status"] = "released" if a["type"] == "dealer_sell_counter" else a["status"]
+            elif t is None or t.get("status") != "open":
+                a["status"] = "released"
+            elif a["type"] == "dealer_sell_counter" and tick > a["tick"] + 1:
+                a["status"] = "released"
     fresh = [a for a in led["actions"] if a["status"] == "settled" and before.get(id(a)) != "settled"]
     return fresh, [a for a in led["actions"] if a["status"] in ("intent", "ambiguous")]
 
@@ -234,8 +255,8 @@ def dealer_context(s, led, journal, val, counts, args):
     mine = set(led["threads"]) | {d.get("thread") for d in journal.records("decision")}
     active = []
     for t in open_dealer:
-        if t["id"] not in mine:
-            continue
+        if t["id"] not in mine or "sell" in (t.get("topic") or {}):
+            continue  # las conversaciones de VENTA (--dealer-sell-dups) no son compras: van por sell_thread_candidates
         item = neg.item_of(t.get("topic"))
         value = val.next_copy(counts, item[5:]) if item and item.startswith("card:") else None
         active.append({"thread": t, "item": item, "value": value,
@@ -262,6 +283,8 @@ def candidates(s, led, args, journal):
     me, val = s["me"], tr.Valuation(s["catalog"], s["me"].get("affinity") or {})
     counts = tr.counts_of(me["assets"])
     ccfg = capital_cfg(args)
+    ladder_on = bool(getattr(args, "dealer_ladder", False))
+    lc = ladder_cfg(args)
     pend_actions = [a for a in led["actions"]
                     if a["type"] in ("accept", "dealer_accept", "team_accept") and a["status"] in ("intent", "ambiguous", "submitted")]
     pend = [{"cost": a.get("cost", 0), "assets": a.get("assets") or []} for a in pend_actions if a["type"] != "team_accept"]
@@ -349,6 +372,8 @@ def candidates(s, led, args, journal):
         if t["id"] not in mine_threads:
             out.append({"type": "info", "module": "vendedores", "kind": "conversación ajena", "thread": t["id"],
                         "ref": str(t.get("topic")), "du": 0, "score": -1, "blockers": ["no es nuestra: no se toca"]})
+        elif "sell" in (t.get("topic") or {}):
+            out += sell_thread_candidates(s, t, args, lc, val, counts)
     for a in active:
         t, item, value = a["thread"], a["item"], a["value"]
         did = t["with"]
@@ -358,11 +383,20 @@ def candidates(s, led, args, journal):
         avail = view.free_dealer_cash + exposure  # lo que el vendedor puede cobrar YA (incluida nuestra oferta vigente)
         ceiling = max(0, math.floor(min(a["econ"], avail + rel)))  # capital liberable cancelando pujas débiles
         st = neg.state_from_thread(t, did, tick, neg.Config())
-        left = pol.max_ticks - neg.conversation_ticks_used(t, tick)
-        d = neg.decide_dealer(st, pol, ceiling, left)
+        if ladder_on:  # --dealer-ladder: política observada (sustituye a decide_dealer, también en SECURE)
+            pol = neg.ladder_profile(did, lc, args.mode)
+            notes_mode = "escalera observada"
+            rarity = val.cards.get(item[5:], {}).get("rarity") if item and item.startswith("card:") else None
+            left = pol.max_ticks - neg.conversation_ticks_used(t, tick)
+            d = neg.decide_ladder(st, pol, ceiling, left, rarity, tick)
+        else:
+            notes_mode = None
+            left = pol.max_ticks - neg.conversation_ticks_used(t, tick)
+            d = neg.decide_dealer(st, pol, ceiling, left)
         kind = {"counter": "dealer_counter", "accept": "dealer_accept", "abandon": "dealer_close"}.get(d.action)
         ttl = (st.live.expires - tick) if st.live and st.live.expires is not None else None
-        blockers, notes = [], [f"política {pol.name} modo {args.mode} · escalera {n_q}/{neg.LADDER_SLOTS} → {mode}"]
+        blockers, notes = [], [f"política {pol.name} modo {args.mode} · escalera {n_q}/{neg.LADDER_SLOTS} → {mode}"
+                               + (f" · {notes_mode}" if notes_mode else "")]
         if kind in ("dealer_accept", "dealer_counter") and d.price and d.price > avail:
             need = d.price - avail
             cancels, _, why = ca.rebalance(scored, need, (value or 0) - d.price, ccfg, f"{did} {item}", used)
@@ -385,7 +419,8 @@ def candidates(s, led, args, journal):
                         "opening": st.opening, "ceiling": ceiling, "du": round((value or 0) - (d.price or 0), 2),
                         "dv": value, "cash": -(d.price or 0), "ladder_mode": mode,
                         "score": neg.dealer_accept_priority(mode, n_q, ttl) if kind == "dealer_accept" else 10 ** 5,
-                        "reason": d.reason, "blockers": blockers, "turns": st.turns, "notes": notes})
+                        "reason": d.reason, "blockers": blockers, "turns": st.turns, "notes": notes,
+                        **({"ladder": True} if ladder_on else {})})
         diag[did] = dealer_diag(did, ladder.get(did, []), mode, t, st, ceiling, a["econ"], avail, left, ttl, d,
                                 blockers, pol)
     # 4. Vendedores: abrir una conversación por una carta ausente que venden.
@@ -408,6 +443,12 @@ def candidates(s, led, args, journal):
                 ceiling = math.floor(min(args.per_card, view.free_dealer_cash + rel, value - args.margin))
                 lp = row.get("list_price")
                 blockers = []
+                viable = (neg.ladder_profile(did, lc, args.mode) if ladder_on else neg.dealer_policy(did, args.mode)
+                          ).min_viable_frac
+                prefer = lc.route.get(c["rarity"]) if ladder_on else None
+                if prefer and prefer != did and dealer_available(s, prefer) and any(
+                        r.get("rarity") == c["rarity"] for r in (s["dealers"][prefer].get("menu") or {}).get("sells", [])):
+                    blockers.append(f"enrutado a {prefer}: cierra {c['rarity']} más barato (escalera observada)")
                 if not unlocked:
                     u = dealer.get("unlock") or {}
                     blockers.append(f"{did} no disponible aún (abre a todos en {u.get('open_to_all_at')}; antes con "
@@ -420,7 +461,7 @@ def candidates(s, led, args, journal):
                     blockers.append(f"{did} bloqueado hasta el tick {led['blocked'][did]} (cupo o enfriamiento)")
                 if open_count >= s["clock"]["limits"].get("max_open_threads_per_team", 6):
                     blockers.append("sin conversaciones libres")
-                if lp is None or ceiling < lp * neg.dealer_policy(did, args.mode).min_viable_frac:
+                if lp is None or ceiling < lp * viable:
                     blockers.append(f"máximo {ceiling} P frente a precio publicado {lp} P")
                 out.append({"type": "dealer_open", "module": "vendedores", "kind": f"abrir con {did} [{mode}]",
                             "dealer": did, "ref": f"card:{ref}", "price": lp, "ceiling": ceiling,
@@ -468,10 +509,131 @@ def candidates(s, led, args, journal):
     pl["tactical_sales"] = tactical_sales(s, led, args, val, pl, out)
     # 8. Compras dirigidas ordenadas por un humano.
     out += directed_buys(s, led, args, val, counts, view)
+    # 9. Escalera opt-in: vender duplicados comunes a un vendedor y no pujar por lo que ya negociamos con uno.
+    if getattr(args, "dealer_sell_dups", False):
+        out += sell_open_candidates(s, led, args, lc, val, counts, busy, open_count)
+    if getattr(args, "dedupe_bids", False):
+        out += dealer_bid_cancels(s, out, open_dealer, mine_threads)
     out = dedupe_cancels(out)
     pl["capital"], pl["dealer_diag"], pl["open_bids"] = view.as_dict(), diag, scored
     pl["ladder"] = {d: len(x) for d, x in ladder.items()}
     return out, pl, exposure
+
+
+def ladder_cfg(args):
+    """Parámetros de la escalera (--dealer-ladder / --dealer-sell-dups); los de vendedores nuevos de nivel 3 y los de
+    venta se ajustan por línea de órdenes."""
+    lc = neg.LadderConfig()
+    for k in ("new_open", "new_gap_frac", "new_counters", "new_ticks", "new_max_frac", "sell_margin", "sell_open"):
+        v = getattr(args, f"ladder_{k}", None)
+        if v is not None:
+            setattr(lc, k, v)
+    return lc
+
+
+def dealer_available(s, did):
+    dealer = (s.get("dealers") or {}).get(did)
+    return dealer is not None and (did in (s["me"].get("unlocked") or []) or bool(dealer.get("open_to_all")))
+
+
+def sell_floor(val, counts, ref, lc):
+    loss = -val.delta(counts, Counter(), Counter({ref: 1}))[0]
+    return loss, math.ceil(loss + lc.sell_margin)
+
+
+def sell_open_candidates(s, led, args, lc, val, counts, busy, open_count):
+    """Abrir una conversación de venta de una copia sobrante con el vendedor que compra esa rareza."""
+    me, tick = s["me"], s["clock"]["tick"]
+    committed = committed_ids(s, led)
+    committed_refs = pg.refs_of_assets(committed, me["assets"])
+    selling = {a for t in s["threads"]["open"] if t.get("kind") == "persona"
+               for a in neg.sell_assets_of(t.get("topic"))}
+    out = []
+    for rarity, did in lc.sell_route.items():
+        expected = lc.sell_expected.get(did, {}).get(rarity)
+        for ref, n in sorted(counts.items()):
+            c = val.cards.get(ref)
+            if not c or c["rarity"] != rarity or n < 2 or val.unit(ref) is None:
+                continue
+            if pg.tradeable_surplus(ref, counts, s["catalog"], committed_refs) < 1:
+                continue  # page_guard: solo copias por encima del mínimo protegido
+            ids = [a["id"] for a in sorted(me["assets"], key=lambda a: a["id"]) if a.get("ref") == ref
+                   and a["id"] not in committed and a["id"] not in selling]
+            if not ids:
+                continue
+            loss, floor = sell_floor(val, counts, ref, lc)
+            blockers = []
+            if not dealer_available(s, did):
+                blockers.append(f"{did} no disponible")
+            if did in busy:
+                blockers.append(f"ya hay una conversación abierta con {did}")
+            if led["blocked"].get(did, 0) > tick:
+                blockers.append(f"{did} bloqueado hasta el tick {led['blocked'][did]} (cupo o enfriamiento)")
+            if open_count >= s["clock"]["limits"].get("max_open_threads_per_team", 6):
+                blockers.append("sin conversaciones libres")
+            if expected is not None and expected < floor:
+                blockers.append(f"su final observado ({expected} P) no llega al suelo de {floor} P")
+            got = expected if expected is not None else floor
+            out.append({"type": "dealer_sell_open", "module": "vendedores", "kind": f"vender a {did}", "dealer": did,
+                        "ref": f"card:{ref}", "asset": ids[-1], "price": lc.sell_open, "floor": floor,
+                        "du": round(got - loss, 2), "score": 500 + got - loss, "blockers": blockers,
+                        "notes": [f"duplicado {rarity} ({n} copias), pierde {loss:.2f} P, suelo {floor} P",
+                                  f"final observado de {did}: {expected} P" if expected else "sin final observado",
+                                  "cuenta para la escalera si cerramos por encima de su apertura"]})
+    return out
+
+
+def sell_thread_candidates(s, t, args, lc, val, counts):
+    """Siguiente paso en una conversación de VENTA nuestra a un vendedor."""
+    tick, did = s["clock"]["tick"], t["with"]
+    base = {"module": "vendedores", "thread": t["id"], "dealer": did, "blockers": []}
+    if not getattr(args, "dealer_sell_dups", False):
+        return [dict(base, type="info", kind=f"{did}: venta", ref=str(t.get("topic")), du=0, score=-1,
+                     blockers=["conversación de venta: requiere --dealer-sell-dups"])]
+    ids = neg.sell_assets_of(t.get("topic"))
+    mine = {a["id"]: a for a in s["me"]["assets"]}
+    if len(ids) != 1 or ids[0] not in mine:
+        return [dict(base, type="dealer_close", kind=f"{did}: cerrar venta", ref=str(ids), du=0, score=10 ** 5,
+                     reason="la copia ya no está en nuestras manos")]
+    asset_id, ref = ids[0], mine[ids[0]]["ref"]
+    loss, floor = sell_floor(val, counts, ref, lc)
+    st = neg.state_from_thread(t, did, tick, neg.Config(), side="sell")
+    d = neg.decide_ladder_sell(st, lc, floor, lc.sell_ticks - neg.conversation_ticks_used(t, tick), args.mode)
+    kind = {"counter": "dealer_sell_counter", "accept": "dealer_sell_accept", "abandon": "dealer_close"}.get(d.action)
+    if not kind:
+        return []
+    c = dict(base, type=kind, kind=f"{did}: venta {d.action}", item=f"card:{ref}", ref=f"card:{ref}", price=d.price,
+             offer=d.offer_id, opening=st.opening, floor=floor, du=round((d.price or 0) - loss, 2), score=10 ** 5,
+             reason=d.reason, turns=st.turns, side="sell", notes=[f"venta escalera, suelo {floor} P"])
+    if kind != "dealer_close":
+        c["asset"] = asset_id  # page_guard la revisa: entrega esta copia
+    if kind == "dealer_sell_accept":
+        o = neg.find_offer(t, d.offer_id) or {}
+        c["blockers"] = neg.sell_offer_problems(o, dealer=did, asset_id=asset_id, floor=floor)
+        c["cash"] = d.price
+    return [c]
+
+
+def dealer_bid_cancels(s, cands, open_dealer, mine_threads):
+    """--dedupe-bids: una puja pasiva por una carta que ya negociamos con un vendedor son dos vías para una necesidad
+    (dos cierres = un duplicado): se bloquea la puja nueva y se propone cancelar la abierta. Las pujas duplicadas entre
+    sí ya las retira siempre page_guard.duplicate_pursuit_cancels."""
+    refs = set()
+    for t in open_dealer:
+        item = neg.item_of(t.get("topic")) or ""
+        if t["id"] in mine_threads and item.startswith("card:"):
+            refs.add(item[5:])
+    out = []
+    for c in cands:
+        if c.get("type") == "bid" and c.get("ref") in refs and not c.get("manual_order"):
+            c["blockers"] = list(c.get("blockers") or []) + [f"ya negociamos {c['ref']} con un vendedor"]
+    for b in tr.own_bids(s["offers"].get("offers", []), s["me"]["id"]):
+        if b["ref"] in refs:
+            out.append({"type": "cancel", "module": "mercado", "kind": "cancelar puja (la compra va por un vendedor)",
+                        "offer": b["offer"], "ref": b["ref"], "venue": b.get("venue"), "price": b["price"], "du": 0,
+                        "score": 2 * 10 ** 4, "blockers": [],
+                        "reason": f"negociamos {b['ref']} con un vendedor: dos vías darían un duplicado"})
+    return out
 
 
 def tactical_sales(s, led, args, val, pl, out):
@@ -806,7 +968,16 @@ def committed_ids(s, led, exclude_key=None):
 def double_commit(c, s, committed):
     """Texto de bloqueo si la candidata entregaría un activo ya comprometido en otra obligación abierta."""
     _, ids, _ = pg.delivery_of(c, s)
-    twice = sorted(set(ids) & set(committed))
+    committed = set(committed)
+    if c.get("type") in ("dealer_sell_counter", "dealer_sell_accept"):
+        # en una VENTA a un vendedor, nuestra petición anterior en el MISMO hilo es la misma obligación (un hilo liquida
+        # un solo trato): no cuenta como segundo compromiso de la copia
+        team, offers = s["me"]["id"], s["offers"].get("offers", [])
+        mine = [o for o in offers if o.get("maker") == team and o.get("status") in pg.OPEN_STATES]
+        same = pg.committed_assets([o for o in mine if o.get("thread") == c.get("thread")], team)
+        other = pg.committed_assets([o for o in mine if o.get("thread") != c.get("thread")], team)
+        committed -= same - other
+    twice = sorted(set(ids) & committed)
     return f"activo(s) {twice} ya comprometido(s) en otra obligación abierta" if twice else None
 
 
@@ -817,7 +988,7 @@ def _cards_of(c):
     out = set(c.get("receive") or {}) | set(c.get("deliver") or {})
     o = c.get("opp") or {}
     out |= {o.get("receive"), o.get("deliver")} - {None}
-    if c["type"] in ("bid", "list", "dealer_open", "swap_list") and c.get("ref"):
+    if c["type"] in ("bid", "list", "dealer_open", "swap_list", "dealer_sell_open") and c.get("ref"):
         out.add(c["ref"].split(":")[-1])
     if c.get("give_ref"):
         out.add(c["give_ref"])
@@ -947,8 +1118,9 @@ def send(reader, led, s, c, args, journal):
         elif c["type"] == "cancel":
             resp = reader.api.cancel(c["offer"])
         elif c["type"] == "dealer_counter":
-            resp = reader.api.say(c["thread"], neg.dealer_message(c["dealer"], c.get("turns", 0),
-                                                                  c["price"], c["ref"]), price=c["price"])
+            text = (neg.ladder_message if c.get("ladder") else neg.dealer_message)(c["dealer"], c.get("turns", 0),
+                                                                                    c["price"], c["ref"])
+            resp = reader.api.say(c["thread"], text, price=c["price"])
             journal.append("decision", {"dealer": c["dealer"], "item": c["item"], "thread": c["thread"], "tick": tick,
                                         "action": "counter", "price": c["price"], "reason": c.get("reason"),
                                         "mode": f"coord-{args.mode}"})
@@ -959,6 +1131,19 @@ def send(reader, led, s, c, args, journal):
                                         "mode": f"coord-{args.mode}"})
         elif c["type"] == "dealer_close":
             resp = reader.api.close_thread(c["thread"])
+        elif c["type"] == "dealer_sell_open":
+            resp = reader.api.open_thread(c["dealer"], topic={"sell": {"assets": [c["asset"]]}})
+            rec["thread"] = resp.get("id")
+            led["threads"].append(resp.get("id"))
+        elif c["type"] in ("dealer_sell_counter", "dealer_sell_accept"):
+            if c["type"] == "dealer_sell_counter":
+                resp = reader.api.say(c["thread"], neg.ladder_message(c["dealer"], c.get("turns", 0), c["price"],
+                                                                      c["ref"], "sell"), price=c["price"])
+            else:
+                resp = reader.api.accept(c["offer"])
+            journal.append("decision", {"dealer": c["dealer"], "item": c["item"], "thread": c["thread"], "tick": tick,
+                                        "action": "sell_" + ("counter" if c["type"] == "dealer_sell_counter" else "accept"),
+                                        "price": c["price"], "reason": c.get("reason"), "mode": f"coord-{args.mode}"})
         elif c["type"] == "team_open":
             nrec = cp.new_negotiation(c["opp"], tick, campaign_cfg(args))
             nrec["state"] = "ambigua"  # hasta saber si la conversación se abrió
@@ -1008,7 +1193,7 @@ def send(reader, led, s, c, args, journal):
               f"   AMBIGUA    {describe(c)} · {rec['error']} · no se reenvía hasta reconciliar")
         return rec
     rec.update(status="submitted" if c["type"] not in ("dealer_open", "dealer_close", "team_open", "team_close",
-                                                       "team_propose") else "settled",
+                                                       "team_propose", "dealer_sell_open") else "settled",
                response={k: resp.get(k) for k in ("id", "status", "queued", "offer", "created_tick", "expires_tick",
                                                    "settles_at_tick") if k in resp},
                offer_id=resp.get("id") if c["type"] in ("list", "bid") else c.get("offer"))
@@ -1301,6 +1486,28 @@ def main():
     p.add_argument("--max-proposals", type=int, default=3, help="propuestas nuestras por conversación")
     p.add_argument("--negotiation-ticks", type=int, default=6, help="ticks máximos por negociación")
     p.add_argument("--max-conversations", type=int, default=2, help="negociaciones de campaña activas a la vez")
+    g = p.add_argument_group("escalera de vendedores (opt-in; sin estos flags el comportamiento no cambia)")
+    g.add_argument("--dealer-ladder", action="store_true",
+                   help="política de escalera observada (Chato pasos +3/+4, apertura 0,70 y final-1 una vez; Abuela "
+                        "pasos de 1 y apertura 0,60; poco comunes enrutadas a la Abuela; vendedores nuevos prudentes)")
+    g.add_argument("--dealer-sell-dups", action="store_true",
+                   help="vender duplicados comunes a la Abuela (pide 10, baja de 1 en 1; final ~6 P) sin romper páginas")
+    g.add_argument("--dedupe-bids", action="store_true",
+                   help="no pujar (y cancelar la puja abierta) por una carta que ya negociamos con un vendedor")
+    g.add_argument("--ladder-new-open", dest="ladder_new_open", type=float, default=None,
+                   help="vendedores nuevos (nivel 3): apertura en fracción de su precio (0.80)")
+    g.add_argument("--ladder-new-step", dest="ladder_new_gap_frac", type=float, default=None,
+                   help="vendedores nuevos: fracción de la brecha por contraoferta (0.35)")
+    g.add_argument("--ladder-new-counters", dest="ladder_new_counters", type=int, default=None,
+                   help="vendedores nuevos: contraofertas máximas (3)")
+    g.add_argument("--ladder-new-ticks", dest="ladder_new_ticks", type=int, default=None,
+                   help="vendedores nuevos: ticks máximos por conversación (10)")
+    g.add_argument("--ladder-new-max-frac", dest="ladder_new_max_frac", type=float, default=None,
+                   help="vendedores nuevos: nunca pagar más de esta fracción de su apertura (0.95)")
+    g.add_argument("--ladder-sell-margin", dest="ladder_sell_margin", type=float, default=None,
+                   help="venta a vendedores: excedente mínimo sobre el valor perdido (1.0 P)")
+    g.add_argument("--ladder-sell-open", dest="ladder_sell_open", type=int, default=None,
+                   help="venta a vendedores: primera petición (10 P)")
     args = p.parse_args()
     if not 1 <= args.ticks <= 120:
         p.error("--ticks entre 1 y 120")
