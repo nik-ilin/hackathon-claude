@@ -305,16 +305,29 @@ def render(dealer_prof, team_prof, rmed, recs, q):
         L += ["## Mala fe de dealers", "", f"- error: {e!r}", ""]
     # announcements (new levels, venue ads) and offers that touch us (directed to t15 or listed on our venue)
     try:
-        ev = q("SELECT tick, type, actor, payload FROM events WHERE type IN ('level.announced','venue.announcement') "
-               "ORDER BY id DESC LIMIT 8")
+        # game-wide news and new features first (rare, high signal), then the noisy venue ads
+        ev = q("SELECT tick, type, actor, payload FROM events WHERE type IN ('level.announced','level.activated',"
+               "'news.posted','persona.updated') ORDER BY id DESC LIMIT 6")
+        ev += q("SELECT tick, type, actor, payload FROM events WHERE type='taller.crafted' ORDER BY id DESC LIMIT 3")
+        ev += q("SELECT tick, type, actor, payload FROM events WHERE type='venue.announcement' ORDER BY id DESC LIMIT 5")
         offs = q("SELECT tick, payload FROM events WHERE type='offer.listed' AND "
                  "(payload LIKE '%\"to\": \"t15\"%' OR payload LIKE '%\"venue\": \"v15\"%') ORDER BY id DESC LIMIT 6")
         if ev or offs:
             L += ["## Anuncios y ofertas que nos tocan", ""]
             for tick, typ, actor, p in ev:
                 d = json.loads(p)
-                txt = (f"nivel «{d.get('name')}» ({d.get('kind')}): {d.get('teaser')}" if typ == "level.announced"
-                       else f"{actor} «{d.get('name')}»: {(d.get('text') or '')[:120]}")
+                if typ in ("level.announced", "level.activated"):
+                    txt = (f"nivel {'ACTIVO' if typ == 'level.activated' else 'anunciado'} «{d.get('name')}» "
+                           f"({d.get('kind')}): {(d.get('how') or d.get('teaser') or '')[:160]}")
+                elif typ == "news.posted":  # Boletín = oficial; Radio = a veces cierto; Tablón = rumor
+                    txt = f"NOTICIA [{d.get('source_name')}] {d.get('headline')} — {(d.get('body') or '')[:100]}"
+                elif typ == "taller.crafted":
+                    txt = f"taller: {(d.get('text') or '')[:120]}"
+                elif typ == "persona.updated":
+                    txt = f"dealer {d.get('name')} cambia a versión {d.get('version')}: recalibrar su escalera"
+                else:
+                    txt = f"{actor} «{d.get('name')}»: {(d.get('text') or '')[:120]}"
+
                 L.append(f"- t{tick} {txt}")
             for tick, p in offs:
                 o = json.loads(p)["offer"]
