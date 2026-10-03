@@ -44,7 +44,8 @@ def load(db):
 def haggles(q, dealers):
     """One record per persona thread: who, what, prices on both sides, outcome."""
     topics = {tid: json.loads(t) if t else None for tid, t in q("SELECT id, topic FROM threads")}
-    rarity_of_asset = dict(q("SELECT asset_id, rarity FROM provenance WHERE rarity IS NOT NULL"))
+    rarity_of_asset = dict(q("SELECT asset_id, rarity FROM settlement_items WHERE rarity IS NOT NULL"))
+    rarity_of_asset.update(q("SELECT asset_id, rarity FROM provenance WHERE rarity IS NOT NULL"))
     rarity_of_ref = dict(q("SELECT ref, rarity FROM provenance WHERE rarity IS NOT NULL"))
     msgs = collections.defaultdict(list)
     for tid, tick, team, with_, sender, price, final in q(
@@ -260,7 +261,14 @@ def self_improve(dealer_prof, team_prof, q):
         levers.append((gap, f"negociación: captura con dealers {me['dealer_capture']} vs {lead['dealer_capture']} del líder; "
                             f"tratos/hilos {me.get('dealer_deals')}/{me.get('dealer_threads')} → abrir más bajo y pasos cortos (ver dealer_params)"))
     levers.sort(reverse=True)
-    return {"gap_to_first": round((lead.get("score") or 0) - (me.get("score") or 0), 2),
+    # our live score breakdown (GET /api/me → score): which component actually moves
+    parts = {}
+    row = q("SELECT payload FROM me_snapshots ORDER BY snap_ts DESC LIMIT 1")
+    if row:
+        sc = json.loads(row[0][0]).get("score") or {}
+        parts = {k: sc.get(k) for k in ("neg_points", "duel_points", "ladder_points", "mm_points",
+                                        "bench_efficiency", "bench_points", "negotiating", "market")}
+    return {"gap_to_first": round((lead.get("score") or 0) - (me.get("score") or 0), 2), "score_parts": parts,
             "our_trend_last_snapshots": trend, "levers": [t for _, t in levers], "dealer_params": params}
 
 
@@ -270,8 +278,28 @@ def render(dealer_prof, team_prof, rmed, recs, q):
     if si:
         L += ["## Bucle de automejora (t15)", "",
               f"- Distancia al 1º: {si['gap_to_first']} · tendencia últimas instantáneas: {si['our_trend_last_snapshots']}"]
+        if si.get("score_parts"):
+            L.append("- Desglose propio (/api/me): " + " · ".join(f"{k} {v}" for k, v in si["score_parts"].items()))
         L += [f"- Palanca {i}: {t}" for i, t in enumerate(si["levers"], 1)]
         L += ["- Parámetros aprendidos del mejor trato por dealer/artículo en `recommendations.json` → `self_improve.dealer_params`", ""]
+    # bad faith: words vs attached price (flag candidates) and bluffs (negotiation hint, never flag)
+    try:
+        import lies
+        mism, bluffs = lies.scan(q)
+        ours = [m for m in mism if m["team"] == US]
+        L += ["## Mala fe de dealers", "",
+              f"- Palabras ≠ precio de la oferta: {len(mism)} en total, {len(ours)} en nuestros hilos "
+              "(candidatos a `POST /api/flags`; solo los nuestros, un flag erróneo resta)"]
+        L += [f"  - msg {m['message_id']} {m['dealer']} t{m['tick']}: oferta {m['price']} vs palabras {m['words']} · «{m['text']}»"
+              for m in ours[:5]]
+        by = {}
+        for b in bluffs:
+            by.setdefault(b["dealer"], []).append(b)
+        L += [f"- Faroles «final» sin `final: true` que luego se mueven: " +
+              ("; ".join(f"{d} ×{len(v)} (p. ej. {v[-1]['said']}→{v[-1]['then']})" for d, v in by.items()) or "ninguno")
+              + " → seguir regateando", ""]
+    except Exception as e:  # analysis only: never break the report
+        L += ["## Mala fe de dealers", "", f"- error: {e!r}", ""]
     # venue changes over the last ~hour of snapshots (fee cuts, new venues, first trades)
     vs = q("SELECT tick, payload FROM json_snapshots WHERE kind='venues' ORDER BY snap_ts DESC LIMIT 7")
     if len(vs) > 1:
