@@ -13,6 +13,39 @@ El coordinador existente sigue siendo la única autoridad operativa. La integrac
 
 No se adoptan automáticamente la contraoferta tras `final` basada en dos ejemplos, la apertura de mercado a una hora fija ni el veto permanente a ciertos equipos. Son hipótesis históricas, no mejoras demostradas para nuestro estado actual. Tampoco se instala ningún supervisor ni se inicia ningún bot al hacer el merge.
 
+## Actualización de ramas del 3 de octubre
+
+- `duel-decision-tree` (`e631cbd`): explicaciones numéricas de decisiones y
+  memoria del log para evitar repetir ofertas o aceptaciones en el mismo tick.
+  Conserva la política, bloqueo compartido, ritmo de peticiones, omisión de
+  duelos con días y detención ante escrituras ambiguas. El feed es contexto;
+  no altera automáticamente los parámetros.
+- `team15-live-trade-dashboard` (`d4f53bf`): panel local de solo lectura,
+  inventario y propuestas por equipo. Las lecturas públicas y privadas ahora
+  comparten un limitador de 0,3 segundos; se rechazan redirecciones para evitar
+  reenviar credenciales. No inicia operaciones ni se arranca automáticamente.
+- `t15-bazaar-bot-pr` (`bf1138c`): actualización histórica de análisis y
+  estimación de rareza por precio. `kind_estimate` conserva esa hipótesis
+  separada de `kind`; no contamina los grupos de rareza confirmada. Los
+  ejecutores alternativos siguen restringidos al análisis.
+
+Validación de esta actualización en un árbol limpio: **527 pruebas unittest
+del agente (una omitida por datos históricos ausentes), 11 del panel y 31
+pytest del bot T15**. No se enviaron operaciones al juego. Los cambios locales
+simultáneos del otro agente no forman parte de estos merges ni de esos números.
+Comprobación adicional del árbol compartido durante la revisión: 576 pruebas
+del agente y 11 del panel sin fallos. Ese resultado verifica compatibilidad
+en esa instantánea; no incorpora los cambios ajenos al commit de integración.
+
+Desde la raíz del repositorio, panel opcional:
+
+```bash
+python3 team15-dashboard/app.py --env-file bazaar-kit/.env
+```
+
+Abrir `http://127.0.0.1:8775`. Otros procesos aún pueden consumir el límite
+compartido del servidor; el limitador del panel solo coordina sus propias lecturas.
+
 ## Uso
 
 Desde `bazaar-kit`:

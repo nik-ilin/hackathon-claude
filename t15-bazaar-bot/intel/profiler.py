@@ -91,7 +91,10 @@ def haggles(q, dealers):
         if h["kind"] == "carta" and h["dealer_open"]:
             refs = {k: med(v) for (d, k), v in opens.items() if d == h["dealer"]}
             if refs:
-                h["kind"] = min(refs, key=lambda k: abs(refs[k] - h["dealer_open"]))
+                # Price similarity is a hypothesis, never provenance. Keep unknown
+                # cards out of the confirmed rarity aggregates used by strategies.
+                h["kind_estimate"] = min(refs, key=lambda k: abs(refs[k] - h["dealer_open"]))
+                h["kind_estimate_basis"] = "nearest_dealer_opening_median"
     return out
 
 

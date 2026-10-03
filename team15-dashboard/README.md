@@ -26,6 +26,11 @@ El alias del maker en un libro público sólo se asocia con un equipo si existe 
 
 El ranking se desactiva si el valor calculado de nuestra colección difiere del que devuelve `/api/me`, si la clave no es de t15 o si no hay datos privados. La página se actualiza cada 15 segundos; el selector de equipo y la pausa sobreviven al refresco.
 
+Todas las lecturas del panel comparten una separación mínima de 0,3 segundos,
+incluidas las públicas y los libros. Otros procesos siguen compartiendo el límite
+del servidor y pueden provocar `rate_limited`. Se rechazan redirecciones HTTP
+para no reenviar la clave a otro destino.
+
 ```bash
 python3 -m unittest discover -s team15-dashboard -p 'test_*.py' -q
 python3 -m unittest discover -s bazaar-kit -p 'test_*.py' -q

@@ -43,6 +43,9 @@ class Reader:
     """GET only. Authentication is sent only to the game's origin."""
     def __init__(self, url: str, key: str | None, timeout: float = 9):
         self.url, self.key, self.timeout = url.rstrip("/"), key, timeout
+        self._pace_lock = threading.Lock()
+        self._last_request = None
+        self._opener = urllib.request.build_opener(NoRedirect())
 
     def get(self, path: str, *, private: bool = False) -> dict:
         if private and not self.key:
@@ -51,15 +54,27 @@ class Reader:
         if private:
             headers["X-Team-Key"] = self.key
         req = urllib.request.Request(self.url + path, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=self.timeout) as response:
+        # Public feed and concurrent venue reads share the same request budget.
+        with self._pace_lock:
+            now = time.monotonic()
+            if self._last_request is not None:
+                time.sleep(max(0, .3 - (now - self._last_request)))
+            self._last_request = time.monotonic()
+        with self._opener.open(req, timeout=self.timeout) as response:
             return json.load(response)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Do not forward a private team header to a redirected origin."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 class Model:
     def __init__(self, reader: Reader, team: str = "t15", reserve: int = 100,
                  feed_root: Path = KIT):
         self.reader, self.team, self.reserve = reader, team, reserve
-        self.public = public_dashboard.Builder(public_dashboard.ReadOnlyClient(reader.url),
+        self.public = public_dashboard.Builder(reader,
                                                team=team, root=feed_root)
         self.lock = threading.Lock()
         self.cached = None

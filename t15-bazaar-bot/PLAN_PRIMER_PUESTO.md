@@ -1,5 +1,9 @@
 # Plan para el 1.er puesto — sábado 11:00 (tick ~315)
 
+> Documento histórico del tick ~315. Precios, clasificación y diagnóstico no
+> describen necesariamente el estado actual. Los «finales» observados no son
+> suelos garantizados. No se aplican automáticamente sus parámetros al agente.
+
 Estamos 14.º (15,13). t18 lidera con 29,7 gracias al **ladder**: 10 tratos cerrados con dealers. Nosotros: **ladder 0** (0 tratos en 24 hilos).
 
 ## Causa (verificada con `coordinator.py` en modo análisis, sin enviar nada)
