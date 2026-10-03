@@ -1,9 +1,9 @@
 {
- "generated": "2026-10-03 10:26:35",
+ "generated": "2026-10-03 10:31:36",
  "dealer_finals": {
   "abuela|buy|sobre_barrio": {
-   "n": 5,
-   "median": 21.5
+   "n": 6,
+   "median": 21
   },
   "abuela|?|?": {
    "n": 10,
@@ -46,8 +46,8 @@
    "median": 14
   },
   "abuela|buy|carta": {
-   "n": 23,
-   "median": 24
+   "n": 24,
+   "median": 24.0
   },
   "chato|buy|uncommon": {
    "n": 4,
@@ -91,14 +91,13 @@
   "abuela|sell|?": 1
  },
  "p2p_median_by_rarity": {
-  "common": 8,
+  "common": 8.5,
   "uncommon": 25,
   "rare": 76.0
  },
  "buyers_by_set": {
   "LAV": [
    "t06",
-   "t05",
    "t03",
    "t08",
    "t14",
@@ -133,6 +132,7 @@
    "t18",
    "t03",
    "t08",
+   "t14",
    "t13",
    "t04"
   ]
