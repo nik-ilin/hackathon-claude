@@ -17,8 +17,11 @@ Política por duelo vivo, en cada tick:
   3. Sin oferta rival a falta de SPEAK_AT ticks ⇒ UNA oferta propia (comprador 0,70·L, vendedor 1,30·C).
   4. Últimos ticks ⇒ aceptar la mejor oferta dentro de límite. Solo hay UNA aceptación por tick y equipo: los duelos
      que comparten deadline se escalonan (un tick de margen más por cada duelo de la oleada).
-Duelos de precio + días: omitidos por duel_candidates hasta verificar la fórmula del servidor.
-_days_value y margin conservan una aproximación exploratoria para análisis offline.
+Duelos de precio + días: omitidos por defecto hasta verificar la fórmula del servidor. Con PARAMS["PLAY_DAYS"] = True
+(opt-in, `duel_runner.py --days`) se juegan con la misma política, valorando cada oferta como precio + utilidad de
+días, exigiendo SIEMPRE precio dentro de límite y enviando `days` en toda oferta propia.
+Opt-in PARAMS["LADDER"]: frente a un rival que no habla, en vez de una sola oferta, una escalera de ofertas que se
+acerca al límite (por defecto desactivada: una sola oferta).
 
 Repetición individual retrospectiva (sin límite compartido de aceptaciones ni validación fuera de muestra): 98 % del margen máximo disponible (562 de 574 P) con los parámetros por defecto, frente
 a 77 % aceptando en cuanto hay un 30 % de margen. El viernes, sin módulo de duelos, se capturó 0.
@@ -33,22 +36,64 @@ PARAMS = {
     "SPEAK_AT": 5,        # ticks antes del deadline para hablar si el rival calla
     "ANCHOR": 0.30,       # nuestra única oferta: comprador límite·(1−0,30), vendedor límite·(1+0,30)
     "SAFE_TICKS": 1,      # aceptar a más tardar en deadline − SAFE_TICKS (+1 por duelo de la misma oleada)
+    # --- opt-in (desactivados por defecto; ver duel_sim.py para su medición) ---
+    "PLAY_DAYS": False,        # jugar duelos de precio + días (si no, se omiten)
+    "LADDER": (),         # rival mudo: márgenes sucesivos tras ANCHOR, p. ej. (0.20, 0.12, 0.06); () = una sola oferta
+    "PROBE": False,       # rival plantado con tiempo de sobra: UNA contraoferta a mitad de camino antes de aceptar
 }
+
+_SCALAR_KEYS = ("per_day", "weight", "value", "slope", "w")
+
+
+def _num(x) -> Optional[float]:
+    if isinstance(x, bool):
+        return None
+    if isinstance(x, (int, float)):
+        return float(x) if x == x and abs(x) != float("inf") else None
+    if isinstance(x, str):
+        try:
+            return _num(float(x.strip()))
+        except ValueError:
+            return None
+    return None
+
+
+def days_table(duel: dict) -> Optional[list]:
+    """`your_days_weight` normalizado a una lista de 11 utilidades (día 0..10), o None si falta o no se entiende.
+    El formato no está documentado: se aceptan lista por día, dict por día ({"3": 12} o {3: 12}), peso escalar por
+    día (lineal: peso·días), un dict con un único escalar ({"per_day": 2}) y números en texto."""
+    w = duel.get("your_days_weight")
+    if w is None or isinstance(w, bool):
+        return None
+    if isinstance(w, (list, tuple)):
+        vals = [_num(x) for x in w]
+        if not vals or any(v is None for v in vals):
+            return None
+        return [vals[k] if k < len(vals) else 0.0 for k in range(11)]
+    if isinstance(w, dict):
+        for k in _SCALAR_KEYS:
+            if k in w and _num(w[k]) is not None and len(w) == 1:
+                return [_num(w[k]) * d for d in range(11)]
+        table = {}
+        for k, v in w.items():
+            kk, vv = _num(k), _num(v)
+            if kk is None or vv is None or kk != int(kk) or not 0 <= kk <= 10:
+                return None
+            table[int(kk)] = vv
+        return [table.get(d, 0.0) for d in range(11)] if table else None
+    n = _num(w)
+    return None if n is None else [n * d for d in range(11)]
 
 
 def _days_value(duel: dict, days: Optional[int]) -> float:
-    """Utilidad (en primas) del día de entrega, si el duelo negocia días. El formato de `your_days_weight` no está
-    documentado: se aceptan lista por día, dict por día o peso escalar por día."""
-    w = duel.get("your_days_weight")
-    if days is None or not w:
+    """Utilidad (en primas) del día de entrega, si el duelo negocia días (0 si no hay tabla o día fuera de 0..10)."""
+    if days is None:
         return 0.0
-    if isinstance(w, dict):
-        return float(w.get(str(days), w.get(days, 0)) or 0)
-    if isinstance(w, list) and 0 <= days < len(w):
-        return float(w[days])
-    if isinstance(w, (int, float)):
-        return float(w) * days
-    return 0.0
+    t = days_table(duel)
+    d = _num(days)
+    if t is None or d is None or d != int(d) or not 0 <= d <= 10:
+        return 0.0
+    return t[int(d)]
 
 
 def margin(duel: dict, price: Optional[int], days: Optional[int] = None) -> Optional[float]:
@@ -70,54 +115,106 @@ def rival_trajectory(duel: dict) -> list:
 
 
 def _best_days(duel: dict) -> int:
-    return max(range(11), key=lambda k: _days_value(duel, k))
+    """Nuestro día preferido; en empate (o sin tabla), el último día que propuso el rival: si a nosotros nos da
+    igual, se lo concedemos (la tarta crece cuando cada uno se queda con lo que más valora)."""
+    ro = duel.get("rival_offer") or {}
+    rd = _num(ro.get("days"))
+    pref = int(rd) if rd is not None and rd == int(rd) and 0 <= rd <= 10 else 0
+    return max(range(11), key=lambda k: (_days_value(duel, k), k == pref, -k))
+
+
+def _is_days(duel: dict) -> bool:
+    return "days" in (duel.get("issues") or [])
+
+
+def _own_price(duel: dict, share: float) -> int:
+    lim = float(duel["your_limit"])
+    return max(1, int(round(lim * (1 - share)))) if duel["role"] == "buyer" else max(1, int(round(lim * (1 + share))))
 
 
 def duel_candidates(duels: list, tick: int) -> list:
     """Candidatas para el tick, con el mismo espíritu que las del coordinador: dicts con `type`, `duel`, `score`, `du`
-    (excedente) y `why`. type ∈ {"duel_accept", "duel_say"}. Ordenar por `score` y enviar como mucho UNA aceptación."""
+    (excedente) y `why`. type ∈ {"duel_accept", "duel_say"}. Ordenar por `score` y enviar como mucho UNA aceptación.
+    Los duelos ya aceptados (pendientes de liquidar) NO deben pasarse: consumirían plazas del escalonado."""
+    playable = [d for d in duels if d.get("status") == "live" and d.get("deadline_tick") is not None
+                and (PARAMS["PLAY_DAYS"] or not _is_days(d))]
     by_deadline: dict = {}
     for d in duels:
         if d.get("status") == "live":
             by_deadline[d.get("deadline_tick")] = by_deadline.get(d.get("deadline_tick"), 0) + 1
+    in_limit = []                                     # deadlines de duelos con una oferta rival aceptable ya
+    for d in playable:
+        ro = d.get("rival_offer") or {}
+        m = margin(d, ro.get("price"), ro.get("days") if _is_days(d) else None)
+        if m is not None and m >= 0:
+            in_limit.append(d["deadline_tick"])
     out = []
-    for d in duels:
-        if d.get("status") != "live" or d.get("deadline_tick") is None:
-            continue
+    for d in playable:
         deadline = d["deadline_tick"]
         left = deadline - tick
         if left <= 0:
             continue  # no enviar acciones sobre un snapshot caducado
-        if "days" in (d.get("issues") or []):
-            continue  # pendiente de verificar la fórmula de utilidad de días con el servidor
+        days_duel = _is_days(d)
         ro = d.get("rival_offer") or {}
-        price, days = ro.get("price"), ro.get("days")
+        price = ro.get("price")
+        days = ro.get("days") if days_duel else None
         m = margin(d, price, days)
+        pm = margin(dict(d, your_days_weight=None), price)  # solo precio: el umbral GOOD_SHARE no cuenta los días
         lim = float(d["your_limit"])
         traj = rival_trajectory(d)
+        rival = d.get("rival")
+        dtraj = [m_.get("days") for m_ in d.get("messages", []) if m_.get("price") is not None and m_.get("from") == rival]
+        util = [margin(d, p, (dtraj[i] if days_duel else None)) for i, (_, p) in enumerate(traj)]
         slope = 0.0                                   # mejora del rival a nuestro favor, primas/tick (últimos 3 ticks)
         if len(traj) >= 2:
-            (t0, p0), (t1, p1) = traj[max(0, len(traj) - 4)], traj[-1]
+            i0 = max(0, len(traj) - 4)
+            (t0, _), (t1, _) = traj[i0], traj[-1]
             if t1 > t0:
-                slope = ((p0 - p1) if d["role"] == "buyer" else (p1 - p0)) / (t1 - t0)
+                slope = (util[-1] - util[i0]) / (t1 - t0)
         n = PARAMS["STALL_TICKS"]
-        stalled = len(traj) >= n and all(p == traj[-1][1] for _, p in traj[-n:])
-        safe = PARAMS["SAFE_TICKS"] + max(0, by_deadline.get(deadline, 1) - 1)
+        offers = [(p, dtraj[i] if days_duel else None) for i, (_, p) in enumerate(traj)]
+        stalled = len(offers) >= n and all(o == offers[-1] for o in offers[-n:])
+        # una aceptación por tick: los duelos con deadline ≤ el nuestro y oferta aceptable compiten por los mismos ticks
+        queue = sum(1 for x in in_limit if x <= deadline)
+        safe = PARAMS["SAFE_TICKS"] + max(0, by_deadline.get(deadline, 1) - 1, queue - 1)
         why = f"duelo {d['duel']} {d['role']} límite {lim:.0f} rival {price} días {days} quedan {left} pendiente {slope:.1f}"
 
-        if m is not None and m >= 0:
-            if left <= safe or m >= PARAMS["GOOD_SHARE"] * lim or slope < 0 or stalled:
-                # urgencia primero; entre urgentes, antes el rival que menos cede (el que más cede, al final)
-                score = (1000 if left <= safe + 1 else 500) + max(0, 10 - int(slope))
+        if m is not None and m >= 0 and pm is not None and pm >= 0:
+            probe = (PARAMS["PROBE"] and stalled and slope >= 0 and d.get("your_offer") is None
+                     and left > safe + 2 and pm < PARAMS["GOOD_SHARE"] * lim)
+            if probe:
+                # opt-in: un rival que se planta puede ser un «espejo» que solo se mueve si nos movemos
+                ours = int(round((price + _own_price(d, PARAMS["ANCHOR"])) / 2))
+                c = {"type": "duel_say", "duel": d["duel"], "price": ours, "du": None, "score": 100,
+                     "text": f"{ours} P y cerramos ahora.", "why": why + " ⇒ sondeo a rival plantado"}
+                if days_duel:
+                    c["days"] = _best_days(d)
+                out.append(c)
+                continue
+            if left <= safe or pm >= PARAMS["GOOD_SHARE"] * lim or slope < 0 or stalled:
+                # urgencia primero (antes el deadline más próximo); entre iguales, antes el rival que menos cede
+                score = (1000 + 10 * max(0, 50 - left) if left <= safe + 1 else 500) + max(0, 10 - int(slope))
                 out.append({"type": "duel_accept", "duel": d["duel"], "du": m, "score": score, "why": why + " ⇒ aceptar"})
                 continue
-        if (price is None or (m is not None and m < 0)) and left <= PARAMS["SPEAK_AT"] and d.get("your_offer") is None:
-            a = PARAMS["ANCHOR"]
-            ours = int(round(lim * (1 - a))) if d["role"] == "buyer" else int(round(lim * (1 + a)))
+        if (price is None or (m is not None and m < 0)) and left <= PARAMS["SPEAK_AT"]:
+            ladder = [PARAMS["ANCHOR"]] + [s_ for s_ in PARAMS["LADDER"] if s_ < PARAMS["ANCHOR"]]
+            mine = (d.get("your_offer") or {}).get("price")
+            if mine is None:
+                share = ladder[0]
+            elif price is None and len(ladder) > 1:
+                # escalera (opt-in) solo frente a rivales mudos: un peldaño por tick, nunca hacia atrás
+                below = [s_ for s_ in ladder if (_own_price(d, s_) > mine if d["role"] == "buyer" else _own_price(d, s_) < mine)]
+                if not below:
+                    continue
+                share = below[0]
+            else:
+                continue
+            ours = _own_price(d, share)
             c = {"type": "duel_say", "duel": d["duel"], "price": ours, "du": None, "score": 100,
                  "text": f"{ours} P y cerramos ahora.", "why": why + " ⇒ una oferta propia"}
-            if "days" in (d.get("issues") or []):
+            if days_duel:
                 c["days"] = _best_days(d)
+                c["text"] = f"{ours} P con entrega el día {c['days']} y cerramos ahora."
             out.append(c)
     return sorted(out, key=lambda c: -c["score"])
 
