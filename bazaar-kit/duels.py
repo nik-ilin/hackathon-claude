@@ -39,17 +39,24 @@ PARAMS = {
 
 def _days_value(duel: dict, days: Optional[int]) -> float:
     """Utilidad (en primas) del día de entrega, si el duelo negocia días. El formato de `your_days_weight` no está
-    documentado: se aceptan lista por día, dict por día o peso escalar por día."""
+    documentado: se aceptan lista por día, dict por día ("3" o 3), dict con un escalar (per_day/weight/value) o peso
+    escalar por día (también como texto numérico). Formato desconocido ⇒ 0 (se juega solo precio, nunca rompe)."""
     w = duel.get("your_days_weight")
-    if days is None or not w:
+    if days is None or w is None or w == "":
         return 0.0
-    if isinstance(w, dict):
-        return float(w.get(str(days), w.get(days, 0)) or 0)
-    if isinstance(w, list) and 0 <= days < len(w):
-        return float(w[days])
-    if isinstance(w, (int, float)):
-        return float(w) * days
-    return 0.0
+    try:
+        if isinstance(w, dict):
+            if str(days) in w or days in w:
+                return float(w.get(str(days), w.get(days)) or 0)
+            for k in ("per_day", "weight", "value", "per_day_value"):
+                if isinstance(w.get(k), (int, float, str)):
+                    return float(w[k]) * days
+            return 0.0
+        if isinstance(w, (list, tuple)):
+            return float(w[days]) if 0 <= days < len(w) else 0.0
+        return float(w) * days                    # escalar o texto numérico
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def margin(duel: dict, price: Optional[int], days: Optional[int] = None) -> Optional[float]:
