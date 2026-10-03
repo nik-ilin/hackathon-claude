@@ -386,9 +386,17 @@ class DuelView:
             rounds_used=int(pick("rounds_used", "round", "messages", default=0)),
             ticks_left=pick("ticks_left", "ticks_remaining"),
             issues=tuple(issues),
-            days_weight=float(pick("your_days_weight", "days_weight", default=0.0) or 0.0),
+            days_weight=_scalar_weight(pick("your_days_weight", "days_weight", default=0.0)),
             item=str(pick("item", "scenario", default="") or ""),
         )
+
+
+def _scalar_weight(w) -> float:
+    """El oráculo modela un peso escalar por día; una lista/dict (formato no documentado) no debe tumbarlo."""
+    try:
+        return float(w or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 # -------------------------------------------------------------------- decisión

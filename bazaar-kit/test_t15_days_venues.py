@@ -60,6 +60,24 @@ class TestDays(unittest.TestCase):
         self.assertEqual(call.call_args[0][2], {"text": "hola", "price": 60})
 
 
+class TestDaysWeightFormats(unittest.TestCase):
+    def test_formats(self):
+        f = lambda w, k: dl._days_value({"your_days_weight": w}, k)
+        self.assertEqual(f([0, 1, 2, 3], 3), 3)
+        self.assertEqual(f({"3": 7}, 3), 7)
+        self.assertEqual(f({3: 7}, 3), 7)
+        self.assertEqual(f({"per_day": -2}, 3), -6)
+        self.assertEqual(f(1.5, 2), 3)
+        self.assertEqual(f("2", 2), 4)
+        for weird in ({"a": [1]}, [1, 2], "x", object()):
+            self.assertEqual(f(weird, 5), 0.0)
+
+    def test_oracle_does_not_crash_on_list_weight(self):
+        import oracle_duels
+        self.assertEqual(oracle_duels._scalar_weight([1, 2]), 0.0)
+        self.assertEqual(oracle_duels._scalar_weight(2), 2.0)
+
+
 class TestRivalVenues(unittest.TestCase):
     S = {"me": {"id": "t15"}, "venues": {"venues": [
         {"venue": "rastro", "owner": "world"}, {"venue": "v14", "owner": "t14"}, {"venue": "v15", "owner": "t15"}]}}
