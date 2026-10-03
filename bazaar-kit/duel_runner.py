@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 import duels as dl
+import duel_tree
 from bazaar_sdk import Bazaar, BazaarError
 from negotiation import InstanceLock
 
@@ -33,6 +34,25 @@ def log(rec: dict) -> None:
     print(json.dumps(rec, ensure_ascii=False), flush=True)
     with open(LOG, "a") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def load_feed_events(path: Path | None) -> list[dict]:
+    """El feed es contexto opcional; una línea parcial no frena el duelo."""
+    if not path:
+        return []
+    try:
+        with path.open(encoding="utf-8") as fh:
+            events = []
+            for line in fh:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict):
+                    events.append(event)
+            return events
+    except OSError:
+        return []
 
 
 def load_params() -> None:
@@ -74,6 +94,8 @@ class PacedBazaar(Bazaar):
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--execute", action="store_true", help="enviar (por defecto solo análisis)")
+    ap.add_argument("--feed-file", type=Path, default=DATA / "feed_history.jsonl",
+                    help="JSONL del feed público para contexto (por defecto data/feed_history.jsonl)")
     a = ap.parse_args()
     key = os.environ.get("BAZAAR_KEY", "")
     if not key or key == "tk-xxxx-xxxx":
@@ -86,13 +108,13 @@ def main() -> None:
         if holder:
             raise SystemExit(f"Otro agente está activo (pid {holder.get('pid')}); detén ese agente antes de ejecutar duelos")
     try:
-        run(b, a.execute)
+        run(b, a.execute, a.feed_file)
     finally:
         if a.execute:
             lock.release()
 
 
-def run(b, execute):
+def run(b, execute, feed_file: Path | None = None):
     last_tick = None
     while True:
         try:
@@ -108,11 +130,22 @@ def run(b, execute):
             for d in live:
                 if "days" in (d.get("issues") or []):
                     log({"tick": c["tick"], "duel": d["duel"], "skipped": "days utility not verified"})
+            events = load_feed_events(feed_file)
             accepted = False
-            for cand in dl.duel_candidates(live, c["tick"]):
+            for step in duel_tree.plan(live, c["tick"], events,
+                                       load_feed_events(LOG)):
+                cand = step["candidate"]
+                if step["action"] in {"wait", "defer", "already_sent"}:
+                    log({"tick": c["tick"], "duel": step["duel"],
+                         "action": step["action"], "path": step["path"],
+                         "trigger": step["trigger"], "facts": step["facts"],
+                         "reason": step["reason"], "feed": step["feed"], "sent": False})
+                    continue
                 if cand["type"] == "duel_accept" and accepted:
-                    continue                 # una aceptación por tick y equipo
+                    continue
                 rec = {"tick": c["tick"], **{k: v for k, v in cand.items() if k != "score"}}
+                rec.update(action=step["action"], path=step["path"],
+                           trigger=step["trigger"], facts=step["facts"], feed=step["feed"])
                 if not execute:
                     log({**rec, "sent": False})
                     continue
