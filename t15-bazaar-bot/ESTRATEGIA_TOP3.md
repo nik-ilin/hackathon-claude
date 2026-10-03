@@ -37,7 +37,7 @@ Reglas propias: solo jugadas dentro de RULES.md. No se usan claves ajenas ni fal
    - **Vender TODAS nuestras SAL a Pilar en ese intervalo** da a la vez valor, los 3 tratos de nivel 3 y el ladder con más peso.
    - Preparar desde ya, antes de las 14:55: acumular SAL baratas (tablón y la Abuela), sin romper páginas completas.
 3. **Market Tests** (≈14:45, 17:05, 19:23; **el difícil ≈21:17**; 21:41): pasar v15 a 0 bps. Un solo trato entre otros equipos en v15 lleva el market-making de ~7,5 a ~12. Anunciar v15 en el feed como hace t13.
-4. **Duelos II (≈17:49, precio + días, decay 0,08, 6 simultáneos, 2 rondas)**:
+4. **Duelos II (los organizadores dicen «hacia las 18:30»; el calendario del servidor da ≈17:49: estar listos a las 17:40; precio + días, decay 0,08, 6 simultáneos, 2 rondas)**:
    - Los rivales son bots con perfiles fijos y el silencio evita el decay (`rounds` = 0 si no hablamos).
    - Perfiles medidos en Duelos I:
      - **Plata**: cede 1-3 por tick → esperar.
@@ -45,6 +45,7 @@ Reglas propias: solo jugadas dentro de RULES.md. No se usan claves ajenas ni fal
      - **Oro y Luna**: saltos grandes y luego se plantan → aceptar tras el salto.
      - **Rojo y Noche**: a veces **empeoran** con el tiempo (Rojo vendedor 133→166) → aceptar pronto u ofertar.
      - **Mudos**: una oferta propia (`--ladder`).
+   - Los días son la **urgencia de la fecha de entrega** (organizadores). Consejo oficial: revisar todas las ofertas frente al límite.
    - Con días: «the pie grows for teams that trade on what each side cares about». Cedemos los días que nos importan poco y cobramos en precio (logrolling).
 5. **Domingo** (ticks de 15 s):
    - Ronda 3 ≈09:29 con 150 P de asignación.
@@ -57,5 +58,5 @@ Reglas propias: solo jugadas dentro de RULES.md. No se usan claves ajenas ni fal
 1. Ahora: v15 a 0 bps. Coordinador con `--no-rival-venues --duende-venue rastro` (PR #6).
 2. Ahora → 14:55: ladder, 3 tratos con la Abuela y 3 con el Chato (PR #8 `--dealer-ladder`), y acumular SAL.
 3. 14:55 → 17:13: vender SAL a Pilar con escalera tipo t14 (abrir alto y bajar de 2 en 2 hasta 19-20 × 1,25).
-4. 17:40: parar el coordinador. Duelos II con `python3 duel_runner.py --execute --days --ladder --reconcile --verify-accept` (PR #6 + #7).
+4. 17:40 (Duelos II hacia las 17:49–18:30): parar el coordinador. Duelos II con `python3 duel_runner.py --execute --days --ladder --reconcile --verify-accept` (PR #6 + #7).
 5. 21:00: vigilar el Market Test difícil con v15 a 0 bps.
