@@ -3,9 +3,14 @@
 #   ./run.sh                          -> starter_agent.py (sobre sobre_barrio)
 #   ./run.sh --card LAV-03 --dry-run  -> starter_agent.py con argumentos (ver --help)
 #   ./run.sh broker                   -> starter_broker.py (necesita BROKER_KEY en .env)
+#   ./run.sh memory                   -> coordinador con memoria persistente (análisis por defecto)
+#   ./run.sh market-broker            -> market_broker.py: Market Test con suelo del puesto y vigilante
 #   ./run.sh coord                    -> coordinador único: análisis (solo lectura); --execute para operar
 #   ./run.sh market                   -> análisis de colección y mercado (solo lectura)
 #   ./run.sh market --execute --cycles 8 -> operación entre equipos, máximo una acción por ciclo
+#   ./run.sh celestina [--loop]       -> casamentera de v15: imprime el anuncio (dry run); --execute para publicarlo
+#   ./run.sh t15                      -> coordinador con la configuración decidida del equipo (ver T15_PLAN.md)
+#   ./run.sh t15 --execute --ticks 120 -> igual, operando
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -24,9 +29,19 @@ if [ "${BAZAAR_KEY:-}" = "tk-xxxx-xxxx" ] || [ -z "${BAZAAR_KEY:-}" ]; then
 fi
 
 case "${1:-}" in
+  memory) shift; exec python3 memory_coordinator.py "$@" ;;
   coord)  shift; exec python3 coordinator.py "$@" ;;
   market) shift; exec python3 market_agent.py "$@" ;;
+  celestina) shift; exec python3 celestina.py "$@" ;;
+  t15)    shift; exec python3 coordinator.py --reserve 5 --per-card 95 --margin 2 \
+            --no-rival-venues --duende-venue rastro \
+            --deny-teams t05,t14,t12,t10,t18 --deny-margin 15 \
+            --ladder-fill --ladder-calibrated --dealer-sell-dups --dedupe-bids \
+            --pilar-sell SAL,LAV:1.25 --pilar-last-copy --allow-last-copy SAL-07 \
+            --news-sell --chato-mirror on --fever-priority "$@" ;;
   broker) exec python3 starter_broker.py ;;
+  market-broker) shift; exec python3 market_broker.py "$@" ;;
+  duels) shift; exec python3 duel_runner.py "$@" ;;
   agent)  shift; exec python3 starter_agent.py "$@" ;;
   *)      exec python3 starter_agent.py "$@" ;;
 esac

@@ -24,6 +24,8 @@ ORIGINAL = {
     "bazaar_sdk.py", "coordinator.py", "trading.py", "negotiation.py",
     "market_agent.py", "market_intel.py", "campaigns.py", "starter_agent.py",
     "starter_broker.py", "sim.py", "sim_day2.py",
+    "duels.py", "duel_runner.py", "test_duels.py", "test_duel_runner.py",
+    "page_guard.py", "test_page_guard.py", "agent_memory.py", "test_agent_memory.py",
     "test_coordinator.py", "test_trading.py", "test_market.py",
     "test_negotiation.py", "test_campaigns.py", "test_market_intel.py",
 }
@@ -54,10 +56,13 @@ def addon_files() -> list[str]:
     """Los .py del add-on, descubiertos en vez de listados a mano."""
     # Este propio archivo queda fuera: contiene a propósito los literales que
     # busca, así que escanearse a sí mismo sería un falso positivo garantizado.
+    # Explicit ownership: unrelated new project files are not oracle add-ons.
+    modules = {"feed_oracle", "feed_watch", "feed_stream", "dashboard", "broker_engine", "broker_run",
+               "oracle_duels", "duels_run", "playbook", "rivals", "signals", "addon_isolation"}
     return sorted(f.name for f in HERE.glob("*.py")
-                  if f.name not in ORIGINAL
-                  and f.name != pathlib.Path(__file__).name
-                  and not f.name.startswith("conftest"))
+                  if f.stem.removeprefix("test_") in modules
+                  and f.name != pathlib.Path(__file__).name)
+
 
 
 def pure_files() -> list[str]:

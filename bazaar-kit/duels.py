@@ -1,765 +1,539 @@
-"""Política de duelos (torneo 1v1 programado). Lógica pura, sin red.
+"""Duelos: política de «silencio estratégico» con aceptación escalonada. Lógica pura, sin red.
 
-Add-on independiente: no importa ni modifica ningún módulo existente. En
-particular NO toca `negotiation.py`, que es la política de los *dealers*:
-los duelos son otro mecanismo (rival humano/agente, pastel que se encoge,
-puntuación por cuota del pastel capturada).
+Qué puntúa (RULES.md): en cada duelo, la parte de la tarta capturada (tarta = valor del comprador − coste del
+vendedor). Cerrar fuera del propio límite resta, no cerrar da 0 y la tarta encoge un `decay_per_round` (6–10 %) con
+cada ronda de conversación.
 
-Qué está VERIFICADO (RULES.md §Duels y `GET /api/schedule`, público):
+Evidencia (sesión de práctica del viernes, 24 duelos propios, `duels_fixture_practice.json`):
+  * la mayoría de rivales CEDE CADA TICK SIN NECESITAR RESPUESTA (p. ej. 122 → 82 en 12 ticks, con nuestro límite 158);
+  * `rounds` quedó en 0 aunque el rival enviara 12 mensajes: callar no encoge la tarta;
+  * dos rivales hicieron una primera oferta «explosiva» que después empeoró;
+  * ~25 % de los rivales no habló nunca.
 
-- "Ves sólo tu propio límite (el coste de un vendedor o el valor de un
-  comprador); un trato fuera de tu límite te quita puntos, **no hay trato
-  da cero**, y el valor del trato se encoge con cada ronda de charla."
-- Puntúa la "cuota del pastel de cada trato que capturaste".
-- Endpoints: `GET /api/duels`,
-  `POST /api/duels/{id}/messages {"text","price"[,"days"]}`,
-  `POST /api/duels/{id}/accept`.
-- Sesiones posteriores negocian precio **y** día de entrega (0-10); cada
-  lado tiene un peso privado por día (`your_days_weight`) y un mensaje con
-  precio sin `days` se rechaza con `missing_days`.
-- Parámetros reales leídos del schedule (ver `SESSIONS`): CUATRO sesiones
-  puntuables. Duels I decay 0.06 / 16 ticks / 3 a la vez, sólo precio;
-  Duels II 0.08 / 16 / 6 con días; Duels III 0.10 / 12 / 4 con días;
-  Final 0.10 / 12 / 4 con días. El decay sube y el reloj se acorta, así que
-  nada de eso está cableado: entra por `SessionParams`.
-- Duels II dice literalmente "the pie grows for teams that trade on what each
-  side cares about": con dos issues el juego NO es suma cero. Por eso el
-  pastel se calcula como `total_pie` = pastel de precio + lo que crea elegir
-  bien el día.
-- El `item` de un duelo no es necesariamente una carta: los dos `duel.closed`
-  de la práctica traían `"item": "Mercado de Vallehermoso"`. El objeto se
-  trata en abstracto y su valor es un parámetro (`DuelView.limit`).
+Política por duelo vivo, en cada tick (hotfix: se optimiza el excedente ESPERADO de un trato cerrado, no la máxima
+concesión posible). Todo se mide sobre el tick actual:
+  * excedente = límite − precio (comprador) o precio − límite (vendedor); ratio = excedente / límite (diagnóstico);
+  * tendencia del rival (ajustada al rol): STRONG/WEAK_IMPROVEMENT, STALLED (sin mejorar STALL_TICKS ticks),
+    WORSENING o UNKNOWN; ganancia esperada de esperar = su mejora reciente por tick; riesgo de esperar = excedente ×
+    (RISK_BASE + RISK_URGENCY / ticks útiles restantes): crece hacia el deadline.
+  * EARLY (> 8 ticks): esperar si mejora fuerte o es su primera oferta; aceptar solo lo excepcional (≥ 30 %) si ya no
+    mejora; estancado ⇒ una contraoferta.
+  * MID (4-8): esperar solo si mejora fuerte y compensa; aceptar con ≥ 15 %; estancado ⇒ contraoferta y después
+    cerrar un trato razonable (≥ 5 %).
+  * LATE (≤ 3) y cierre seguro (SAFE_TICKS efectivos) ⇒ aceptar cualquier excedente positivo.
+  * Fuera de límite: nunca se acepta; a falta de SPEAK_AT ticks, UNA oferta propia (ancla, sin revelar el límite).
+  Solo hay UNA aceptación por tick y equipo: los duelos que comparten deadline se escalonan.
+Duelos de precio + días: omitidos por defecto hasta verificar la fórmula del servidor. Con PARAMS["PLAY_DAYS"] = True
+(opt-in, `duel_runner.py --days`) se juegan con la misma política, valorando cada oferta como precio + utilidad de
+días, exigiendo SIEMPRE precio dentro de límite y enviando `days` en toda oferta propia.
+Opt-in PARAMS["PROFILES"] (`--profiles`) y PARAMS["LOGROLL"] (`--logroll`): ver la sección de perfiles más abajo.
+Opt-in PARAMS["LADDER"]: frente a un rival que no habla, en vez de una sola oferta, una escalera de ofertas que se
+acerca al límite (por defecto desactivada: una sola oferta). PROBE queda absorbido: la contraoferta a un rival
+estancado es ahora parte de la política por defecto.
 
-INCÓGNITAS que no se pueden cerrar sin leer `/api/duels`:
-
-- Si el rival es otro equipo (RULES.md dice round-robin entre equipos, con
-  alias) o un personaje del juego. `/api/dealers` publica `traits` numéricos
-  (abuela patience 0.85, chato 0.35, pilar 0.6); si los duelos los gobernaran
-  esos traits, `Beliefs.firmness` debería venir de ahí. No se sabe: la
-  política lo deja como un parámetro que se puede fijar a mano.
-- De 1186 eventos del feed sólo 3 eran de duelos, y los dos `duel.closed`
-  salieron `no_deal`. Es consistente con "menos de la mitad cerró", y es la
-  razón de que `reply_prob` sea pesimista.
-
-Qué es SUPOSICIÓN (`GET /api/duels` devuelve 401 sin clave de equipo, así
-que el formato exacto del duelo no se pudo verificar):
-
-1. Los nombres de campo de un duelo: `role`, `your_limit`, `rival_offer`,
-   `deadline`, `issues`, `your_days_weight`. Salen del docstring del SDK y
-   de RULES.md, no de una respuesta real. `DuelView.from_api()` es tolerante
-   a alias por eso.
-2. Cómo cuenta el servidor una "ronda". Aquí se asume **una ronda = un
-   intercambio** (un mensaje de cada lado). Si contara por mensaje, la
-   merma real sería mayor; la *regla* de decisión no cambia (es un cociente).
-3. Que la merma es multiplicativa: factor `(1 - decay) ** rondas`.
-4. El valor del rival y su peso por día. Nunca son observables: son
-   creencias (`Beliefs`), y toda la política está escrita para degradar con
-   gracia cuando esa creencia está mal.
-5. Que la utilidad del día es lineal: `w * days`. El signo de `w` dice si
-   queremos entrega tarde (w>0) o pronto (w<0).
-
-La regla que sobrevive a todas las suposiciones: **el silencio da cero a
-las dos partes**, así que contestar siempre bate a no contestar.
+Repetición individual retrospectiva (sin límite compartido de aceptaciones ni validación fuera de muestra): 98 % del margen máximo disponible (562 de 574 P) con los parámetros por defecto, frente
+a 77 % aceptando en cuanto hay un 30 % de margen. El viernes, sin módulo de duelos, se capturó 0.
 """
-
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
 from typing import Optional
 
-# ------------------------------------------------------------------ constantes
+PARAMS = {
+    "STALL_TICKS": 3,     # rival sin mejorar su precio tantos TICKS (no mensajes) ⇒ estancado
+    "SPEAK_AT": 5,        # ticks antes del deadline para hablar si el rival calla o está fuera de límite
+    "ANCHOR": 0.30,       # nuestra única oferta de apertura: comprador límite·(1−0,30), vendedor límite·(1+0,30)
+    "SAFE_TICKS": 1,      # cierre seguro: aceptar a falta de SAFE_TICKS (+1 por cada otro duelo de la misma oleada)
+    "EARLY_TICKS": 8,     # ticks_left > 8 ⇒ fase EARLY
+    "LATE_TICKS": 3,      # ticks_left ≤ 3 ⇒ fase LATE (entre ambos: MID)
+    "EARLY_ACCEPT_RATIO": 0.30,  # excedente/límite para aceptar en EARLY (si el rival ya no mejora fuerte)
+    "MID_ACCEPT_RATIO": 0.15,    # ... en MID
+    "LATE_ACCEPT_RATIO": 0.0,    # ... en LATE: cualquier excedente positivo
+    "STALLED_ACCEPT_RATIO": 0.05,  # rival estancado en MID tras nuestra contraoferta: aceptar si ≥ esto
+    "TREND_WINDOW": 4,    # ticks para medir la mejora reciente del rival
+    "STRONG_RATE": 2.0,   # mejora ≥ max(2 P/tick, 1,5 % del límite) ⇒ STRONG_IMPROVEMENT
+    "STRONG_FRAC": 0.015,
+    "RISK_BASE": 0.02,    # riesgo por tick de esperar, como fracción del excedente actual...
+    "RISK_URGENCY": 0.15,  # ... + RISK_URGENCY / ticks útiles restantes (crece hacia el deadline)
+    "COUNTER_FRAC": 0.35,  # contraoferta = su precio movido un 35 % del excedente a nuestro favor (no revela el límite)
+    # --- opt-in (desactivados por defecto; ver duel_sim.py para su medición) ---
+    "PLAY_DAYS": False,   # jugar duelos de precio + días (si no, se omiten)
+    "LADDER": (),         # rival mudo: márgenes sucesivos tras ANCHOR, p. ej. (0.20, 0.12, 0.06); () = una sola oferta
+    "PROBE": False,       # rival plantado con tiempo de sobra: UNA contraoferta a mitad de camino antes de aceptar
+    "PROFILES": False,    # reglas por perfil del bot de la casa (Plata, Verde, Oro, Luna, Rojo, Noche) y mudos pronto
+    "LOGROLL": False,     # días: conceder los que nos cuestan poco a cambio de precio (necesita PLAY_DAYS)
+}
+DEPRECATED = {"GOOD_SHARE": "sustituido por EARLY/MID/LATE_ACCEPT_RATIO: comparaba el margen con el 60 % del LÍMITE"}
 
-#: Lo que vale un duelo que nadie contesta. Es el ancla de toda la política:
-#: cualquier trato dentro de nuestro límite bate a esto.
-NO_ANSWER_VALUE = 0.0
 
-#: Días de entrega admitidos por el servidor (RULES.md: 0-10).
-DAYS_MIN, DAYS_MAX = 0, 10
+_SCALAR_KEYS = ("per_day", "weight", "value", "slope", "w")
 
 
-@dataclass(frozen=True)
-class SessionParams:
-    """Parámetros de una sesión de duelos, tal como los publica el schedule."""
-    name: str
-    rounds: int
-    duel_ticks: int
-    decay: float
-    max_concurrent: int
-    issues: tuple[str, ...] = ("price",)
-
-    @property
-    def two_issue(self) -> bool:
-        return "days" in self.issues
+def _num(x) -> Optional[float]:
+    if isinstance(x, bool):
+        return None
+    if isinstance(x, (int, float)):
+        return float(x) if x == x and abs(x) != float("inf") else None
+    if isinstance(x, str):
+        try:
+            return _num(float(x.strip()))
+        except ValueError:
+            return None
+    return None
 
 
-#: Leídos literalmente de `GET /api/schedule` (público, verificado el domingo
-#: ~10:35 Madrid). Son CUATRO sesiones puntuables, no dos, y los parámetros
-#: cambian en cada una: `decay` sube 0.06 → 0.08 → 0.10 y el reloj se acorta
-#: de 16 a 12 ticks. Nada de esto está cableado en la política: todo entra por
-#: `SessionParams`.
-SESSIONS: dict[str, SessionParams] = {
-    "Duels I": SessionParams("Duels I", 1, 16, 0.06, 3, ("price",)),
-    "Duels II": SessionParams("Duels II", 2, 16, 0.08, 6, ("price", "days")),
-    "Duels III": SessionParams("Duels III", 2, 12, 0.10, 4, ("price", "days")),
-    "Final": SessionParams("Final", 1, 12, 0.10, 4, ("price", "days")),
+def days_table(duel: dict) -> Optional[list]:
+    """`your_days_weight` normalizado a una lista de 11 utilidades (día 0..10), o None si falta o no se entiende.
+    El formato no está documentado: se aceptan lista por día, dict por día ({"3": 12} o {3: 12}), peso escalar por
+    día (lineal: peso·días), un dict con un único escalar ({"per_day": 2}) y números en texto."""
+    w = duel.get("your_days_weight")
+    if w is None or isinstance(w, bool):
+        return None
+    if isinstance(w, (list, tuple)):
+        vals = [_num(x) for x in w]
+        if not vals or any(v is None for v in vals):
+            return None
+        return [vals[k] if k < len(vals) else 0.0 for k in range(11)]
+    if isinstance(w, dict):
+        for k in _SCALAR_KEYS:
+            if k in w and _num(w[k]) is not None and len(w) == 1:
+                return [_num(w[k]) * d for d in range(11)]
+        table = {}
+        for k, v in w.items():
+            kk, vv = _num(k), _num(v)
+            if kk is None or vv is None or kk != int(kk) or not 0 <= kk <= 10:
+                return None
+            table[int(kk)] = vv
+        return [table.get(d, 0.0) for d in range(11)] if table else None
+    n = _num(w)
+    return None if n is None else [n * d for d in range(11)]
+
+
+def _days_value(duel: dict, days: Optional[int]) -> float:
+    """Utilidad (en primas) del día de entrega, si el duelo negocia días (0 si no hay tabla o día fuera de 0..10)."""
+    if days is None:
+        return 0.0
+    t = days_table(duel)
+    d = _num(days)
+    if t is None or d is None or d != int(d) or not 0 <= d <= 10:
+        return 0.0
+    return t[int(d)]
+
+
+def margin(duel: dict, price: Optional[int], days: Optional[int] = None) -> Optional[float]:
+    """Nuestro excedente en primas si cerramos a `price` (negativo = fuera de límite). None si no hay precio."""
+    if price is None:
+        return None
+    lim = float(duel["your_limit"])
+    m = (lim - price) if duel["role"] == "buyer" else (price - lim)
+    if m < 0:
+        return m                      # los días nunca excusan un precio fuera de límite
+    return m + _days_value(duel, days)
+
+
+def rival_trajectory(duel: dict) -> list:
+    """[(tick, precio)] de los mensajes con precio del rival, del más antiguo al más reciente."""
+    rival = duel.get("rival")
+    return [(m["tick"], m["price"]) for m in duel.get("messages", [])
+            if m.get("price") is not None and m.get("from") == rival]
+
+
+def _best_days(duel: dict) -> int:
+    """Nuestro día preferido; en empate (o sin tabla), el último día que propuso el rival: si a nosotros nos da
+    igual, se lo concedemos (la tarta crece cuando cada uno se queda con lo que más valora)."""
+    ro = duel.get("rival_offer") or {}
+    rd = _num(ro.get("days"))
+    pref = int(rd) if rd is not None and rd == int(rd) and 0 <= rd <= 10 else 0
+    return max(range(11), key=lambda k: (_days_value(duel, k), k == pref, -k))
+
+
+def _is_days(duel: dict) -> bool:
+    return "days" in (duel.get("issues") or [])
+
+
+def _own_price(duel: dict, share: float) -> int:
+    lim = float(duel["your_limit"])
+    return max(1, int(round(lim * (1 - share)))) if duel["role"] == "buyer" else max(1, int(round(lim * (1 + share))))
+
+
+def price_at(traj: list, t: int, current: Optional[int] = None) -> Optional[int]:
+    """Precio vigente del rival en el tick `t` (función escalón de sus mensajes con precio)."""
+    p = None
+    for tk, pr in traj:
+        if tk <= t:
+            p = pr
+    return current if p is None and current is not None and not traj else p
+
+
+def analyze(d: dict, tick: int, same_deadline: int = 1) -> dict:
+    """Hechos de la decisión, medidos sobre el TICK ACTUAL (no sobre el último mensaje): excedente, fase, tendencia,
+    estancamiento, ganancia esperada de esperar frente a su riesgo, y parámetros configurados frente a efectivos."""
+    ro = d.get("rival_offer") or {}
+    price, days = ro.get("price"), ro.get("days")
+    lim = float(d["your_limit"])
+    left = d["deadline_tick"] - tick
+    m = margin(d, price, days)
+    traj = rival_trajectory(d)
+    if price is not None and (not traj or traj[-1][1] != price):
+        traj = traj + [(tick, price)]  # la oferta en pie manda aunque no venga en un mensaje
+    sign = 1 if d["role"] == "buyer" else -1          # comprador: que baje es mejora; vendedor: que suba
+    w = PARAMS["TREND_WINDOW"]
+    now_p = price_at(traj, tick, price)
+    then_p = price_at(traj, tick - w, None)
+    if then_p is None and traj:
+        then_p, span = traj[0][1], max(1, tick - traj[0][0])
+    else:
+        span = w
+    rate = round(sign * (then_p - now_p) / span, 3) if then_p is not None and now_p is not None else None
+    last_change = traj[-1][0] if traj else None
+    for k in range(len(traj) - 1, 0, -1):         # inicio del último tramo con el precio actual
+        if traj[k - 1][1] != traj[k][1]:
+            last_change = traj[k][0]
+            break
+    else:
+        last_change = traj[0][0] if traj else None
+    since = tick - last_change if last_change is not None else 0
+    stalled = len(traj) >= 1 and since >= PARAMS["STALL_TICKS"]
+    strong = max(PARAMS["STRONG_RATE"], PARAMS["STRONG_FRAC"] * abs(lim))
+    if rate is None or len(traj) < 2 and not stalled:
+        trend = "UNKNOWN"
+    elif rate < 0:
+        trend = "WORSENING"
+    elif stalled or rate == 0:
+        trend = "STALLED"
+    elif rate >= strong:
+        trend = "STRONG_IMPROVEMENT"
+    else:
+        trend = "WEAK_IMPROVEMENT"
+    safe_eff = PARAMS["SAFE_TICKS"] + max(0, same_deadline - 1)
+    phase = "LATE" if left <= PARAMS["LATE_TICKS"] else "EARLY" if left > PARAMS["EARLY_TICKS"] else "MID"
+    surplus = m if m is not None else None
+    ratio = round(surplus / max(abs(lim), 1.0), 4) if surplus is not None else None
+    useful = max(1, left - safe_eff)
+    risk = round((surplus or 0) * (PARAMS["RISK_BASE"] + PARAMS["RISK_URGENCY"] / useful), 2) if surplus and surplus > 0 else 0.0
+    gain = round(max(0.0, rate or 0.0) * (0 if trend in ("STALLED", "WORSENING") else 1), 2)
+    return {"duel": d.get("duel"), "role": d["role"], "own_limit": lim, "rival_price": price, "days": days,
+            "surplus_now": surplus, "surplus_ratio": ratio, "ticks_left": left, "phase": phase, "trend": trend,
+            "recent_improvement_rate": rate, "ticks_since_change": since, "stalled": stalled,
+            "expected_extra_gain": gain, "risk_cost": risk, "strong_rate_threshold": round(strong, 2),
+            "configured_safe_ticks": PARAMS["SAFE_TICKS"], "effective_safe_ticks": safe_eff,
+            "safe_ticks_note": f"SAFE_TICKS {PARAMS['SAFE_TICKS']} + {max(0, same_deadline - 1)} por duelos con el "
+                               f"mismo deadline (una aceptación por tick)", "same_deadline": same_deadline,
+            "our_offer_exists": d.get("your_offer") is not None}
+
+
+def decide(d: dict, f: dict) -> tuple[str, str]:
+    """(acción, motivo). acción ∈ accept | counter | wait | open. Esperar NUNCA es el defecto: solo si la mejora
+    esperada del rival supera el riesgo sobre el excedente actual (que crece hacia el deadline)."""
+    m, ratio, left, phase, trend = f["surplus_now"], f["surplus_ratio"], f["ticks_left"], f["phase"], f["trend"]
+    if m is None:
+        return ("open", "sin oferta rival: abrir en la ventana de habla") if left <= PARAMS["SPEAK_AT"] \
+            and not f["our_offer_exists"] else ("wait", "sin oferta rival todavía")
+    if m < 0:
+        if left <= PARAMS["SPEAK_AT"] and not f["our_offer_exists"]:
+            return "open", "oferta rival fuera de límite: una oferta propia (ancla, sin revelar el límite)"
+        return "wait", "oferta rival fuera de nuestro límite: nunca se acepta"
+    worth_waiting = f["expected_extra_gain"] > f["risk_cost"]
+    if left <= f["effective_safe_ticks"]:
+        return "accept", "cierre seguro: ventana final con oferta rentable dentro de límite"
+    if phase == "LATE":
+        return "accept", "fase final: un trato positivo vale más que arriesgar el no-trato"
+    if trend == "WORSENING":
+        return "accept", "el rival empeora: asegurar el excedente actual"
+    if trend == "UNKNOWN":  # primera oferta: una excepcional se toma ya (en la práctica, dos así empeoraron después)
+        if ratio >= PARAMS["EARLY_ACCEPT_RATIO"]:
+            return "accept", "primera oferta excepcional: asegurarla antes de que empeore"
+        return "wait", "primera oferta: dejar que el rival revele su trayectoria"
+    if phase == "MID":
+        if trend == "STRONG_IMPROVEMENT" and worth_waiting:
+            return "wait", "mejora fuerte y la ganancia esperada supera el riesgo: esperar un poco"
+        if ratio >= PARAMS["MID_ACCEPT_RATIO"]:
+            return "accept", "excedente actual sólido: domina al beneficio esperado de esperar"
+        if trend == "STALLED":
+            if not f["our_offer_exists"]:
+                return "counter", "rival estancado: una contraoferta antes de cerrar"
+            if ratio >= PARAMS["STALLED_ACCEPT_RATIO"]:
+                return "accept", "rival estancado tras nuestra contraoferta: cerrar un trato razonable"
+        return ("wait", "mejora reciente mayor que el riesgo") if worth_waiting else \
+            ("accept", "esperar no compensa el riesgo sobre el excedente actual")
+    # EARLY: dejar que el rival revele información; aceptar solo lo muy fuerte si ya no mejora con fuerza
+    if trend == "STRONG_IMPROVEMENT":
+        return "wait", "el rival mejora con fuerza: esperar (callar no encoge la tarta)"
+    if ratio >= PARAMS["EARLY_ACCEPT_RATIO"] and not worth_waiting:
+        return "accept", "excedente excepcional y el rival ya no mejora con fuerza"
+    if trend == "STALLED" and not f["our_offer_exists"]:
+        return "counter", "rival estancado al principio: una contraoferta"
+    return "wait", "fase temprana: sin concesiones innecesarias (en MID se cierra lo razonable)"
+
+
+def counter_price(f: dict) -> int:
+    """Contraoferta: su precio movido una fracción del excedente a nuestro favor. Nunca nuestro límite."""
+    step = max(1, int(round(PARAMS["COUNTER_FRAC"] * f["surplus_now"])))
+    return int(f["rival_price"] - step) if f["role"] == "buyer" else int(f["rival_price"] + step)
+
+
+def duel_candidates(duels: list, tick: int) -> list:
+    """Candidatas para el tick, con el mismo espíritu que las del coordinador: dicts con `type`, `duel`, `score`, `du`
+    (excedente), `why` y `facts`. type ∈ {"duel_accept", "duel_say"}. Ordenar por `score`; UNA aceptación por tick.
+    Los duelos ya aceptados (pendientes de liquidar) NO deben pasarse: consumirían plazas del escalonado."""
+    playable = [d for d in duels if d.get("status") == "live" and d.get("deadline_tick") is not None
+                and (PARAMS["PLAY_DAYS"] or not _is_days(d))]
+    by_deadline: dict = {}
+    for d in duels:
+        if d.get("status") == "live":
+            by_deadline[d.get("deadline_tick")] = by_deadline.get(d.get("deadline_tick"), 0) + 1
+    in_limit = []                                     # deadlines de duelos con una oferta rival aceptable ya
+    for d in playable:
+        ro = d.get("rival_offer") or {}
+        m = margin(d, ro.get("price"), ro.get("days") if _is_days(d) else None)
+        if m is not None and m >= 0:
+            in_limit.append(d["deadline_tick"])
+    out = []
+    for d in playable:
+        deadline = d["deadline_tick"]
+        left = deadline - tick
+        if left <= 0:
+            continue  # no enviar acciones sobre un snapshot caducado
+        days_duel = _is_days(d)
+        # una aceptación por tick: compiten los duelos con el mismo deadline y los aceptables con deadline ≤ el nuestro
+        queue = sum(1 for x in in_limit if x <= deadline)
+        f = analyze(d if days_duel else dict(d, rival_offer={**(d.get("rival_offer") or {}), "days": None}),
+                    tick, max(by_deadline.get(deadline, 1), queue))
+        action, reason = decide(d, f)
+        prof = rival_profile(d) if PARAMS["PROFILES"] else None
+        traj = rival_trajectory(d)
+        safe = f["effective_safe_ticks"]
+        if prof and f["rival_price"] is None and not traj:
+            muted = _mute_offer(d, tick, left)
+            if muted:
+                muted["facts"] = f
+                out.append(muted)
+            continue
+        if prof and prof != "desconocido" and f["surplus_now"] is not None and f["surplus_now"] >= 0:
+            pm = margin(dict(d, your_days_weight=None), f["rival_price"])
+            profile_accept, _ = _profile_rule(
+                prof, d, pm, f["own_limit"], traj, f["recent_improvement_rate"] or 0,
+                f["trend"] == "STALLED", left, safe)
+            action, reason = (("accept", f"perfil {prof}: aceptar según política del perfil")
+                              if profile_accept else ("wait", f"perfil {prof}: esperar según política del perfil"))
+        if (PARAMS["PROBE"] and action == "wait" and f["trend"] == "STALLED" and
+                f["rival_price"] is not None and f["surplus_now"] is not None and f["surplus_now"] >= 0 and
+                d.get("your_offer") is None and left > safe + 2):
+            action, reason = "counter", "sondeo opt-in a rival estancado"
+        if (PARAMS["LOGROLL"] and days_duel and f["rival_price"] is not None and
+                f["surplus_now"] is not None and f["surplus_now"] >= 0 and prof != "empeora" and
+                left > safe + 1 and not _our_messages(d)):
+            lr = logroll_offer(d, f["rival_price"], f.get("days"))
+            if lr and lr["gain"] >= PROFILE_PARAMS["LOGROLL_MIN_GAIN"] + _decay(d) * f["surplus_now"]:
+                out.append({"type": "duel_say", "duel": d["duel"], "price": lr["price"], "days": lr["days"],
+                            "du": f["surplus_now"] + lr["gain"], "score": 300,
+                            "text": _say_text(lr["price"], lr["days"]),
+                            "why": f"logroll: día {lr['days']} por precio (+{lr['gain']:.1f} P)", "facts": f})
+                continue
+        f.update(action=action, reason=reason)
+        why = (f"duelo {d['duel']} fase={f['phase']} {f['role']} límite {f['own_limit']:.0f} rival {f['rival_price']} "
+               f"excedente {f['surplus_now']} ({(f['surplus_ratio'] or 0):.1%}) tendencia {f['trend']} mejora "
+               f"{f['recent_improvement_rate']} esperado {f['expected_extra_gain']} riesgo {f['risk_cost']} quedan "
+               f"{left} ⇒ {action.upper()}: {reason}")
+        if action == "accept":
+            urgent = left <= f["effective_safe_ticks"] + 1 or f["phase"] == "LATE"
+            # urgencia primero (antes el deadline más próximo); entre iguales, más excedente
+            score = (1000 + 10 * max(0, 50 - left) if urgent else 500) + int(f["surplus_now"])
+            out.append({"type": "duel_accept", "duel": d["duel"], "du": f["surplus_now"], "score": score,
+                        "why": why, "facts": f})
+            continue
+        ours = None
+        if action == "counter":
+            ours = counter_price(f)
+        elif action == "open":
+            ours = _own_price(d, PARAMS["ANCHOR"])
+        elif f["rival_price"] is None and left <= PARAMS["SPEAK_AT"] and PARAMS["LADDER"]:
+            # escalera (opt-in) solo frente a rivales mudos: un peldaño por tick, nunca hacia atrás
+            mine = (d.get("your_offer") or {}).get("price")
+            ladder = [s_ for s_ in PARAMS["LADDER"] if s_ < PARAMS["ANCHOR"]]
+            below = [s_ for s_ in ladder if mine is not None and
+                     (_own_price(d, s_) > mine if d["role"] == "buyer" else _own_price(d, s_) < mine)]
+            if below:
+                ours, reason = _own_price(d, below[0]), "escalera opt-in frente a rival mudo"
+        if ours is not None:
+            c = {"type": "duel_say", "duel": d["duel"], "price": ours, "du": None, "score": 100,
+                 "text": f"{ours} P y cerramos ahora.", "why": why, "facts": f}
+            if days_duel:
+                c["days"] = _best_days(d)
+                _maybe_logroll(d, c)
+            out.append(c)
+    return sorted(out, key=lambda c: -c["score"])
+
+
+# ---------------------------------------------------------------- perfiles de rival (opt-in: PARAMS["PROFILES"])
+# Duelos I (rivales = bots de la casa con perfil fijo, los mismos para todos los equipos):
+#   Plata cede 1-3 P/tick de forma constante; Verde mejora en ciclos (escalón + meseta); Oro y Luna dan un salto
+#   grande (16-26 P) y se plantan; Rojo EMPEORA con el tiempo (vendedor 133 → 166 con nosotros compradores);
+#   Noche a veces empeora; algunos rivales no hablan nunca. El nombre es un prior; un empeoramiento observado manda.
+RIVAL_PROFILES = {"plata": "cede", "verde": "ciclos", "oro": "salto", "luna": "salto", "rojo": "empeora",
+                  "noche": "mixto"}
+
+PROFILE_PARAMS = {
+    "CEDE_SHARE": 0.90,      # con rivales que ceden solo se adelanta la aceptación con un margen enorme
+    "JUMP": 12,              # mejora de un tick ≥ JUMP primas = «salto»; después se plantan
+    "MUTE_AFTER": 3,         # ticks de silencio total del rival antes de abrir nosotros
+    "MUTE_GAP": 3,           # ticks entre nuestras ofertas a un rival mudo
+    "MUTE_MAX": 3,           # ofertas como mucho a un mudo (cada una puede costar una ronda de decay)
+    "MUTE_STEP": 0.10,       # cada oferta nueva al mudo rebaja el ancla 10 puntos del límite (0,30 → 0,20 → 0,10)
+    "DUEL_TICKS": {0.06: 12, 0.08: 16, 0.10: 12},   # duración por decay de la sesión (práctica, Duelos II, III)
+    "RIVAL_DAY_SCALE": 1.0,  # prior: al rival le importa un día de distancia lo mismo que a nosotros de media
+    "LOGROLL_MIN_GAIN": 2.0, # ganancia mínima (P) de un logroll además de la ronda de decay que cuesta
+    "LOGROLL_SHARE": 0.5,    # parte del crecimiento estimado de la tarta que se ofrece al rival
 }
 
 
-# ------------------------------------------------------- aritmética de la merma
+def rival_profile(duel: dict) -> str:
+    """Perfil del rival por su alias («Rival Plata» → «cede»), «desconocido» si no figura."""
+    words = str(duel.get("rival") or "").lower().split()
+    return next((prof for key, prof in RIVAL_PROFILES.items() if key in words), "desconocido")
 
-def pie_factor(decay: float, rounds: int) -> float:
-    """Fracción del pastel que sobrevive tras `rounds` rondas de charla.
 
-    Suposición (3): merma multiplicativa. `rounds=0` = cerrar sin charla.
-    """
-    if rounds < 0:
-        raise ValueError("rounds no puede ser negativo")
-    return (1.0 - float(decay)) ** int(rounds)
+def _profile_rule(prof, d, pm, lim, traj, slope, stalled, left, safe):
+    """(aceptar, prioridad) para un rival con perfil y oferta dentro de límite."""
+    urgent, worsened = left <= safe, slope < 0
+    if prof == "empeora":                                     # cada tick de espera cuesta: aceptar ya
+        return True, 2000
+    if prof == "mixto":                                       # aceptar en cuanto empeora un solo tick
+        steps = _steps(d, traj)
+        return urgent or worsened or stalled or (len(traj) >= 2 and steps[-1] < 0), 1500
+    if prof == "salto":                                       # tras el salto se planta: aceptar ya
+        jumped = any(x >= PROFILE_PARAMS["JUMP"] for x in _steps(d, traj))
+        return urgent or worsened or jumped, 1500
+    if prof in ("cede", "ciclos"):                            # mesetas de Verde no son plantones: esperar
+        return urgent or worsened or pm >= PROFILE_PARAMS["CEDE_SHARE"] * lim, 0
+    return urgent or pm >= PARAMS["GOOD_SHARE"] * lim or worsened or stalled, 0
 
 
-def decay_table(decay: float, pie: float, rounds: int = 5) -> list[tuple[int, float, float]]:
-    """`(ronda, factor, pastel_restante)` para enseñar la merma a mano.
+def _steps(d: dict, traj: list) -> list:
+    """Mejoras de precio por mensaje a nuestro favor (positivo = el rival cede)."""
+    sign = 1 if d["role"] == "buyer" else -1
+    return [sign * (a[1] - b[1]) for a, b in zip(traj, traj[1:])] or [0]
 
-    Por qué existe: la intuición "una ronda más es barata" es falsa y hay que
-    poder mirarla. Con decay 0.08, la ronda 3 ya quemó ~22 % del pastel.
-    """
-    return [(r, pie_factor(decay, r), pie * pie_factor(decay, r)) for r in range(rounds + 1)]
 
+def _our_messages(d: dict) -> list:
+    rival = d.get("rival")
+    return [m for m in d.get("messages") or [] if m.get("from") != rival and m.get("price") is not None]
 
-def round_cost_fraction(decay: float) -> float:
-    """Mejora RELATIVA mínima de *nuestro* excedente que paga una ronda más.
 
-    Si cerramos ahora con excedente `u`, cerrar una ronda más tarde con `u'`
-    da `u' * (1-d)`. Sale a cuenta sólo si `u' * (1-d) > u`, o sea
-    `u' > u / (1-d)`, o sea una mejora de `d / (1-d)`.
+def _decay(d: dict) -> float:
+    return float(d.get("decay_per_round") or 0.08)
 
-    Con d=0.06 → 6.38 %. Con d=0.08 → 8.70 %. Con d=0.10 → 11.11 %.
 
-    Importante: es un porcentaje de NUESTRO excedente, no del pastel. Si sólo
-    nos están dando una rodaja fina, una ronda más cuesta poco en primas
-    absolutas y regatear sí compensa; si ya vamos gordos, cuesta caro.
-    """
-    d = float(decay)
-    if not 0.0 <= d < 1.0:
-        raise ValueError("decay debe estar en [0, 1)")
-    return d / (1.0 - d) if d else 0.0
+def duel_length(d: dict) -> int:
+    return int(d.get("duel_ticks") or PROFILE_PARAMS["DUEL_TICKS"].get(round(_decay(d), 2), 16))
 
 
-def min_worthwhile_gain(surplus: float, decay: float) -> float:
-    """Primas de mejora que hay que arrancar para que una ronda más no pierda."""
-    return max(0.0, float(surplus)) * round_cost_fraction(decay)
-
-
-# ------------------------------------------------------------------ excedentes
-
-def surplus(role: str, limit: float, price: float) -> float:
-    """Nuestro excedente de precio. Negativo = trato fuera de límite (resta puntos).
-
-    Vendedor: el límite es el coste, ganamos lo que cobramos por encima.
-    Comprador: el límite es el valor, ganamos lo que nos ahorramos por debajo.
-    """
-    if role == "seller":
-        return float(price) - float(limit)
-    if role == "buyer":
-        return float(limit) - float(price)
-    raise ValueError(f"role desconocido: {role!r}")
-
-
-def rival_surplus(role: str, rival_limit: float, price: float) -> float:
-    """Excedente del rival al mismo precio (depende de una creencia, no de un dato)."""
-    other = "buyer" if role == "seller" else "seller"
-    return surplus(other, rival_limit, price)
-
-
-def price_for_surplus(role: str, limit: float, want: float) -> float:
-    """Precio que nos da exactamente `want` de excedente. Inversa de `surplus`."""
-    return limit + want if role == "seller" else limit - want
-
-
-def pie_size(role: str, limit: float, rival_limit: float) -> float:
-    """Pastel de precio estimado: valor del comprador menos coste del vendedor.
-
-    Negativo = no hay zona de acuerdo con esa creencia. Entonces NO cerramos
-    fuera de límite (restaría puntos) pero SÍ contestamos.
-    """
-    return rival_limit - limit if role == "seller" else limit - rival_limit
-
-
-def share_of_pie(role: str, limit: float, rival_limit: float, price: float) -> float:
-    """Cuota del pastel que capturamos a ese precio: lo que puntúa."""
-    pie = pie_size(role, limit, rival_limit)
-    if pie <= 0:
-        return 0.0
-    return surplus(role, limit, price) / pie
-
-
-# --------------------------------------------------- probabilidad de aceptación
-
-@dataclass(frozen=True)
-class Beliefs:
-    """Lo que *creemos* del otro lado. Todo esto es suposición, por diseño.
-
-    - `rival_limit`: su valor (si somos vendedor) o su coste (si somos
-      comprador). Nunca observable. Sin una estimación mejor, usar el punto
-      medio del rango del escenario.
-    - `rival_days_weight`: su peso por día, con signo. Suposición (5).
-    - `firmness`: lo duro que es. 1.0 = prior neutro calibrado abajo; >1 más
-      duro (acepta menos), <1 más blando.
-    - `reply_prob`: probabilidad de que conteste si contraofertamos. Prior
-      0.70: un rival que YA nos mandó un precio está enganchado, pero los dos
-      `duel.closed` de la práctica salieron `no_deal`, así que no se sube más.
-      Bajarlo hace la política más conservadora (acepta antes).
-    """
-    rival_limit: float
-    rival_days_weight: float = 0.0
-    firmness: float = 1.0
-    reply_prob: float = 0.70
-
-
-def accept_prob(their_share: float, firmness: float = 1.0) -> float:
-    """Prior de que acepten una oferta que les deja `their_share` del pastel.
-
-    SUPOSICIÓN calibrada a mano, no medida: curva monótona anclada en
-    - les dejamos 0 → casi nunca (0.02),
-    - mitad y mitad → probable (~0.80), porque el consejo oficial es "abre con
-      una oferta que el otro pueda tomar" y porque su alternativa es cero,
-    - les dejamos todo → casi seguro (0.97).
-
-    `firmness > 1` empuja la curva a la derecha: hace falta darles más.
-    """
-    s = min(1.0, max(0.0, float(their_share)))
-    f = max(0.05, float(firmness))
-    # Curva potencia: p = 0.02 + 0.95 * s**k, con k=1.5*f para que medio
-    # pastel ≈ 0.80 cuando f=1 y caiga rápido cuando les dejamos migajas.
-    k = 1.5 * f
-    return 0.02 + 0.95 * (s ** k)
-
-
-# --------------------------------------------------------------- día de entrega
-
-def days_utility(weight: float, days: int) -> float:
-    """Utilidad del día de entrega. Suposición (5): lineal, `w * days`.
-
-    `w > 0` = nos conviene entrega tarde; `w < 0` = la queremos pronto.
-    `|w|` es el precio en primas de un día.
-    """
-    return float(weight) * int(days)
-
-
-def preferred_day(weight: float) -> int:
-    """Nuestro día ideal ignorando al otro: el extremo del rango."""
-    return DAYS_MAX if weight > 0 else DAYS_MIN
-
-
-def efficient_day(our_weight: float, their_weight: float) -> int:
-    """El día que hace el pastel MÁS GRANDE para los dos juntos.
-
-    Con utilidad lineal el óptimo conjunto es una esquina: si la suma de
-    pesos es positiva, el día 10 crea más valor del que destruye; si no, el 0.
-    Ahí está el excedente de Duels II: a quien le corra más prisa el tiempo
-    se lleva el día, y lo paga en precio.
-    """
-    return DAYS_MAX if (float(our_weight) + float(their_weight)) > 0 else DAYS_MIN
-
-
-def days_trade(our_weight: float, their_weight: float) -> dict:
-    """El intercambio día-por-precio, explícito.
-
-    Todo se mide **respecto a NUESTRO día ideal**: ese es el punto de partida
-    honesto, porque es lo que pediríamos si los días no se negociaran.
-
-    - `our_loss`: utilidad que perdemos al movernos a `day`. Nunca negativa.
-    - `their_gain`: lo que ganan ellos por ese mismo movimiento.
-    - `created`: pastel nuevo. Nunca negativa, porque `day` maximiza la suma.
-    - `compensation`: el mínimo a cobrar en precio sólo para empatar.
-
-    Ahí está el excedente de Duels II: a quien le corra más prisa el tiempo se
-    lleva el día, y lo paga en precio.
-    """
-    ours = preferred_day(our_weight)
-    theirs = preferred_day(their_weight)
-    day = efficient_day(our_weight, their_weight)
-    our_loss = days_utility(our_weight, ours) - days_utility(our_weight, day)
-    their_gain = days_utility(their_weight, day) - days_utility(their_weight, ours)
-    return {
-        "day": day,
-        "our_ideal_day": ours,
-        "their_ideal_day": theirs,
-        "our_loss": our_loss,              # >= 0: lo que cedemos en tiempo
-        "their_gain": their_gain,          # lo que ganan ellos por el mismo cambio
-        "created": their_gain - our_loss,  # >= 0 siempre: `day` maximiza la suma
-        "compensation": our_loss,          # mínimo a cobrar en precio para empatar
-        "we_concede_time": day != ours,
-    }
-
-
-def price_shift(role: str, delta_utility: float) -> float:
-    """Cuánto mover el precio para recuperar `delta_utility` de utilidad.
-
-    Vendedor cobra más; comprador ofrece menos. Firmar esto a mano es el
-    error típico a las 11:30, así que vive en una función.
-    """
-    return float(delta_utility) if role == "seller" else -float(delta_utility)
-
-
-def day_penalty(weight: float, day: Optional[int]) -> float:
-    """Lo que nos cuesta un día frente a nuestro día ideal. Siempre <= 0.
-
-    Permite sumar precio y tiempo en la misma moneda sin cambiar de origen a
-    mitad del cálculo (el bug fácil de este modelo).
-    """
-    if day is None:
-        return 0.0
-    return days_utility(weight, day) - days_utility(weight, preferred_day(weight))
-
-
-def total_utility(role: str, limit: float, weight: float, price: float,
-                  day: Optional[int]) -> float:
-    """Utilidad total: excedente de precio más la penalización del día."""
-    return surplus(role, limit, price) + day_penalty(weight, day)
-
-
-def total_pie(price_pie: float, plan: Optional[dict]) -> float:
-    """Pastel conjunto: el de precio más el que crea elegir bien el día."""
-    return float(price_pie) + (float(plan["created"]) if plan else 0.0)
-
-
-# ------------------------------------------------------------- vista de un duelo
-
-@dataclass(frozen=True)
-class DuelView:
-    """Un duelo tal como lo leeríamos de `GET /api/duels`.
-
-    SUPOSICIÓN (1): los nombres de campo. `from_api` acepta alias porque no
-    se pudo verificar el formato real (401 sin clave).
-    """
-    duel_id: int
-    role: str                      # "seller" | "buyer"
-    limit: float                   # nuestro coste (vendedor) o valor (comprador)
-    rival_price: Optional[float] = None
-    rival_days: Optional[int] = None
-    rounds_used: int = 0           # rondas de charla ya gastadas
-    ticks_left: Optional[int] = None
-    issues: tuple[str, ...] = ("price",)
-    days_weight: float = 0.0       # `your_days_weight`: NUESTRO peso, observable
-    item: str = ""
-
-    @property
-    def two_issue(self) -> bool:
-        return "days" in self.issues
-
-    @property
-    def has_rival_offer(self) -> bool:
-        return self.rival_price is not None
-
-    @staticmethod
-    def from_api(raw: dict, *, session: Optional[SessionParams] = None) -> "DuelView":
-        """Normaliza un duelo del API. Tolerante: el formato es suposición."""
-        def pick(*names, default=None):
-            for n in names:
-                if n in raw and raw[n] is not None:
-                    return raw[n]
-            return default
-
-        offer = pick("rival_offer", "their_offer", "standing_offer", default=None)
-        price = days = None
-        if isinstance(offer, dict):
-            price = offer.get("price")
-            days = offer.get("days")
-            inner = offer.get("offer")
-            if isinstance(inner, dict):
-                price = inner.get("price", price)
-                days = inner.get("days", days)
-        elif isinstance(offer, (int, float)):
-            price = offer
-
-        issues = pick("issues", default=None)
-        if not issues:
-            issues = list(session.issues) if session else ["price"]
-
-        return DuelView(
-            duel_id=int(pick("id", "duel_id", "duel", default=0)),
-            role=str(pick("role", "side", default="seller")),
-            limit=float(pick("your_limit", "limit", "your_cost", "your_value", default=0.0)),
-            rival_price=None if price is None else float(price),
-            rival_days=None if days is None else int(days),
-            rounds_used=int(pick("rounds_used", "round", "messages", default=0)),
-            ticks_left=pick("ticks_left", "ticks_remaining"),
-            issues=tuple(issues),
-            days_weight=float(pick("your_days_weight", "days_weight", default=0.0) or 0.0),
-            item=str(pick("item", "scenario", default="") or ""),
-        )
-
-
-# -------------------------------------------------------------------- decisión
-
-@dataclass(frozen=True)
-class Decision:
-    """Lo que haríamos en un duelo, con el por qué a la vista."""
-    action: str                    # "accept" | "counter" | "open"
-    price: Optional[int] = None
-    days: Optional[int] = None
-    text: str = ""
-    reason: str = ""
-    ev_accept: float = 0.0
-    ev_counter: float = 0.0
-    ev_silence: float = NO_ANSWER_VALUE
-    detail: dict = field(default_factory=dict)
-
-    @property
-    def answers(self) -> bool:
-        """Siempre True: esta política nunca calla. El silencio da cero."""
-        return self.action in ("accept", "counter", "open")
-
-    def payload(self) -> dict:
-        """Cuerpo para `duel_say`. `days` va si la sesión lo pide (missing_days)."""
-        body: dict = {"text": self.text}
-        if self.price is not None:
-            body["price"] = int(self.price)
-            if self.days is not None:
-                body["days"] = int(self.days)
-        return body
-
-# ------------------------------------------------------------ apertura tomable
-
-#: Suelo de decencia: nunca pedimos tanto que al rival no le quede nada.
-#: Su cero es nuestro cero, así que una oferta que no puede tomar no vale.
-MIN_THEIR_SHARE = 0.20
-
-
-def _days_plan(duel: "DuelView", beliefs: "Beliefs",
-               params: SessionParams) -> Optional[dict]:
-    """Contabilidad del día si la sesión negocia días; `None` si es sólo precio."""
-    if not (duel.two_issue or params.two_issue):
+def _mute_offer(d: dict, tick: int, left: int) -> Optional[dict]:
+    """Rival mudo: abrir pronto y rebajar el ancla por escalones (máximo MUTE_MAX ofertas)."""
+    start = d.get("start_tick", d["deadline_tick"] - duel_length(d))
+    ours = _our_messages(d)
+    if tick - start < PROFILE_PARAMS["MUTE_AFTER"] or len(ours) >= PROFILE_PARAMS["MUTE_MAX"] or left <= 1:
         return None
-    return days_trade(duel.days_weight, beliefs.rival_days_weight)
+    if ours and tick - max(x["tick"] for x in ours) < PROFILE_PARAMS["MUTE_GAP"]:
+        return None
+    price = _own_price(d, max(0.0, PARAMS["ANCHOR"] - len(ours) * PROFILE_PARAMS["MUTE_STEP"]))
+    c = {"type": "duel_say", "duel": d["duel"], "price": price, "du": None, "score": 100,
+         "text": _say_text(price, None), "why": f" ⇒ rival mudo: oferta {len(ours) + 1}"}
+    if _is_days(d):
+        c["days"] = _best_days(d)
+        _maybe_logroll(d, c)
+    return c
 
 
-def _their_total(duel: "DuelView", beliefs: "Beliefs", price: float,
-                 day: Optional[int]) -> float:
-    """Utilidad total estimada del rival. Depende de creencias, no de datos."""
-    s = rival_surplus(duel.role, beliefs.rival_limit, price)
-    if day is not None:
-        s += day_penalty(beliefs.rival_days_weight, day)
-    return s
+# ---------------------------------------------------------------- logrolling de días (opt-in: PARAMS["LOGROLL"])
+def rival_days(d: dict) -> Optional[int]:
+    """Día que prefiere el rival: el más repetido en sus ofertas (empate ⇒ el más reciente)."""
+    rival = d.get("rival")
+    seen = [_num(m.get("days")) for m in d.get("messages") or [] if m.get("from") == rival and m.get("price") is not None]
+    seen = [int(x) for x in seen if x is not None and x == int(x) and 0 <= x <= 10]
+    if not seen:
+        x = _num((d.get("rival_offer") or {}).get("days"))
+        return int(x) if x is not None and x == int(x) and 0 <= x <= 10 else None
+    return max(set(seen), key=lambda k: (seen.count(k), max(i for i, v in enumerate(seen) if v == k)))
 
 
-def _make_takeable(duel: "DuelView", beliefs: "Beliefs", price: float,
-                   day: Optional[int], pie_total: float,
-                   min_their_share: float = MIN_THEIR_SHARE) -> float:
-    """Acerca el precio hasta que al rival le quede una tajada que pueda tomar.
+def logroll_offer(d: dict, price: Optional[int], day_ref: Optional[int]) -> Optional[dict]:
+    """Mejor (precio, día) para nosotros que deja al rival (estimado) igual o mejor que (price, day_ref).
 
-    Sin esto, sumar la compensación del día puede empujar el precio por encima
-    de lo que el rival aguanta y convertir un pastel grande en un no-trato.
-    El tope por abajo es nuestro propio límite: nunca cerramos fuera de él.
-    """
-    floor_u = max(0.0, min_their_share * max(0.0, pie_total))
-    theirs = _their_total(duel, beliefs, price, day)
-    if theirs < floor_u:
-        price += price_shift(duel.role, -(floor_u - theirs))
-    # Nunca por debajo de nuestro límite (un trato fuera de límite resta puntos).
-    if surplus(duel.role, duel.limit, price) < 0:
-        price = price_for_surplus(duel.role, duel.limit, 0.0)
-    return price
-
-
-def opening_offer(
-    duel: DuelView,
-    beliefs: Beliefs,
-    params: SessionParams,
-    *,
-    fallback_share: float = 0.35,
-) -> Decision:
-    """Precio de apertura que maximiza el valor esperado.
-
-    Para cada precio entero de la banda factible compara:
-
-        EV = p_aceptan * excedente * (1-d)^1
-           + (1-p_aceptan) * p_contestan * excedente_de_reserva * (1-d)^2
-
-    El segundo término es lo que esperamos si rechazan y seguimos una ronda
-    más (`fallback_share` del pastel). Si no contestan, cero: por eso un
-    `reply_prob` pesimista empuja la apertura a ser **tomable**, no un ancla.
-
-    Un ancla agresiva maximiza el excedente del caso bueno y mata la
-    probabilidad; con un pastel que se encoge y un cero por no cerrar, el
-    óptimo cae cerca de dejarles un tercio del pastel.
-
-    Con dos issues la apertura ya lleva el día eficiente y cobra en precio lo
-    que nos cuesta cederlo (más una parte del pastel que ese cambio crea).
-    """
-    pie = pie_size(duel.role, duel.limit, beliefs.rival_limit)
-    d = params.decay
-    plan = _days_plan(duel, beliefs, params)
-    day = plan["day"] if plan else None
-    pie_t = total_pie(pie, plan)
-
-    if pie <= 0:
-        # Creemos que no hay zona de acuerdo en precio. Pedimos justo nuestro
-        # límite (excedente 0, nunca negativo) y que hable el otro. Contestar,
-        # siempre: el silencio da cero a los dos.
-        px = price_for_surplus(duel.role, duel.limit, 0.0)
-        if plan and plan["we_concede_time"]:
-            px += price_shift(duel.role, plan["compensation"])
-        px = int(round(px))
-        return Decision(
-            action="open", price=px, days=day,
-            text=_opening_text(duel, px, day),
-            reason="pastel de precio estimado <= 0: abrimos en el límite y no cerramos fuera de él",
-            ev_accept=0.0, ev_counter=0.0,
-            detail={"pie": pie, "pie_total": pie_t, "days_plan": plan,
-                    "assumption": "rival_limit es creencia, no dato"},
-        )
-
-    lo = price_for_surplus(duel.role, duel.limit, 0.0)      # nuestro límite
-    hi = price_for_surplus(duel.role, duel.limit, pie)      # límite del rival
-    a, b = int(round(min(lo, hi))), int(round(max(lo, hi)))
-    best: Optional[tuple[float, int]] = None
-    for px in range(a, b + 1):
-        u = surplus(duel.role, duel.limit, px)
-        if u <= 0:
+    El rival revela su día preferido en sus ofertas; su utilidad se estima como −s·|día − preferido|, con s la
+    pendiente media de la nuestra × RIVAL_DAY_SCALE. Conceder un día que a nosotros nos cuesta poco se cobra en precio
+    (y al revés). El precio NUNCA sale de nuestro límite. None si falta información (`days_table` no entiende el
+    formato de your_days_weight o el rival no ha revelado día) o si no hay mejora."""
+    u = days_table(d)
+    pref = rival_days(d)
+    if u is None or pref is None or price is None:
+        return None
+    ref = pref if day_ref is None else int(day_ref)
+    s = PROFILE_PARAMS["RIVAL_DAY_SCALE"] * sum(abs(u[k + 1] - u[k]) for k in range(10)) / 10
+    est = lambda k: -s * abs(k - pref)
+    lim = float(d["your_limit"])
+    buyer = d["role"] == "buyer"
+    base = (-price if buyer else price) + u[ref]
+    best = None
+    for k in range(11):
+        if k == ref:
             continue
-        p_ok = accept_prob(rival_surplus(duel.role, beliefs.rival_limit, px) / pie,
-                           beliefs.firmness)
-        ev = p_ok * u * pie_factor(d, 1)
-        ev += (1 - p_ok) * beliefs.reply_prob * (fallback_share * pie) * pie_factor(d, 2)
-        if best is None or ev > best[0]:
-            best = (ev, px)
-
-    ev, px_price = best if best else (0.0, int(round(lo)))
-    px = float(px_price)
-    if plan and plan["we_concede_time"]:
-        # Ceder el día no es gratis: se cobra la pérdida y una parte del pastel
-        # nuevo. Luego se comprueba que la oferta siga siendo tomable.
-        px += price_shift(duel.role, plan["compensation"] + 0.25 * plan["created"])
-        px = _make_takeable(duel, beliefs, px, day, pie_t)
-    px = int(round(px))
-    share_them = _their_total(duel, beliefs, px, day) / pie_t if pie_t > 0 else 0.0
-    return Decision(
-        action="open", price=px, days=day,
-        text=_opening_text(duel, px, day),
-        reason=(f"apertura tomable: les deja ~{share_them:.0%} del pastel; "
-                f"EV {ev:.1f} frente a 0 por no contestar"),
-        ev_accept=ev, ev_counter=ev,
-        detail={"pie": pie, "pie_total": pie_t, "band": (a, b), "days_plan": plan,
-                "their_share": share_them,
-                "assumption": "rival_limit y rival_days_weight son creencias"},
-    )
+        comp = est(ref) - est(k)                  # lo que pierde el rival al pasar de ref a k (negativo = gana)
+        joint = (u[k] - u[ref]) - comp            # lo que crece la tarta (estimado) al cambiar de día
+        if joint > 0:                             # cedemos parte de lo que crece: colchón si subestimamos al rival
+            comp += PROFILE_PARAMS["LOGROLL_SHARE"] * joint
+        # redondeo a favor del rival y 1 P más para que prefiera estrictamente nuestra oferta
+        p = math.ceil(price + comp) + 1 if buyer else math.floor(price - comp) - 1
+        if (buyer and p > lim) or (not buyer and p < lim):
+            continue
+        ours = (-p if buyer else p) + u[k]
+        if best is None or ours > best[0]:
+            best = (ours, p, k)
+    if best is None or best[0] - base <= 0:
+        return None
+    return {"price": best[1], "days": best[2], "gain": best[0] - base}
 
 
-def _opening_text(duel: DuelView, price: int, day: Optional[int]) -> str:
-    """Texto que acompaña la oferta. Las palabras no obligan: la estructura sí.
-
-    Dos cosas que el texto debe hacer: invitar a aceptar YA (la merma es real
-    para los dos) y preguntar por la prisa del otro, que es el único modo de
-    convertir la suposición sobre su peso por día en información.
-    """
-    side = "te lo dejo" if duel.role == "seller" else "te lo compro"
-    when = f", entrega el día {day}" if day is not None else ""
-    out = (f"{side} a {price}{when}. Es una oferta que puedes tomar ya: cada "
-           f"ronda que hablamos nos encoge el trato a los dos, y si ninguno "
-           f"cierra, los dos nos vamos con cero. Si te sirve, acéptala.")
-    if day is not None:
-        out += (" Dime si el día te aprieta: si te corre más prisa que a mí, te "
-                "lo adelanto y lo arreglamos en el precio.")
-    return out
+def _maybe_logroll(d: dict, c: dict) -> None:
+    """Oferta propia en un duelo con días: con LOGROLL, mover día y precio si mejora; texto con el día."""
+    if PARAMS["LOGROLL"]:
+        lr = logroll_offer(d, c["price"], c["days"])
+        if lr:
+            c.update(price=lr["price"], days=lr["days"])
+    c["text"] = _say_text(c["price"], c["days"])
 
 
-# -------------------------------------------------------------- regla de respuesta
-
-def respond(
-    duel: DuelView,
-    beliefs: Beliefs,
-    params: SessionParams,
-    *,
-    fallback_share: float = 0.35,
-    max_counters: int = 1,
-) -> Decision:
-    """Qué hacer con lo que tenemos delante. NUNCA devuelve "callar".
-
-    Orden de la lógica, que es el orden de la importancia:
-
-    1. Sin oferta del rival → abrimos (`opening_offer`). El silencio da cero.
-    2. Su oferta nos deja excedente y ya gastamos las contras permitidas, o
-       mejorarla no paga la merma, o el reloj aprieta → **aceptar**.
-    3. Su oferta nos deja excedente pero hay sitio para arrancar más que
-       `min_worthwhile_gain` → **una** contraoferta, y luego cerrar.
-    4. Su oferta está fuera de nuestro límite (excedente de precio <= 0) →
-       nunca se acepta (resta puntos), pero se contraoferta en nuestro límite:
-       es la única jugada que todavía puede acabar en trato.
-
-    El límite se mide SOBRE EL PRECIO: `your_limit` es un coste o un valor
-    monetario. Suposición: que el día no mueve ese límite.
-    """
-    if not duel.has_rival_offer:
-        return opening_offer(duel, beliefs, params, fallback_share=fallback_share)
-
-    d = params.decay
-    px_in = float(duel.rival_price)
-    u_price = surplus(duel.role, duel.limit, px_in)
-    pie = pie_size(duel.role, duel.limit, beliefs.rival_limit)
-    plan = _days_plan(duel, beliefs, params)
-    day_in = duel.rival_days if plan else None
-    pie_t = total_pie(pie, plan)
-
-    # Utilidad total de SU oferta, con el día que trae.
-    u_now = u_price + day_penalty(duel.days_weight, day_in)
-
-    # ---- 4. fuera de límite: no se acepta, pero se contesta
-    if u_price <= 0:
-        want = 0.10 * pie if pie > 0 else 0.0
-        px = price_for_surplus(duel.role, duel.limit, max(0.0, want))
-        day = plan["day"] if plan else None
-        if plan and plan["we_concede_time"]:
-            px += price_shift(duel.role, plan["compensation"])
-            px = _make_takeable(duel, beliefs, px, day, pie_t)
-        px = int(round(px))
-        return Decision(
-            action="counter", price=px, days=day,
-            text=(f"A {int(px_in)} pierdo puntos, no puedo firmarlo. {px} sí lo "
-                  f"firmo ahora mismo"
-                  + (f", entrega el día {day}" if day is not None else "")
-                  + ". Cerrar algo nos vale a los dos más que irnos con cero."),
-            reason="su oferta cae fuera de nuestro límite: aceptarla restaría puntos",
-            ev_accept=u_price,
-            ev_counter=max(0.0, want) * pie_factor(d, duel.rounds_used + 1),
-            detail={"u_now": u_now, "pie": pie, "pie_total": pie_t, "days_plan": plan},
-        )
-
-    ev_accept = u_now * pie_factor(d, duel.rounds_used)
-
-    # ---- objetivo de la contra, en excedente de PRECIO
-    # No pedir la luna: tiene que seguir siendo tomable o la merma nos come.
-    target = max(u_price, (1.0 - fallback_share) * pie) if pie > 0 else u_price
-    ask_price_u = u_price + 0.5 * max(0.0, target - u_price)
-    px_counter = price_for_surplus(duel.role, duel.limit, ask_price_u)
-
-    day = plan["day"] if plan else None
-    if plan and plan["we_concede_time"]:
-        # Cedemos el día a quien más le urge y lo cobramos: compensación más
-        # una parte del pastel nuevo. Esto es el excedente de Duels II.
-        px_counter += price_shift(duel.role, plan["compensation"] + 0.25 * plan["created"])
-    if plan:
-        px_counter = _make_takeable(duel, beliefs, px_counter, day, pie_t)
-
-    u_counter = total_utility(duel.role, duel.limit, duel.days_weight, px_counter, day)
-    gain = u_counter - u_now
-    needed = min_worthwhile_gain(u_now, d)
-
-    counters_left = max(0, max_counters - duel.rounds_used)
-    ticks_tight = duel.ticks_left is not None and duel.ticks_left <= 2
-
-    p_ok = accept_prob(_their_total(duel, beliefs, px_counter, day) / pie_t
-                       if pie_t > 0 else 0.0, beliefs.firmness)
-    # Si rechazan y contestan, suponemos que volvemos a algo como su oferta
-    # actual (conservador). Si no contestan, cero: eso es lo que nos disciplina.
-    ev_counter = pie_factor(d, duel.rounds_used + 1) * (
-        p_ok * u_counter + (1 - p_ok) * beliefs.reply_prob * u_now)
-
-    # ---- 2. aceptar
-    if counters_left <= 0 or ticks_tight or gain < needed or ev_counter <= ev_accept:
-        why = ("sin contras disponibles" if counters_left <= 0 else
-               "quedan <=2 ticks: el riesgo de no-trato (cero) domina" if ticks_tight else
-               f"la mejora alcanzable ({gain:.1f}) no cubre la merma de una ronda "
-               f"({needed:.1f} = {round_cost_fraction(d):.1%} de nuestro excedente)"
-               if gain < needed else
-               f"EV de contraofertar ({ev_counter:.1f}) no bate aceptar ({ev_accept:.1f})")
-        return Decision(
-            action="accept", price=int(px_in), days=day_in,
-            text="Hecho, acepto.",
-            reason=f"aceptar: {why}; y aceptar bate siempre a no contestar (0)",
-            ev_accept=ev_accept, ev_counter=ev_counter,
-            detail={"u_now": u_now, "pie": pie, "pie_total": pie_t,
-                    "needed_gain": needed, "achievable_gain": gain,
-                    "days_plan": plan},
-        )
-
-    # ---- 3. una sola contra
-    px_counter = int(round(px_counter))
-    return Decision(
-        action="counter", price=px_counter, days=day,
-        text=(f"Casi. {px_counter}"
-              + (f" con entrega el día {day}" if day is not None else "")
-              + " y lo firmo en este mismo turno; si no, acepto lo tuyo antes de "
-                "que la charla nos coma el trato. Una sola vuelta, no más."),
-        reason=(f"contra única: gana {gain:.1f} > {needed:.1f} que cuesta la ronda "
-                f"({round_cost_fraction(d):.1%} del excedente)"
-                + (f"; cedemos el día {day} y lo cobramos "
-                   f"(+{plan['created']:.1f} de pastel nuevo)"
-                   if plan and plan["we_concede_time"] and plan["created"] > 0 else "")),
-        ev_accept=ev_accept, ev_counter=ev_counter,
-        detail={"u_now": u_now, "pie": pie, "pie_total": pie_t,
-                "needed_gain": needed, "achievable_gain": gain, "p_accept": p_ok,
-                "days_plan": plan,
-                "assumption": "pie y p_accept dependen de beliefs.rival_limit"},
-    )
+def _say_text(price: int, days: Optional[int]) -> str:
+    return f"{price} P y cerramos ahora." if days is None else f"{price} P con entrega el día {days} y cerramos ahora."
 
 
-# ------------------------------------------------- reparto de atención por tick
-
-def urgency(duel: DuelView, beliefs: Beliefs, params: SessionParams) -> float:
-    """Cuánto se pierde por NO contestar este duelo en este tick.
-
-    Con `max_concurrent` 6 (Duels II) y un presupuesto de mensajes por tick,
-    el cuello de botella es la atención, no la política. Se prioriza por lo
-    que está en juego, no por el número de duelo:
-
-    - un duelo sin contestar vale 0, así que el primer mensaje de un duelo
-      virgen vale todo su pastel: bonificación grande;
-    - pocos ticks restantes = riesgo inminente de cerrar en no_deal;
-    - pastel grande antes que pastel pequeño;
-    - la merma de un tick perdido se paga en el pastel completo.
-    """
-    pie_t = max(0.0, total_pie(pie_size(duel.role, duel.limit, beliefs.rival_limit),
-                               _days_plan(duel, beliefs, params)))
-    at_stake = pie_t if pie_t > 0 else max(1.0, abs(duel.limit) * 0.1)
-    score = at_stake * params.decay           # lo que quema un tick de silencio
-    if not duel.has_rival_offer and duel.rounds_used == 0:
-        score += at_stake                     # abrir o no abrir es 0 vs todo
-    if duel.ticks_left is not None:
-        # Un duelo a punto de expirar sin trato es un cero garantizado.
-        score += at_stake / max(1.0, float(duel.ticks_left))
-    return score
-
-
-def triage(duels: list[DuelView], beliefs: dict[int, Beliefs], params: SessionParams,
-           *, budget: Optional[int] = None) -> list[DuelView]:
-    """Ordena los duelos por lo que cuesta ignorarlos, y corta por presupuesto.
-
-    `beliefs` se indexa por `duel_id`; lo que falte usa un prior neutro
-    (el propio límite como estimación del valor del rival, que es lo único
-    que tenemos sin información).
-    """
-    def b(d: DuelView) -> Beliefs:
-        return beliefs.get(d.duel_id) or Beliefs(rival_limit=d.limit)
-
-    ordered = sorted(duels, key=lambda d: -urgency(d, b(d), params))
-    if budget is None:
-        budget = params.max_concurrent
-    return ordered[:max(0, int(budget))]
-
-
-# ------------------------------------------------------------------ chuleta 11:30
-
-def cheat_sheet(params: SessionParams) -> str:
-    """La política en siete líneas, para aplicarla a mano si falla el script."""
-    c = round_cost_fraction(params.decay)
-    return "\n".join([
-        f"{params.name}: decay {params.decay:.0%}/ronda, {params.duel_ticks} ticks, "
-        f"max {params.max_concurrent} a la vez, issues {list(params.issues)}.",
-        "1. CONTESTA TODOS los duelos. Sin respuesta = 0 para los dos.",
-        "2. Abre con una oferta tomable: quédate ~65 % del pastel que estimes, "
-        "no el 95 %. Dilo en el texto: 'acéptala ya'.",
-        f"3. Una ronda más cuesta {c:.1%} de TU excedente. Si no puedes arrancar "
-        f"más que eso, ACEPTA.",
-        "4. Nunca firmes fuera de tu límite (resta puntos): contraoferta en tu "
-        "límite +10 % del pastel y deja que cierren ellos.",
-        "5. Una contra como máximo; con <=2 ticks, acepta.",
-        ("6. Días (0-10): cede el día al que más le urja y cóbralo en precio. "
-         "Si tu peso por día es pequeño y el suyo grande, el día es suyo y la "
-         "prima es tuya. Todo mensaje con precio LLEVA days o sale missing_days."
-         if params.two_issue else
-         "6. Esta sesión es sólo precio: no mandes days."),
-        f"7. Con {params.max_concurrent} duelos a la vez, primero los que aún no "
-        f"has contestado y los que van a expirar: ésos valen 0 si los dejas.",
-    ])
+def replay(duels: list, params: Optional[dict] = None) -> dict:
+    """Repite duelos terminados tick a tick con la política: {'captured', 'best', 'outside_limit'}.
+    Sirve para medir y reajustar PARAMS con datos reales al terminar cada oleada."""
+    saved = dict(PARAMS)
+    PARAMS.update(params or {})
+    captured = best = 0.0
+    outside = 0
+    try:
+        for d in duels:
+            msgs = d.get("messages") or []
+            dl = d.get("deadline_tick")
+            if not msgs or dl is None:
+                continue
+            best += max([margin(d, m["price"], m.get("days")) or 0 for m in msgs if m.get("price") is not None] + [0])
+            for t in range(min(m["tick"] for m in msgs), dl):
+                seen = [m for m in msgs if m["tick"] <= t]
+                priced = [m for m in seen if m.get("price") is not None and m.get("from") == d.get("rival")]
+                if not priced:
+                    continue
+                st = dict(d, status="live", messages=seen, your_offer=None,
+                          rival_offer={"price": priced[-1]["price"], "days": priced[-1].get("days")})
+                acc = [c for c in duel_candidates([st], t) if c["type"] == "duel_accept"]
+                if acc:
+                    captured += max(0.0, acc[0]["du"])
+                    outside += acc[0]["du"] < 0
+                    break
+    finally:
+        PARAMS.clear()
+        PARAMS.update(saved)
+    return {"captured": captured, "best": best, "outside_limit": outside}

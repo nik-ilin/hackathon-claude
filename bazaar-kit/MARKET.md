@@ -91,3 +91,80 @@ Novedades:
 - Publica en El Duende (v02) con 120 ticks, rebaja sin bajar del suelo y para las guerras de precios.
 - Repuja en escalera, publica trueques sin efectivo y pujas dirigidas con evidencia, y reprecia sus propias ofertas.
 - Detalles completos en ARCHITECTURE.md → «DAY 2 STRATEGY».
+
+## COMPLETED PAGE PROTECTION
+
+> Once a page is completed, the agent treats the minimum set of cards required to preserve that page as non-tradeable inventory. Only duplicate copies beyond the protected requirement may be sold or swapped.
+
+- **Restricción dura, prioridad 1**, por encima de cualquier ΔU, precio, liquidez o puntuación estratégica.
+- **Acciones cubiertas:** venta, publicación, trueque, lote, oferta dirigida, propuesta a equipos, vendedores, arbitraje y reprecio.
+- **Solo salen duplicados por encima del mínimo:** `tradeable_surplus = max(copias − comprometidas − 1, 0)`.
+- **Una acción que rompería una página es inviable:**
+  - el planificador y el coordinador la marcan con `BLOCKED: card belongs to completed page` antes de ordenar;
+  - `send` la vuelve a comprobar antes de la red.
+- **Ofertas abiertas que se vuelven inseguras** al completar la página se cancelan con prioridad máxima, sin `--cancel-unsafe`.
+- **Cada bloqueo se registra como `PROTECTED_PAGE_BLOCK`**, con página, carta, activo, acción y motivo.
+- **Cambiar la regla** requiere editar `page_guard.py` (`PROTECTION_ENABLED`, `PROTECTED_REQUIRED_COPIES`). Detalles en ARCHITECTURE.md → «COMPLETED PAGE PROTECTION».
+
+## Ejecución y capital (proceso vivo recomendado: `coordinator.py`)
+
+- **El proceso vivo es `./run.sh coord --execute`.** `market_agent.py` queda para diagnóstico, simulación y pruebas heredadas, porque su bucle se para cuando un ciclo no actúa.
+- **Las pujas solo pueden usar el capital de mercado.** La liquidez de vendedores (el mayor máximo económico entre las negociaciones activas, o `--dealer-liquidity` sin ninguna) queda apartada.
+- **Rebalanceo:** si un cierre de vendedor o una compra inmediata superior necesita efectivo, se cancelan las pujas más débiles. Después se espera la confirmación del servidor y se ejecuta.
+- **Pujas obsoletas:**
+  - se retiran siempre si ya tenemos la carta o si ya no compensan;
+  - por edad o baja probabilidad, solo si el capital de mercado escasea (`--rebalance-threshold`, `--stale-age`).
+- **Trueques propios:** se valoran con la carta que recibimos (`trading.evaluate_own_open_offer`), el mismo evaluador en publicación, seguridad y cancelación.
+- **Un activo físico, una obligación:** las ofertas duplicadas se retiran automáticamente.
+- **Probabilidad de ejecución con banda de confianza:** HEURISTIC, EARLY DATA, LEARNING o LEARNED.
+- **Rendimiento separado en tres:** REALIZADO, ABIERTO y ESTIMADO.
+- Detalles en ARCHITECTURE.md → «EJECUCIÓN, CAPITAL Y CIERRE DE TRATOS».
+
+## Inteligencia de contrapartes y venta táctica
+
+- **`data/market.db`** (SQLite) se alimenta del MISMO snapshot del coordinador, sin llamadas extra. Contiene ofertas, liquidaciones, evidencia de posesión, interés por carta y colección, cotas de reserva y perfiles de estrategia, todos con confianza. Consultas: `./run.sh coord --intel-card LAT-10 --intel-team t14 --intel-db-stats`.
+- **Capital.** Las pujas pasivas no pueden usar ni la liquidez de vendedores ni el colchón táctico (`--tactical-buffer`), ni superar `--max-passive-frac`. El exceso se libera cancelando las peores pujas. `--capital-report` y `--open-bid-audit` lo muestran.
+- **Venta táctica** de un duplicado a una contraparte real: `--sale-target LAT-10=86` (por defecto).
+  - Nunca vende la copia que mantiene una página completa: con una sola copia, NO VENDER.
+  - Ancla por encima del objetivo, concede de forma decreciente, no baja del suelo económico y cierra cerca del objetivo.
+- **Una sola vía por carta buscada:** los trueques duplicados que piden la misma carta se retiran automáticamente.
+
+## Market Test: broker propio (`market_broker.py`) y banco de pruebas (`sim_bench.py`)
+
+**Cómo puntúa (RULES.md).** Cada ~2 h todos los venues reciben el mismo libro sintético (`bench_offers`, ids `b<run>-<n>`). La nota es la fracción del excedente posible (entre los límites ocultos) que se realiza. Igualar al puesto gratuito da la mitad de los puntos y la media de los tres mejores, los puntos completos. Cada sesión cuenta el mejor venue abierto durante ella, y la ronda promedia sus sesiones. Un broker solo actúa en un venue `board`: en uno `auto` (el puesto incluido) el motor cruza antes. En un `board` sin broker no se cruza nada, así que el proceso debe estar vivo toda la sesión.
+
+**Qué hace el broker nuevo** (`./run.sh market-broker`; `--mode stall` = puesto exacto; `--probe 0` sin sondeo):
+1. **Suelo:** toda oferta que el puesto cruzaría (`starter_broker.bench_plan`) queda cruzada, quizá con otro socio.
+2. **Excedente máximo:** entre los emparejamientos que cumplen el suelo y cruzan por cotización, elige el de mayor excedente estimado (algoritmo húngaro). Así cruza pares que el emparejamiento ordenado del puesto deja fuera (pujas 10 y 8 contra asks 7 y 9: el puesto cruza 1, este 2) cuando el excedente estimado del par extra es positivo.
+3. **Límites estimados:** desde la primera cotización vista y un sombreado aprendido en la sesión. La relajación de las ofertas que se van sin cruzar mide el sombreado; mientras hay pocas, se usa el prior del 20 %.
+4. **Precio:** punto medio de las cotizaciones, como el puesto. Envía primero lo que tiene más prisa.
+5. **Sondeo** (3 por tick, activado por defecto): pares sobrantes que no cruzan por cotización pero sí por límites estimados. Solo funciona si el servidor valida contra límites reales, cosa que no está documentada. Si no, el servidor los rechaza sin coste y el sondeo se apaga solo tras 3 rechazos sin ningún acierto.
+6. **Vigilante:** vuelve al plan del puesto el resto de la sesión ante un error del planificador, un plan que no cubre los cruces del puesto, ≥ 3 rechazos propios (> 25 %) o un sombreado observado < 5 %.
+
+**Un resultado de construcción:** un par extra respecto al puesto siempre tiene excedente negativo *por cotización* (bid_extra ≤ bid_k < ask_k ≤ ask_extra). Validando por cotización, la única mejora posible es apostar a que el sombreado cubre ese hueco. Por eso la ganancia sin sondeo es pequeña.
+
+**Banco de pruebas:** `python3 sim_bench.py [--server quote|limit|libre] [--scenario dificil] [--sessions N]`. Reproduce el libro sintético con compradores y vendedores de límite oculto, sombreado, paciencia, relajación cuadrática y firmes, en 6 escenarios (`dificil` = 75 % firmes y 70 % impacientes, como el test de las ~21:30). Ejecuta el puesto, starter_broker, el broker nuevo y sus variantes, y un oráculo miope de referencia. Son resultados de un modelo, no de la API: sirven para comparar entre mecanismos, no para predecir la nota.
+
+**Comisión.** `market_broker` cotiza el punto medio bajado lo justo para que el comprador pague la comisión. Con `fee_bps > 0`, el punto medio de `starter_broker` puede ser ilegal y el motor lo rechaza. En el banco, 300 bps cuestan un 4–11 % de eficiencia solo por los cruces que dejan de ser legales, y un 13–18 % si además la comisión se descuenta del excedente (`--fee-bps 300 --leak`). Las comisiones no puntúan: **el venue debe ir a 0 bps y 0 P por carta.**
+
+**Frente a `broker_engine.py` / `broker_run.py`** (`sim_bench` los ejecuta tal cual):
+- Sin sondeo, a 0 bps, la eficiencia media es la misma.
+- `market_broker` queda por debajo del puesto en menos sesiones gracias al suelo: 8 % frente a 14 % en el escenario normal.
+- `broker_engine` con `defer` rinde menos que el puesto.
+- El tope de 10 cruces por tick de `broker_run.py` pierde un ~4 % en libros densos.
+
+Pruebas: `python3 -m unittest test_market_broker`.
+
+## Cambio a venue `board` propio (`venue_switch.py`)
+
+`BAZAAR_KEY=tk_... python3 venue_switch.py` (en seco, por defecto) comprueba con GET la caja (≥ 270 P + colchón), el nivel (≥ 2), que no haya un venue propio, el horario (sin sesión del Market Test en curso según el feed y al menos `--min-lead` min hasta la próxima según `/api/schedule`; si no se puede leer, `--next-bench-in MIN`) y el autotest de `market_broker`. Imprime el plan y el déficit de caja.
+
+Con `--execute [--announce]` abre `board` a 0 bps y 0 P por carta, toma la broker key de la respuesta solo en memoria y la pasa al entorno de `market_broker.py` (sin `BAZAAR_KEY`). Un supervisor relanza el broker si muere o si se para su latido (`data/venue_broker.heartbeat`, solo tick y hora). Tras 3 caídas en 10 min pasa a `starter_broker.py`, y si la clave es rechazada para. Cada incidencia lanza una ALERTA (`--alert-cmd` para notificar fuera). El anuncio solo se envía cuando el broker ya late. `--resume` relanza el supervisor con `BROKER_KEY` o con la clave de `/api/me`, si el servidor la expone.
+
+**Riesgo:** si el proceso cae, el venue no cruza nada. Además, la broker key solo se devuelve una vez. **Vuelta atrás:** cerrar el venue devuelve la fianza tras un cooldown, pero RULES.md no promete que vuelva el puesto, y sin venue la sesión cuenta 0. La vuelta atrás real es `--broker-mode stall`, que cruza como el puesto. Detalle en el docstring de `venue_switch.py`.
+
+Pruebas: `python3 -m unittest test_venue_switch test_market_broker`.
+
+## Campaña de página (Malasaña)
+
+`--page-campaign MAL` (por defecto) prioriza las cartas que faltan de Malasaña: compra ya los asks rentables (la última carta sin regatear), propone trueques dirigidos con duplicados que el dueño quiere, puja dirigida por debajo del techo, cancela búsquedas ya cumplidas o redundantes y no dispersa efectivo en pujas públicas ajenas. Nunca paga por encima del valor privado, nunca usa copias protegidas y nunca desanonimiza alias. El informe `=== MAL COMPLETION CAMPAIGN ===` sale en cada tick.

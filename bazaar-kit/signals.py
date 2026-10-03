@@ -7,8 +7,8 @@ abre la red y no escribe nada. Sólo interpreta eventos ya recogidos.
 `thread.message`). Sobre 1.011 eventos reales (ticks 192-254) el feed trae
 otros doce, y ahí está lo que falta para decidir **a qué precio** publicar:
 
-- `offer.cancelled`: una oferta retirada sin liquidar es un precio que el
-  mercado RECHAZÓ. Cruzada con `settlement` da la curva de demanda observada.
+- `offer.cancelled`: retirada observada, con motivo desconocido. No demuestra
+  rechazo del precio; se excluye del denominador de tasas de venta.
 - `thread.closed.reason`: por qué fracasan las conversaciones con cada dealer.
 - `pack.opened` + la liquidación del sobre: si comprar sobres sale a cuenta.
 - `venue.fee_announced` / `fee_changed` / `opened`: la comisión vigente y la
@@ -42,7 +42,7 @@ INFERRED = "inferido"
 
 #: Desenlace de una oferta publicada.
 SETTLED = "settled"        # se liquidó (inferido por id de activo)
-CANCELLED = "cancelled"    # `offer.cancelled` explícito: precio rechazado
+CANCELLED = "cancelled"    # retirada explícita; no prueba rechazo del precio
 OPEN = "open"              # su `expires_tick` es posterior a lo observado
 UNKNOWN = "unknown"        # desapareció sin evento: no se sabe, no es rechazo
 
@@ -120,9 +120,7 @@ class OfferLife:
 
     @property
     def rejected(self) -> bool:
-        """Rechazo observado: retirada sin liquidar, o liquidada por menos."""
-        if self.outcome == CANCELLED:
-            return True
+        """Precio no alcanzado en una liquidación inferida; cancelar no demuestra rechazo."""
         return self.outcome == SETTLED and not self.accepted
 
     @property
@@ -138,6 +136,7 @@ class PriceLevel:
     accepted: int = 0
     rejected: int = 0
     open_now: int = 0
+    cancelled: int = 0
     unknown: int = 0
     assets: set = field(default_factory=set)     # activos distintos probados
     makers: set = field(default_factory=set)
@@ -162,7 +161,9 @@ class PriceLevel:
         return {"price": self.price, "accepted": self.accepted,
                 "rejected": self.rejected, "n": self.n,
                 "sell_rate": self.sell_rate, "open": self.open_now,
-                "unknown": self.unknown, "distinct_assets": self.distinct_assets,
+                "unknown": self.unknown, "cancelled": self.cancelled,
+                "rate_warning": "conditional on inferred settlements; not calibrated fill probability",
+                "distinct_assets": self.distinct_assets,
                 "makers": len(self.makers), "basis": INFERRED}
 
 
@@ -693,6 +694,8 @@ class Signals:
                 lv.accepted += 1
             elif o.rejected:
                 lv.rejected += 1
+            elif o.outcome == CANCELLED:
+                lv.cancelled += 1
             elif o.outcome == OPEN:
                 lv.open_now += 1
             else:
@@ -704,8 +707,9 @@ class Signals:
                   side: str = "ask") -> Optional[tuple[float, int]]:
         """Tasa de venta acumulada para quien pide `price` o menos, con su `n`.
 
-        Acumula hacia abajo porque un comprador que pagó 12 habría pagado 8:
-        una venta a 8 no dice nada de 12, pero una a 12 sí dice que 8 valía.
+        Resume publicaciones con precio <= price. Es una proporción condicionada
+        a liquidaciones inferidas, no una probabilidad de ejecución calibrada.
+        Las cancelaciones no son rechazos y no entran en el denominador.
         `None` si no hay nada resuelto en ese tramo.
         """
         acc = rej = 0
@@ -946,7 +950,7 @@ class Signals:
                  f"{cov['ignored_by_oracle']} que el oráculo ignora")
 
         L.append("")
-        L.append("ELASTICIDAD (venta, por rareza) — n = sólo resueltos")
+        L.append("PRECIOS (venta, por rareza) — n = liquidaciones inferidas; NO probabilidad calibrada")
         any_curve = False
         for rar in sorted({o.rarity for o in self._offers.values()
                            if o.side == "ask" and o.rarity}):
@@ -957,7 +961,7 @@ class Signals:
                              f"{lv.accepted}/{lv.n} vendidas"
                              f" ({lv.sell_rate:.0%})"
                              f"  [intentos sobre {lv.distinct_assets} cartas, "
-                             f"open {lv.open_now}, desconocidas {lv.unknown}]")
+                             f"open {lv.open_now}, retiradas {lv.cancelled}, desconocidas {lv.unknown}]")
         if not any_curve:
             L.append("  sin desenlaces resueltos: no hay curva")
         L.append(f"  desenlaces ask: {self.outcome_counts('ask')}")

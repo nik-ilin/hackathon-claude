@@ -1,0 +1,301 @@
+{
+ "now_hours": 2.65,
+ "upcoming": [
+  {
+   "at_hours": 3.0,
+   "action": "bench",
+   "note": "The Market Test: every venue gets the same synthetic book",
+   "params": {
+    "traders": 10,
+    "ticks": 16
+   }
+  },
+  {
+   "at_hours": 4.0,
+   "action": "round",
+   "note": "Round 2 starts (holdings carry over)",
+   "params": {
+    "name": "Saturday \u00b7 Gran V\u00eda",
+    "weight": 1
+   }
+  },
+  {
+   "at_hours": 4.0,
+   "action": "set_release",
+   "note": "El Retiro released",
+   "params": {
+    "set": "RET"
+   }
+  },
+  {
+   "at_hours": 4.0,
+   "action": "day_closes",
+   "note": "Closed until Saturday 09:00",
+   "params": {
+    "day": "fri"
+   },
+   "wall": "2026-10-02T23:00:00+02:00"
+  },
+  {
+   "at_hours": 4.0,
+   "action": "day_opens",
+   "note": "Saturday opens",
+   "params": {
+    "day": "sat",
+    "tick_seconds": 30.0
+   },
+   "wall": "2026-10-03T09:00:00+02:00"
+  },
+  {
+   "at_hours": 4.05,
+   "action": "grant_all",
+   "note": "El Retiro has arrived: a pack and the Saturday allowance (150 primas) for everyone",
+   "params": {
+    "packs": [
+     "sobre_barrio"
+    ],
+    "cash": 150
+   }
+  },
+  {
+   "at_hours": 5.0,
+   "action": "bench",
+   "note": "The Market Test: every venue gets the same synthetic book",
+   "params": {
+    "traders": 10,
+    "ticks": 16
+   }
+  },
+  {
+   "at_hours": 6.5,
+   "action": "duels",
+   "note": "Duels I: price only, one round-robin",
+   "params": {
+    "name": "Duels I",
+    "rounds": 1,
+    "duel_ticks": 16,
+    "decay": 0.06,
+    "max_concurrent": 3
+   }
+  },
+  {
+   "at_hours": 7.0,
+   "action": "bench",
+   "note": "The Market Test: every venue gets the same synthetic book",
+   "params": {
+    "traders": 10,
+    "ticks": 16
+   }
+  },
+  {
+   "at_hours": 9.0,
+   "action": "bench",
+   "note": "The Market Test: every venue gets the same synthetic book",
+   "params": {
+    "traders": 10,
+    "ticks": 16
+   }
+  },
+  {
+   "at_hours": 11.0,
+   "action": "bench",
+   "note": "The Market Test: every venue gets the same synthetic book",
+   "params": {
+    "traders": 10,
+    "ticks": 16
+   }
+  },
+  {
+   "at_hours": 13.0,
+   "action": "bench",
+   "note": "The Market Test: every venue gets the same synthetic book",
+   "params": {
+    "traders": 10,
+    "ticks": 16
+   }
+  },
+  {
+   "at_hours": 13.0,
+   "action": "duels",
+   "note": "Duels II: price and delivery day; the pie grows for teams that trade on what each side cares about",
+   "params": {
+    "name": "Duels II",
+    "rounds": 2,
+    "duel_ticks": 16,
+    "decay": 0.08,
+    "max_concurrent": 6,
+    "issues": [
+     "price",
+     "days"
+    ]
+   }
+  },
+  {
+   "at_hours": 15.0,
+   "action": "bench",
+   "note": "The Market Test: every venue gets the same synthetic book",
+   "params": {
+    "traders": 10,
+    "ticks": 16
+   }
+  },
+  {
+   "at_hours": 16.0,
+   "action": "bench",
+   "note": "The hard Market Test: firmer and more impatient traders",
+   "params": {
+    "name": "The hard Market Test",
+    "traders": 12,
+    "ticks": 16
+   }
+  },
+  {
+   "at_hours": 17.0,
+   "action": "bench",
+   "note": "The Market Test: every venue gets the same synthetic book",
+   "params": {
+    "traders": 10,
+    "ticks": 16
+   }
+  },
+  {
+   "at_hours": 18.0,
+   "action": "round",
+   "note": "Round 3 starts",
+   "params": {
+    "name": "Sunday \u00b7 Chamber\u00ed",
+    "weight": 1
+   }
+  },
+  {
+   "at_hours": 18.0,
+   "action": "set_release",
+   "note": "Chamber\u00ed released",
+   "params": {
+    "set": "CHA"
+   }
+  },
+  {
+   "at_hours": 18.0,
+   "action": "day_closes",
+   "note": "Closed until Sunday 09:00",
+   "params": {
+    "day": "sat"
+   },
+   "wall": "2026-10-03T23:00:00+02:00"
+  },
+  {
+   "at_hours": 18.0,
+   "action": "day_opens",
+   "note": "Sunday opens",
+   "params": {
+    "day": "sun",
+    "tick_seconds": 15.0
+   },
+   "wall": "2026-10-04T09:00:00+02:00"
+  },
+  {
+   "at_hours": 18.05,
+   "action": "grant_all",
+   "note": "The Sunday allowance: 150 primas for everyone",
+   "params": {
+    "cash": 150
+   }
+  },
+  {
+   "at_hours": 19.0,
+   "action": "bench",
+   "note": "The Market Test: every venue gets the same synthetic book",
+   "params": {
+    "traders": 10,
+    "ticks": 16
+   }
+  },
+  {
+   "at_hours": 20.0,
+   "action": "duels",
+   "note": "Duels III: two issues, shorter clock, harder decay",
+   "params": {
+    "name": "Duels III",
+    "rounds": 2,
+    "duel_ticks": 12,
+    "decay": 0.1,
+    "max_concurrent": 4,
+    "issues": [
+     "price",
+     "days"
+    ]
+   }
+  },
+  {
+   "at_hours": 21.0,
+   "action": "bench",
+   "note": "The Market Test: every venue gets the same synthetic book",
+   "params": {
+    "traders": 10,
+    "ticks": 16
+   }
+  },
+  {
+   "at_hours": 22.8,
+   "action": "announce",
+   "note": "finale warning",
+   "params": {}
+  },
+  {
+   "at_hours": 23.0,
+   "action": "persona",
+   "note": "Finale: stalls close",
+   "params": {
+    "id": "abuela",
+    "enabled": false
+   }
+  },
+  {
+   "at_hours": 23.0,
+   "action": "persona",
+   "note": "Finale: stalls close",
+   "params": {
+    "id": "chato",
+    "enabled": false
+   }
+  },
+  {
+   "at_hours": 23.0,
+   "action": "duels",
+   "note": "The Grand Final: the last duel wave, on the big screen",
+   "params": {
+    "name": "Final duels",
+    "rounds": 1,
+    "duel_ticks": 12,
+    "decay": 0.1,
+    "max_concurrent": 4,
+    "issues": [
+     "price",
+     "days"
+    ]
+   }
+  },
+  {
+   "at_hours": 23.9,
+   "action": "announce",
+   "note": "freeze warning",
+   "params": {}
+  },
+  {
+   "at_hours": 24.0,
+   "action": "end_round",
+   "note": "Scores freeze",
+   "params": {}
+  },
+  {
+   "at_hours": 24.0,
+   "action": "day_closes",
+   "note": "The Bazaar closes",
+   "params": {
+    "day": "sun"
+   },
+   "wall": "2026-10-04T15:00:00+02:00"
+  }
+ ]
+}

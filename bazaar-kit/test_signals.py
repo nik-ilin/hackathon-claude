@@ -72,14 +72,15 @@ def settled(sid, tick, price, asset, frm, to, *, ref="MAL-01",
 class TestCicloDeOferta(unittest.TestCase):
     """Publicada y cancelada, publicada y liquidada, publicada y desaparecida."""
 
-    def test_cancelada_es_rechazo_observado(self):
+    def test_cancelada_no_demuestra_rechazo(self):
         s = from_events([listed(3100, 192, "t04", 7, 500),
                          cancelled(3100, 195),
                          _ev("schedule.fired", 200, {"action": "bench"})])
         o = s.offers[3100]
         self.assertEqual(o.outcome, CANCELLED)
         self.assertEqual(o.outcome_basis, signals.OBSERVED)
-        self.assertTrue(o.rejected)
+        self.assertFalse(o.rejected)
+        self.assertFalse(o.resolved)
         self.assertFalse(o.accepted)
 
     def test_liquidada_al_precio_pedido_es_aceptacion_inferida(self):
@@ -169,25 +170,25 @@ class TestElasticidad(unittest.TestCase):
 
     def test_niveles_con_su_n(self):
         lv = {l.price: l for l in self.s.elasticity(rarity="common")}
-        self.assertEqual((lv[12].accepted, lv[12].n), (1, 3))
-        self.assertEqual((lv[8].accepted, lv[8].n), (2, 3))
+        self.assertEqual((lv[12].accepted, lv[12].n), (1, 1))
+        self.assertEqual((lv[8].accepted, lv[8].n), (2, 2))
         self.assertEqual(lv[8].unknown, 1)       # la desaparecida, aparte
-        self.assertAlmostEqual(lv[8].sell_rate, 2 / 3)
+        self.assertAlmostEqual(lv[8].sell_rate, 1.0)
 
     def test_cartas_distintas_detras_del_nivel(self):
         # Un equipo que republica la misma carta infla `n`; esto lo delata.
         s = from_events([listed(3210, 192, "t03", 6, 700), cancelled(3210, 193),
                          listed(3211, 194, "t03", 6, 700), cancelled(3211, 195)])
         lv = s.elasticity()[0]
-        self.assertEqual((lv.n, lv.distinct_assets), (2, 1))
+        self.assertEqual((lv.n, lv.distinct_assets), (0, 1))
 
     def test_odds_acumula_hacia_abajo(self):
         rate, n = self.s.sell_odds(12, rarity="common")
-        self.assertEqual(n, 6)
-        self.assertAlmostEqual(rate, 3 / 6)
+        self.assertEqual(n, 3)
+        self.assertAlmostEqual(rate, 1.0)
         rate8, n8 = self.s.sell_odds(8, rarity="common")
-        self.assertEqual(n8, 3)
-        self.assertAlmostEqual(rate8, 2 / 3)
+        self.assertEqual(n8, 2)
+        self.assertAlmostEqual(rate8, 1.0)
 
     def test_sin_muestra_no_hay_cifra(self):
         self.assertIsNone(self.s.sell_odds(3, rarity="common"))
@@ -195,14 +196,14 @@ class TestElasticidad(unittest.TestCase):
         self.assertEqual(self.s.elasticity(ref="NO-99"), [])
 
     def test_price_for_odds_exige_muestra(self):
-        self.assertEqual(self.s.price_for_odds(0.6, rarity="common", min_n=3), 8)
+        self.assertEqual(self.s.price_for_odds(0.6, rarity="common", min_n=3), 12)
         # Con n=3 por nivel, pedir 10 desenlaces no puede devolver precio.
         self.assertIsNone(self.s.price_for_odds(0.6, rarity="common", min_n=10))
 
     def test_banda_de_rechazo(self):
         b = self.s.rejection_band(rarity="common")
         self.assertEqual(b["max_accepted"], 12)
-        self.assertEqual(b["min_rejected"], 8)
+        self.assertIsNone(b["min_rejected"])
         self.assertIsNone(self.s.rejection_band(rarity="epic"))
 
     def test_elasticidad_de_compra_separada_y_mas_debil(self):
@@ -448,7 +449,7 @@ class TestCoberturaEInforme(unittest.TestCase):
                          listed(3902, 192, "t04", 7, 961),
                          settled(420, 194, 7, 961, "t04", "t02", fee=2)])
         txt = s.report()
-        self.assertIn("1/2 vendidas", txt)
+        self.assertIn("1/1 vendidas", txt)
 
 
 if __name__ == "__main__":

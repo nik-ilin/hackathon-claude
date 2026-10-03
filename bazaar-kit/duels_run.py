@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-import duels
+import oracle_duels as duels
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 LOG_PATH = DATA_DIR / "duels_log.jsonl"
@@ -230,7 +230,9 @@ def main(argv: list[str] | None = None) -> int:
         print(duels.cheat_sheet(params))
         return 0
 
-    live = bool(args.live and args.confirm)
+    if args.live:
+        ap.error("Ejecutor experimental: usa duel_runner.py para operar; esta política queda en análisis")
+    live = False
     if args.live and not args.confirm:
         print("--live sin --yes-i-have-the-key: no se escribe nada.", file=sys.stderr)
     if not args.key:

@@ -61,6 +61,7 @@ class Ask:
     final: bool
     live: bool
     tick: int
+    expires: Optional[int] = None  # tick de caducidad de su oferta estructurada
 
 
 @dataclass
@@ -78,6 +79,7 @@ class NegState:
     rounds: list = field(default_factory=list)
     current: Optional[Ask] = None  # su última oferta estructurada (viva o no)
     awaiting_reply: bool = False
+    final_countered: bool = False  # ya contraofertamos después de una oferta final suya (escalera: una sola vez)
 
     @property
     def turns(self) -> int:
@@ -121,30 +123,41 @@ def sell_assets(item: Optional[str]) -> list:
     return [int(x) for x in item[5:].split(",") if x] if is_sell(item) else []
 
 
-def _our_price(m: dict) -> Optional[int]:
+def sell_assets_of(topic: Optional[dict]) -> list:
+    """Activos que ofrecemos en una conversación de VENTA a un vendedor ({"sell": {"assets": [...]}})."""
+    return list(((topic or {}).get("sell") or {}).get("assets") or [])
+
+
+def _our_price(m: dict, side: str = "buy") -> Optional[int]:
     if m.get("price") is not None:
         return int(m["price"])
-    cash = ((m.get("offer") or {}).get("give") or {}).get("cash")
+    cash = ((m.get("offer") or {}).get("give" if side == "buy" else "want") or {}).get("cash")
     return int(cash) if cash else None
 
 
-def state_from_thread(thread: dict, dealer: str, now_tick: int, cfg: Config) -> NegState:
-    """Reconstruye el estado desde los mensajes del hilo, así un reinicio retoma la negociación tal cual estaba."""
+def state_from_thread(thread: dict, dealer: str, now_tick: int, cfg: Config, side: str = "buy") -> NegState:
+    """Reconstruye el estado desde los mensajes del hilo, así un reinicio retoma la negociación tal cual estaba.
+    side="sell": el vendedor nos COMPRA (su precio está en give.cash); por defecto, compramos (want.cash)."""
     st = NegState(item=item_of(thread.get("topic")))
     for m in thread.get("messages") or []:
         o = m.get("offer")
         if m.get("sender") == dealer:
             if not o:
                 continue
-            a = Ask(int(o["want"]["cash"]), o["id"], bool(o.get("final")), o.get("status") == "open", int(m.get("tick", 0)))
+            exp = o.get("expires_tick")
+            live = o.get("status") == "open" and (exp is None or int(exp) >= now_tick)  # caducada = no vigente
+            price = o["want"]["cash"] if side == "buy" else o["give"]["cash"]
+            a = Ask(int(price), o["id"], bool(o.get("final")), live, int(m.get("tick", 0)), exp)
             if st.opening is None:
                 st.opening = a.price
             if st.rounds and st.rounds[-1].reply is None:
                 st.rounds[-1].reply = a.price
             st.current = a
         else:
-            p = _our_price(m)
+            p = _our_price(m, side)
             if p is not None:
+                if st.current is not None and st.current.final:
+                    st.final_countered = True
                 st.rounds.append(Round(p, st.current.price if st.current else None, int(m.get("tick", 0))))
     last = st.rounds[-1] if st.rounds else None
     st.awaiting_reply = bool(last and last.reply is None and now_tick - last.tick < cfg.reply_timeout_ticks)
@@ -324,6 +337,14 @@ def message(turn: int, price: int, item_name: str) -> str:
     return MESSAGES[turn % len(MESSAGES)].format(p=price, item=item_name)
 
 
+def dealer_message(dealer: str, turn: int, price: int, item_name: str) -> str:
+    """Texto para una contraoferta: la plantilla de Abuela no debe dirigirse a Chato."""
+    if dealer == "chato":
+        return (f"Voy directo al precio, Chato: {price} P por {item_name}. ¿Cerramos?"
+                if turn == 0 else f"Subo a {price} P por {item_name}. Es mi mejor oferta.")
+    return message(turn, price, item_name)
+
+
 # ------------------------------------------------------------------ modo primera compra (--first-purchase)
 
 @dataclass
@@ -409,6 +430,7 @@ class DealerPolicy:
     allow_opening_price: bool        # False en modo score: el precio de apertura no cuenta para la escalera
     accept_gap: int = 1
     min_viable_frac: float = 0.8     # si nuestro máximo < 80 % de su precio, mejor otro artículo
+    secure: bool = False             # SECURE: cerrar un trato negociado válido en cuanto exista (ver ladder_mode)
     sell_open_mult: float = 2.0      # VENTA: primera petición = múltiplo de su primera puja
     sell_gap_frac: float = 0.35      # VENTA: cada concesión nuestra cierra esta fracción de la brecha, bajando
 
@@ -538,6 +560,10 @@ def decide_dealer(st: NegState, pol: DealerPolicy, ceiling: int, conv_ticks_left
         return Decision("abandon", f"sin margen económico (máximo {ceiling} P)")
     if st.current is None:
         return Decision("wait" if conv_ticks_left > 0 else "abandon", "aún no ha puesto precio")
+    if pol.secure and live and st.opening is not None and live.price < st.opening and valid(live.price):
+        # SECURE: ya ha concedido (precio vigente < apertura) y está dentro del máximo -> cerrar YA el trato negociado;
+        # no se arriesga un hueco de la escalera por ahorrar 1-3 P más.
+        return take(f"SECURE: ha rebajado de {st.opening} P a {live.price} P (≤ máximo {ceiling} P); se cierra")
     if st.awaiting_reply:
         return Decision("wait", "esperando su respuesta")
     out_of_time = conv_ticks_left <= 0 or total_ticks_left <= 0
@@ -568,6 +594,279 @@ def decide_dealer(st: NegState, pol: DealerPolicy, ceiling: int, conv_ticks_left
             return take(f"no queda oferta nueva por encima de {st.last_ours} P; {live.price} P es aceptable")
         return Decision("abandon", f"no queda oferta nueva entre {st.last_ours} P y {hi} P")
     return Decision("counter", f"[{pol.name}] cierra el {pol.gap_frac:.0%} de la brecha ({ask} P vigente)", p)
+
+
+# ------------------------------------------------------------------ escalera de vendedores (mejores tres tratos)
+
+LADDER_SLOTS = 3  # RULES.md: cuentan los tres mejores tratos negociados por nivel; uno que falta cuenta cero
+
+
+def qualifying_deals(dealer: str, threads: list = (), outcomes: list = ()) -> list:
+    """Tratos con `dealer` LIQUIDADOS y NEGOCIADOS (precio de cierre < su apertura; aceptar la apertura no cuenta).
+    Determinista: hilos `deal` del servidor (precio realmente liquidado) + resultados del diario, sin duplicar hilos."""
+    out = {}
+    for t in threads or []:
+        if t.get("with") != dealer or t.get("status") != "deal":
+            continue
+        st = state_from_thread(t, dealer, 10 ** 9, Config())
+        paid = settled_price(t, dealer)
+        if paid is not None and st.opening is not None and paid < st.opening:
+            out[t.get("id")] = {"thread": t.get("id"), "item": st.item, "opening": st.opening, "close": paid,
+                                "source": "servidor"}
+    for r in outcomes or []:
+        if r.get("dealer") != dealer or r.get("status") != "deal" or not r.get("settled"):
+            continue
+        op, cl = r.get("opening"), r.get("close_price")
+        if op is not None and cl is not None and cl < op and r.get("thread") not in out:
+            out[r.get("thread")] = {"thread": r.get("thread"), "item": r.get("item"), "opening": op, "close": cl,
+                                    "source": "diario"}
+    return sorted(out.values(), key=lambda x: str(x["thread"]))
+
+
+def ladder_mode(n_qualifying: int) -> str:
+    """SECURE hasta tener los tres tratos que puntúan con ese vendedor; después OPTIMIZE (mejorar los tres mejores)."""
+    return "SECURE" if n_qualifying < LADDER_SLOTS else "OPTIMIZE"
+
+
+def policy_for(dealer: str, mode: str, n_qualifying: int) -> DealerPolicy:
+    """Política base del vendedor; en SECURE acepta en cuanto concede dentro del máximo y cierra la brecha más deprisa.
+    Nunca relaja el máximo económico ni (en modo score) la regla de no aceptar la apertura."""
+    base = dealer_policy(dealer, mode)
+    if ladder_mode(n_qualifying) == "OPTIMIZE":
+        return base
+    return DealerPolicy(base.name, base.open_frac, max(base.gap_frac, 0.5), base.max_counteroffers, base.max_ticks,
+                        accept_on_concession=True, allow_opening_price=base.allow_opening_price,
+                        accept_gap=max(base.accept_gap, 3), min_viable_frac=base.min_viable_frac, secure=True)
+
+
+def dealer_accept_priority(mode: str, n_qualifying: int, ticks_to_expiry: Optional[int]) -> int:
+    """Prioridad ESTRATÉGICA (no un valor en primas inventado) de aceptar una oferta válida de un vendedor.
+    Orden: seguridad (≥ 10⁶) > cierre de vendedor que caduca / tercer trato > otras aceptaciones inmediatas > resto."""
+    score = 3 * 10 ** 5 if mode == "SECURE" else 10 ** 5 + 2 * 10 ** 3
+    if mode == "SECURE" and n_qualifying == LADDER_SLOTS - 1:
+        score += 10 ** 5  # el tercer trato llena el último hueco que puntúa
+    if ticks_to_expiry is not None:
+        score += 5 * 10 ** 4 if ticks_to_expiry <= 1 else 2 * 10 ** 4 if ticks_to_expiry <= 2 else 0
+    return score
+
+
+# ------------------------------------------------------------------ escalera de vendedores (--dealer-ladder, opt-in)
+#
+# Reglas OBSERVADAS en hilos reales (pocas muestras: son hipótesis de trabajo, no fórmulas del servidor):
+# (t15-bazaar-bot/intel/AUDITORIA_LIDERES.md, tick ~280; pocas muestras: hipótesis de trabajo)
+# - Chato copia el tamaño de nuestro paso (con +1 no se mueve), acepta nuestra oferta solo cuando estamos a 1-2 P de su
+#   precio y, tras su oferta final, una contraoferta de final-1 funcionó 2/2; si no la acepta, se toma su final en el
+#   tick siguiente. Pasos: +3 en poco común, +4 en rara; apertura de rara 0,70 (t18: 0,72 y +4). Aperturas razonables
+#   (0,55-0,70): t13 abre a 0,2 y no cierra.
+# - Abuela cede ~1 P por ronda: pasos de 1 y paciencia (final de sobre 19-21 frente a 22-24 con pasos de 2). t18 abre una
+#   común de 12 a 7 (~0,6). Vende poco comunes a 21-22 P (Chato 27-31): esas compras se enrutan a ella. Compra comunes a
+#   5 con final 6 abras como abras (t02 pide 10 y baja de 1 en 1).
+# - Vendedores nuevos (nivel 3, p. ej. Pilar): sin observaciones, política prudente con parámetros de línea de órdenes.
+
+@dataclass
+class LadderProfile:
+    """Política de escalera para un vendedor. Pasos FIJOS por rareza (`steps`) o, si no hay, una fracción de la brecha."""
+    name: str
+    open_frac: dict                  # rareza -> fracción de su precio en la primera oferta ("*" = resto)
+    steps: dict                      # rareza -> paso fijo en P ("*" = resto); vacío = usar gap_frac
+    accept_gap: int                  # aceptar su precio vigente si está a esta distancia de nuestra última oferta
+    max_counteroffers: int
+    max_ticks: int
+    counter_final_once: bool = False  # tras su oferta final: una contraoferta de final-1, después aceptar el final
+    gap_frac: float = 0.5
+    max_open_frac: float = 1.0       # nunca pagar más de esta fracción de su apertura (prudencia con desconocidos)
+    min_viable_frac: float = 0.8
+    allow_opening_price: bool = False
+    final_wait_ticks: int = 1        # tras la contraoferta final-1: ticks de espera antes de tomar su final
+
+    def _by_rarity(self, table: dict, rarity: Optional[str], default):
+        return table.get(rarity or "*", table.get("*", default))
+
+    def opening(self, rarity: Optional[str]) -> float:
+        return float(self._by_rarity(self.open_frac, rarity, 0.8))
+
+    def step(self, rarity: Optional[str], gap: int) -> int:
+        fixed = self._by_rarity(self.steps, rarity, None)
+        return max(1, int(fixed)) if fixed else max(1, math.ceil(self.gap_frac * gap))
+
+
+@dataclass
+class LadderConfig:
+    """Parámetros de la escalera. Los valores por defecto salen de las reglas observadas (ver arriba)."""
+    chato_open: dict = field(default_factory=lambda: {"rare": 0.70, "uncommon": 0.70, "*": 0.70})
+    chato_steps: dict = field(default_factory=lambda: {"rare": 4, "uncommon": 3, "*": 2})
+    chato_counters: int = 5
+    chato_ticks: int = 12
+    abuela_open: dict = field(default_factory=lambda: {"*": 0.60})
+    abuela_counters: int = 15
+    abuela_ticks: int = 30
+    new_open: float = 0.80           # vendedores nuevos (nivel 3): apertura prudente
+    new_gap_frac: float = 0.35
+    new_counters: int = 3
+    new_ticks: int = 10
+    new_max_frac: float = 0.95       # nunca más del 95 % de su apertura con un vendedor sin observar
+    new_accept_gap: int = 1
+    route: dict = field(default_factory=lambda: {"uncommon": "abuela"})  # rareza -> vendedor preferido para comprar
+    sell_route: dict = field(default_factory=lambda: {"common": "abuela"})  # rareza -> vendedor que la compra
+    sell_expected: dict = field(default_factory=lambda: {"abuela": {"common": 6}})  # final observado al venderle
+    sell_open: int = 10              # nuestra primera petición al vender una común (t02: pide 10)
+    sell_counters: int = 6
+    sell_ticks: int = 12
+    sell_margin: float = 1.0         # excedente mínimo al vender: precio >= valor perdido + margen
+
+
+def ladder_profile(dealer: str, lc: Optional[LadderConfig] = None, mode: str = "score") -> LadderProfile:
+    lc = lc or LadderConfig()
+    allow = mode != "score"
+    if dealer == "chato":
+        return LadderProfile("chato", dict(lc.chato_open), dict(lc.chato_steps), accept_gap=1,
+                             max_counteroffers=lc.chato_counters, max_ticks=lc.chato_ticks, counter_final_once=True,
+                             allow_opening_price=allow)
+    if dealer == "abuela":
+        return LadderProfile("abuela", dict(lc.abuela_open), {"*": 1}, accept_gap=1,
+                             max_counteroffers=lc.abuela_counters, max_ticks=lc.abuela_ticks, allow_opening_price=allow)
+    return LadderProfile(dealer, {"*": lc.new_open}, {}, accept_gap=lc.new_accept_gap,
+                         max_counteroffers=lc.new_counters, max_ticks=lc.new_ticks, gap_frac=lc.new_gap_frac,
+                         max_open_frac=lc.new_max_frac, min_viable_frac=lc.new_open, allow_opening_price=allow)
+
+
+def decide_ladder(st: NegState, prof: LadderProfile, ceiling: int, conv_ticks_left: int,
+                  rarity: Optional[str] = None, now_tick: Optional[int] = None) -> Decision:
+    """Compra con escalera. Garantías: nunca supera el máximo económico, nunca repite ni baja una oferta, nunca paga su
+    apertura en modo score, y como mucho UNA contraoferta tras su oferta final."""
+    live, n = st.live, st.turns
+    cap = ceiling
+    if st.opening is not None and prof.max_open_frac < 1.0:
+        cap = min(cap, math.floor(prof.max_open_frac * st.opening))
+
+    def valid(price: int) -> bool:
+        return price <= cap and (prof.allow_opening_price or st.opening is None or price < st.opening)
+
+    def take(why: str) -> Decision:
+        return Decision("accept", f"[{prof.name}] {why}", live.price, live.offer_id)
+
+    if live and live.final:
+        last = st.rounds[-1] if st.rounds else None
+        if st.final_countered and last and last.reply is None and (
+                now_tick - last.tick < prof.final_wait_ticks if now_tick is not None else st.awaiting_reply):
+            return Decision("wait", f"[{prof.name}] esperando respuesta a nuestra contraoferta final-1")
+        p = live.price - 1
+        if prof.counter_final_once and not st.final_countered and p <= cap and p > (st.last_ours or 0) \
+                and conv_ticks_left > 0:
+            return Decision("counter", f"[{prof.name}] oferta final de {live.price} P: contraoferta final-1 "
+                                       f"una sola vez", p)
+        if valid(live.price):
+            return take(f"oferta final de {live.price} P aceptable (máximo {cap} P)")
+        return Decision("abandon", f"[{prof.name}] oferta final de {live.price} P no aceptable (máximo {cap} P, "
+                                   f"apertura {st.opening} P)")
+    if cap < 1:
+        return Decision("abandon", f"sin margen económico (máximo {cap} P)")
+    if st.current is None:
+        return Decision("wait" if conv_ticks_left > 0 else "abandon", "aún no ha puesto precio")
+    if st.awaiting_reply:
+        return Decision("wait", "esperando su respuesta")
+    out_of_time = conv_ticks_left <= 0
+    if live and valid(live.price):
+        if st.last_ours is not None and live.price - st.last_ours <= prof.accept_gap:
+            return take(f"brecha de {live.price - st.last_ours} P")
+        if n >= prof.max_counteroffers or out_of_time:
+            return take(("contraofertas agotadas" if n >= prof.max_counteroffers else "plazo agotado") +
+                        f"; {live.price} P es aceptable")
+    if out_of_time or n >= prof.max_counteroffers:
+        return Decision("abandon", f"[{prof.name}] {n} contraofertas / plazo agotado y {st.ref_ask} P no es aceptable")
+    ask = st.ref_ask
+    hi = min(cap, ask - 1)
+    if n == 0:
+        if cap < ask * prof.min_viable_frac:
+            return Decision("abandon", f"máximo {cap} P muy por debajo de su precio {ask} P: mejor otro artículo")
+        frac = prof.opening(rarity)
+        p = min(int(frac * ask + 0.5), hi)
+        if p < 1:
+            return Decision("abandon", "no hay primera oferta válida")
+        return Decision("counter", f"[{prof.name}] apertura {frac:.0%} de {ask} P", p)
+    step = prof.step(rarity, ask - st.last_ours)
+    p = min(st.last_ours + step, hi)
+    if p <= st.last_ours:
+        if live and valid(live.price):
+            return take(f"no queda oferta nueva por encima de {st.last_ours} P; {live.price} P es aceptable")
+        return Decision("abandon", f"no queda oferta nueva entre {st.last_ours} P y {hi} P")
+    return Decision("counter", f"[{prof.name}] paso de {step} P ({ask} P vigente, rareza {rarity or '?'})", p)
+
+
+def decide_ladder_sell(st: NegState, lc: LadderConfig, floor: int, conv_ticks_left: int,
+                       mode: str = "score") -> Decision:
+    """VENTA a un vendedor (state_from_thread con side="sell": ref_ask = su puja, last_ours = nuestra petición).
+    Pedimos `sell_open` y bajamos de 1 en 1; nunca por debajo de `floor` (valor perdido + margen) ni, en modo score, a su
+    precio de apertura. Su oferta final se acepta si llega al suelo."""
+    live, n = st.live, st.turns
+    lo = floor
+    if mode == "score" and st.opening is not None:
+        lo = max(lo, st.opening + 1)  # un trato al precio de apertura no cuenta para la escalera
+
+    def take(why: str) -> Decision:
+        return Decision("accept", why, live.price, live.offer_id)
+
+    if live and live.final:
+        return take(f"oferta final de {live.price} P >= suelo {lo} P") if live.price >= lo else \
+            Decision("abandon", f"oferta final de {live.price} P bajo el suelo de {lo} P")
+    if st.current is None:
+        return Decision("wait" if conv_ticks_left > 0 else "abandon", "aún no ha puesto precio")
+    if st.awaiting_reply:
+        return Decision("wait", "esperando su respuesta")
+    out_of_time = conv_ticks_left <= 0
+    if live and live.price >= lo:
+        if st.last_ours is not None and st.last_ours - live.price <= 1:
+            return take(f"su puja de {live.price} P está a {st.last_ours - live.price} P de nuestra petición")
+        if n >= lc.sell_counters or out_of_time:
+            return take(f"contraofertas o plazo agotados; {live.price} P >= suelo {lo} P")
+    if out_of_time or n >= lc.sell_counters:
+        return Decision("abandon", f"{n} peticiones / plazo agotado y su puja ({st.ref_ask} P) no llega a {lo} P")
+    bid = st.ref_ask
+    p = max(lc.sell_open, bid + 1, lo) if n == 0 else st.last_ours - 1
+    p = max(p, bid + 1, lo)
+    if st.last_ours is not None and p >= st.last_ours:
+        if live and live.price >= lo:
+            return take(f"no queda una petición nueva por debajo de {st.last_ours} P; {live.price} P es aceptable")
+        return Decision("abandon", f"no queda una petición nueva entre {lo} P y {st.last_ours} P")
+    return Decision("counter", f"[venta] pedimos {p} P (su puja {bid} P, suelo {lo} P)", p)
+
+
+def ladder_message(dealer: str, turn: int, price: int, item_name: str, side: str = "buy") -> str:
+    """Textos de la escalera: no se dirige a un vendedor nuevo con la plantilla de la Abuela."""
+    if side == "sell":
+        return (f"¡Buenas, Abuela! ¿Me compraría esta carta repetida por {price} P?" if dealer == "abuela"
+                else f"Le vendo esta carta por {price} P.")
+    if dealer in ("abuela", "chato"):
+        return dealer_message(dealer, turn, price, item_name)
+    return f"Le ofrezco {price} P por {item_name}." if turn == 0 else f"Puedo subir a {price} P por {item_name}."
+
+
+def settled_sell_price(thread: dict, dealer: str) -> Optional[int]:
+    """Precio cobrado en una VENTA a un vendedor, según la oferta liquidada del hilo."""
+    for m in reversed(thread.get("messages") or []):
+        o = m.get("offer") or {}
+        if o.get("status") == "settled":
+            side = "give" if o.get("maker") == dealer else "want"
+            return (o.get(side) or {}).get("cash")
+    return None
+
+
+def sell_offer_problems(offer: dict, *, dealer: str, asset_id: int, floor: int) -> list:
+    """Problemas de la oferta de compra del vendedor (lista vacía = se puede aceptar): solo efectivo por esa copia."""
+    problems = []
+    give, want = offer.get("give") or {}, offer.get("want") or {}
+    if offer.get("maker") != dealer:
+        problems.append(f"la hace {offer.get('maker')!r}, no {dealer!r}")
+    if offer.get("status") != "open":
+        problems.append(f"no está abierta ({offer.get('status')!r})")
+    if give.get("assets") or give.get("types"):
+        problems.append("además del dinero entrega cartas")
+    if not isinstance(give.get("cash"), int) or give["cash"] < floor:
+        problems.append(f"paga {give.get('cash')!r} P, bajo el suelo de {floor} P")
+    ids = [a["id"] if isinstance(a, dict) else a for a in want.get("assets") or []]
+    if ids != [asset_id] or want.get("cash") or want.get("types"):
+        problems.append(f"no pide exactamente el activo {asset_id} (pide {want})")
+    return problems
 
 
 def conversation_ticks_used(thread: dict, now_tick: int) -> int:
