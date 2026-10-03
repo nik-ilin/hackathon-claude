@@ -96,7 +96,11 @@ def main() -> None:
     ap.add_argument("--execute", action="store_true", help="enviar (por defecto solo análisis)")
     ap.add_argument("--feed-file", type=Path, default=DATA / "feed_history.jsonl",
                     help="JSONL del feed público para contexto (por defecto data/feed_history.jsonl)")
+    ap.add_argument("--days", action="store_true",
+                    help="jugar duelos con días (Duelos II): precio dentro de límite y cada oferta con days; "
+                         "sin el flag se saltan y puntúan 0")
     a = ap.parse_args()
+    dl.PARAMS["PLAY_DAYS"] = a.days
     key = os.environ.get("BAZAAR_KEY", "")
     if not key or key == "tk-xxxx-xxxx":
         raise SystemExit("Falta BAZAAR_KEY (carga .env o exporta la variable)")
@@ -116,6 +120,7 @@ def main() -> None:
 
 def run(b, execute, feed_file: Path | None = None):
     last_tick = None
+    seen_weights: set = set()
     while True:
         try:
             c = b.clock()
@@ -129,7 +134,11 @@ def run(b, execute, feed_file: Path | None = None):
                 continue
             for d in live:
                 if "days" in (d.get("issues") or []):
-                    log({"tick": c["tick"], "duel": d["duel"], "skipped": "days utility not verified"})
+                    if not dl.PARAMS["PLAY_DAYS"]:
+                        log({"tick": c["tick"], "duel": d["duel"], "skipped": "days utility not verified"})
+                    elif d["duel"] not in seen_weights:   # formato real de your_days_weight, una vez por duelo
+                        seen_weights.add(d["duel"])
+                        log({"tick": c["tick"], "duel": d["duel"], "your_days_weight": d.get("your_days_weight")})
             events = load_feed_events(feed_file)
             accepted = False
             for step in duel_tree.plan(live, c["tick"], events,

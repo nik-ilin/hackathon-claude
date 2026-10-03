@@ -41,7 +41,7 @@ def _waiting_reason(duel: dict, tick: int) -> tuple[str, list[str]]:
         return "missing_deadline", ["snapshot_incomplete", "no_action"]
     if duel["deadline_tick"] <= tick:
         return "expired_snapshot", ["deadline_reached", "no_action"]
-    if "days" in (duel.get("issues") or []):
+    if "days" in (duel.get("issues") or []) and not duels.PARAMS["PLAY_DAYS"]:
         return "days_utility_unverified", ["two_issue", "no_action"]
     offer = duel.get("rival_offer") or {}
     price = offer.get("price")

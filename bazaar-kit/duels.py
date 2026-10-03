@@ -33,6 +33,7 @@ PARAMS = {
     "SPEAK_AT": 5,        # ticks antes del deadline para hablar si el rival calla
     "ANCHOR": 0.30,       # nuestra única oferta: comprador límite·(1−0,30), vendedor límite·(1+0,30)
     "SAFE_TICKS": 1,      # aceptar a más tardar en deadline − SAFE_TICKS (+1 por duelo de la misma oleada)
+    "PLAY_DAYS": False,   # jugar duelos de precio + días (Duelos II); si no, se saltan y puntúan 0 (opt-in: --days)
 }
 
 
@@ -88,7 +89,7 @@ def duel_candidates(duels: list, tick: int) -> list:
         left = deadline - tick
         if left <= 0:
             continue  # no enviar acciones sobre un snapshot caducado
-        if "days" in (d.get("issues") or []):
+        if "days" in (d.get("issues") or []) and not PARAMS["PLAY_DAYS"]:
             continue  # pendiente de verificar la fórmula de utilidad de días con el servidor
         ro = d.get("rival_offer") or {}
         price, days = ro.get("price"), ro.get("days")
