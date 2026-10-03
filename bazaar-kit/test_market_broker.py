@@ -255,6 +255,85 @@ class Loop(unittest.TestCase):
                 mb.main()
         self.assertEqual(len(sent), 2)
 
+    def run_main(self, books, match=None, argv=()):
+        """main() con un broker falso que sirve `books` (o lanza lo que haya en la lista) y para al acabarse."""
+        from bazaar_sdk import BazaarError
+        sent, books = [], list(books)
+
+        class Fake:
+            def __init__(self, url, key):
+                pass
+
+            def clock(self):
+                return {"tick": 1 + len(sent) + 10 * len(books)}
+
+            def book(self):
+                if not books:
+                    raise KeyboardInterrupt
+                b = books.pop(0)
+                if isinstance(b, Exception):
+                    raise b
+                return b
+
+            def match(self, sell, buy, price):
+                if match:
+                    match(sell, buy, price)
+                sent.append((sell, buy, price))
+                return {}
+
+        with patch("bazaar_sdk.Broker", Fake), patch.dict("os.environ", {"BROKER_KEY": "bk_test"}), \
+                patch.object(mb.time, "sleep"), patch("builtins.print"):
+            with self.assertRaises(KeyboardInterrupt):
+                mb.main(list(argv))
+        return sent, BazaarError
+
+    def test_main_survives_unexpected_errors_and_odd_books(self):
+        import http.client
+        odd = {"bench_offers": [{"id": "b1-a0", "give": {"assets": []}, "want": {"cash": "7"}},
+                                {"id": "b1-b0", "give": {"cash": 10.0}},  # sin want
+                                {"id": 5, "give": {"cash": 3}}, None],
+               "offers": [{"id": 1, "give": {}}], "fee_bps": None}
+        sent, _ = self.run_main([http.client.IncompleteRead(b""), ValueError("json raro"), [], odd])
+        self.assertEqual(sent, [("b1-a0", "b1-b0", 8)])
+
+    def test_main_exits_fatal_on_rejected_key(self):
+        from bazaar_sdk import BazaarError
+        with self.assertRaises(SystemExit) as cm:
+            self.run_main([BazaarError("bad_key", "", 401)])
+        self.assertEqual(cm.exception.code, mb.EXIT_FATAL)
+
+    def test_refused_match_does_not_stop_loop_and_heartbeat_is_written(self):
+        import os
+        import tempfile
+        from bazaar_sdk import BazaarError
+
+        def refuse(sell, buy, price):
+            raise BazaarError("not_crossing", "")
+        with tempfile.TemporaryDirectory() as d:
+            hb = os.path.join(d, "hb")
+            sent, _ = self.run_main([book([10], [7]), book([10], [7])], match=refuse, argv=["--heartbeat", hb])
+            self.assertTrue(os.path.exists(hb))
+        self.assertEqual(sent, [])
+
+
+class Robustness(unittest.TestCase):
+    def test_clean_book_keeps_readable_bench_offers_only(self):
+        b = mb.clean_book({"bench_offers": [{"id": "b1-a", "give": {"cash": 0}, "want": {"cash": "9"}},
+                                            {"id": "b1-x", "give": {"cash": 4}, "want": {"cash": 4}},
+                                            {"id": "b1-y", "give": {"cash": 0}, "want": {"cash": 0}},
+                                            {"id": "b1-z", "give": {"cash": "nan?"}},
+                                            {"id": "b1-e", "give": {"cash": 3}, "expires_tick": "12"}]})
+        self.assertEqual([o["id"] for o in b["bench_offers"]], ["b1-a", "b1-e"])
+        self.assertEqual(b["bench_offers"][0]["want"]["cash"], 9)
+        self.assertEqual(b["bench_offers"][1]["expires_tick"], 12)
+        self.assertEqual((b["fee_bps"], b["fee_per_card"], b["offers"]), (0, 0, []))
+
+    def test_learned_shade_is_capped(self):
+        t = mb.Tracker(0.2)
+        t.moves = [1.0] * 20
+        self.assertLessEqual(t.shade, mb.MAX_SHADE)
+        self.assertGreater(t.limit("b1-b0", True, 10), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
