@@ -23,9 +23,12 @@ concesión posible). Todo se mide sobre el tick actual:
   * LATE (≤ 3) y cierre seguro (SAFE_TICKS efectivos) ⇒ aceptar cualquier excedente positivo.
   * Fuera de límite: nunca se acepta; a falta de SPEAK_AT ticks, UNA oferta propia (ancla, sin revelar el límite).
   Solo hay UNA aceptación por tick y equipo: los duelos que comparten deadline se escalonan.
-Duelos de precio + días: omitidos por defecto hasta verificar la fórmula del servidor. Con PARAMS["PLAY_DAYS"] = True
-(opt-in, `duel_runner.py --days`) se juegan con la misma política, valorando cada oferta como precio + utilidad de
-días, exigiendo SIEMPRE precio dentro de límite y enviando `days` en toda oferta propia.
+Duelos de precio + días: omitidos por defecto. Con PARAMS["PLAY_DAYS"] = True (opt-in, `duel_runner.py --days`) se juegan
+con la misma política. Fórmula VERIFICADA con los 37 duelos liquidados de la sesión 3: result = (margen_de_precio ∓
+peso·días) · (1 − decay)^rondas, con «−» para el comprador (cada día le cuesta) y «+» para el vendedor (cada día le suma).
+Se exige SIEMPRE precio dentro de límite Y excedente total > 0; toda oferta propia lleva `days` (el que maximiza NUESTRA
+utilidad neta). Ver «CONVENCIÓN DE SIGNOS» más abajo: antes se sumaban los días al comprador y se aceptaron tratos que el
+servidor liquidó en negativo (5842, 5694, 5762, 5919, 5702, 5728, 5844).
 Opt-in PARAMS["PROFILES"] (`--profiles`) y PARAMS["LOGROLL"] (`--logroll`): ver la sección de perfiles más abajo.
 Opt-in PARAMS["LADDER"]: frente a un rival que no habla, en vez de una sola oferta, una escalera de ofertas que se
 acerca al límite (por defecto desactivada: una sola oferta). PROBE queda absorbido: la contraoferta a un rival
@@ -50,6 +53,7 @@ PARAMS = {
     "MID_ACCEPT_RATIO": 0.15,    # ... en MID
     "LATE_ACCEPT_RATIO": 0.0,    # ... en LATE: cualquier excedente positivo
     "STALLED_ACCEPT_RATIO": 0.05,  # rival estancado en MID tras nuestra contraoferta: aceptar si ≥ esto
+    "HISTORY_MIN": 8,     # tratos cerrados comparables (mismo rol y temas) necesarios para usar el historial al anclar
     "TREND_WINDOW": 4,    # ticks para medir la mejora reciente del rival
     "STRONG_RATE": 2.0,   # mejora ≥ max(2 P/tick, 1,5 % del límite) ⇒ STRONG_IMPROVEMENT
     "STRONG_FRAC": 0.015,
@@ -62,7 +66,12 @@ PARAMS = {
     "PROBE": False,       # rival plantado con tiempo de sobra: UNA contraoferta a mitad de camino antes de aceptar
     "PROFILES": False,    # reglas por perfil del bot de la casa (Plata, Verde, Oro, Luna, Rojo, Noche) y mudos pronto
     "LOGROLL": False,     # días: conceder los que nos cuestan poco a cambio de precio (necesita PLAY_DAYS)
+    "LEARN": False,       # aprendizaje en línea (duel_runner --learn): refinar accept/wait y el ancla con la historia confirmada
 }
+# Ganchos del aprendizaje en línea (duel_learning.py). Con PARAMS["LEARN"] y un hook instalado, la decisión base puede
+# refinarse (accept↔wait, ancla de apertura) SOLO con evidencia suficiente; sin hook o sin evidencia, manda la base.
+HOOKS = {"refine": None, "open_share": None}
+NOTES: dict = {}     # duelo → {action, reason, learned} de la última evaluación (lo lee duel_tree para registrar también las esperas)
 DEPRECATED = {"GOOD_SHARE": "sustituido por EARLY/MID/LATE_ACCEPT_RATIO: comparaba el margen con el 60 % del LÍMITE"}
 
 
@@ -109,26 +118,101 @@ def days_table(duel: dict) -> Optional[list]:
     return None if n is None else [n * d for d in range(11)]
 
 
-def _days_value(duel: dict, days: Optional[int]) -> float:
-    """Utilidad (en primas) del día de entrega, si el duelo negocia días (0 si no hay tabla o día fuera de 0..10)."""
+# ---------------------------------------------------------------- CONVENCIÓN DE SIGNOS (léase antes de tocar nada)
+#
+# El servidor da `your_days_weight` como un PESO POSITIVO por día (p. ej. 4.48) y una frase `days_meaning` que fija su signo:
+#     comprador: "each delivery day costs you this much cash"          → cada día NOS RESTA `peso` primas
+#     vendedor : "each delivery day adds this much cash to your side"  → cada día NOS SUMA `peso` primas
+# La utilidad de días es lineal: ±peso·día. Verificado contra `result` de los 37 duelos liquidados (data en
+# test_duels_days.py): result = (margen_de_precio ∓ peso·días) · (1 − decay)^rondas, con ∓ = − comprador, + vendedor.
+# El peso es la MAGNITUD del efecto en el lado de quien lo recibe; el signo es del rol, no del número.
+#
+#   margen_de_precio = límite − precio   (comprador)        precio − límite   (vendedor)
+#   excedente_total  = margen_de_precio + utilidad_de_días
+#       comprador: margen_de_precio − peso·días        vendedor: margen_de_precio + peso·días
+# Dos restricciones INDEPENDIENTES: (1) el límite de precio del servidor (margen_de_precio ≥ 0, los días nunca lo excusan) y
+# (2) excedente_total > 0 (un trato con total ≤ 0 puntúa 0 o resta: peor que no cerrar). Ninguna sustituye a la otra.
+#
+# Otros formatos (lista/dict por día, escalar sin `days_meaning`) NO están verificados contra el servidor. Regla: si hay
+# `days_meaning`, manda su frase; si no, los valores no negativos son magnitudes con el signo del ROL (nunca premian al
+# comprador), y los valores con algún negativo se leen como utilidad ya firmada («firmado», no verificado, se avisa).
+# Si no se entiende el formato, la utilidad es DESCONOCIDA (None): no se acepta nada hasta entenderla.
+def days_sign(duel: dict) -> tuple:
+    """(signo, fuente): −1 si cada día nos cuesta, +1 si nos suma. La frase del servidor manda sobre el rol."""
+    text = str(duel.get("days_meaning") or "").lower()
+    if "cost" in text:
+        return -1, "days_meaning"
+    if "add" in text:
+        return 1, "days_meaning"
+    return (-1 if duel.get("role") == "buyer" else 1), "rol"
+
+
+def days_utility_table(duel: dict) -> Optional[list]:
+    """Utilidad de días FIRMADA desde nuestro lado, en primas, para los días 0..10 (comprador ≤ 0, vendedor ≥ 0 en el
+    formato verificado). None si el duelo no tiene tabla entendible."""
+    raw = days_table(duel)
+    if raw is None:
+        return None
+    sign, source = days_sign(duel)
+    signed_input = any(v < 0 for v in raw) and source != "days_meaning"
+    return list(raw) if signed_input else [sign * abs(v) for v in raw]
+
+
+def days_format(duel: dict) -> str:
+    """verificado (peso + days_meaning del servidor) | por_rol (magnitudes sin frase) | firmado (no verificado) | desconocido."""
+    raw = days_table(duel)
+    if raw is None:
+        return "desconocido"
+    if days_sign(duel)[1] == "days_meaning":
+        return "verificado"
+    return "firmado" if any(v < 0 for v in raw) else "por_rol"
+
+
+def days_utility(duel: dict, days: Optional[int]) -> float:
+    """Utilidad FIRMADA (primas) del día de entrega para nosotros: comprador −peso·día, vendedor +peso·día. 0 si el duelo no
+    negocia días, `days` es None o el día está fuera de 0..10. Formato ilegible ⇒ 0.0 (el llamador decide con `days_known`)."""
     if days is None:
         return 0.0
-    t = days_table(duel)
+    t = days_utility_table(duel)
     d = _num(days)
     if t is None or d is None or d != int(d) or not 0 <= d <= 10:
         return 0.0
     return t[int(d)]
 
 
-def margin(duel: dict, price: Optional[int], days: Optional[int] = None) -> Optional[float]:
-    """Nuestro excedente en primas si cerramos a `price` (negativo = fuera de límite). None si no hay precio."""
+_days_value = days_utility      # nombre histórico: ahora devuelve la utilidad FIRMADA (antes sumaba al comprador)
+
+
+def days_known(duel: dict) -> bool:
+    return (not _is_days(duel)) or days_utility_table(duel) is not None
+
+
+def price_margin(duel: dict, price: Optional[int]) -> Optional[float]:
+    """Excedente de PRECIO (sin días): límite − precio (comprador) o precio − límite (vendedor). Negativo = fuera de límite."""
     if price is None:
         return None
     lim = float(duel["your_limit"])
-    m = (lim - price) if duel["role"] == "buyer" else (price - lim)
-    if m < 0:
-        return m                      # los días nunca excusan un precio fuera de límite
-    return m + _days_value(duel, days)
+    return (lim - price) if duel["role"] == "buyer" else (price - lim)
+
+
+def margin(duel: dict, price: Optional[int], days: Optional[int] = None) -> Optional[float]:
+    """Excedente TOTAL en primas si cerramos a (`price`, `days`): margen de precio + utilidad firmada de los días.
+    Comprador: (límite − precio) − peso·días. Vendedor: (precio − límite) + peso·días. Fuera del límite de precio devuelve el
+    margen de precio negativo (los días nunca lo excusan). Puede ser negativo con el precio DENTRO de límite."""
+    pm = price_margin(duel, price)
+    if pm is None or pm < 0:
+        return pm
+    return pm + days_utility(duel, days)
+
+
+def expected_result(duel: dict, price: Optional[int], days: Optional[int]) -> Optional[float]:
+    """Lo que el servidor registra en `result` si se cierra ahora: excedente total · (1 − decay)^rondas (calibrado con los
+    duelos liquidados). Un precio fuera de límite resta igual que dentro (el servidor puntúa la diferencia)."""
+    if price is None:
+        return None
+    lim = float(duel["your_limit"])
+    pm = (lim - price) if duel["role"] == "buyer" else (price - lim)
+    return round((pm + days_utility(duel, days)) * (1 - _decay(duel)) ** int(duel.get("rounds") or 0), 2)
 
 
 def rival_trajectory(duel: dict) -> list:
@@ -139,12 +223,13 @@ def rival_trajectory(duel: dict) -> list:
 
 
 def _best_days(duel: dict) -> int:
-    """Nuestro día preferido; en empate (o sin tabla), el último día que propuso el rival: si a nosotros nos da
-    igual, se lo concedemos (la tarta crece cuando cada uno se queda con lo que más valora)."""
+    """Nuestro día de máxima utilidad NETA (firmada): comprador → el más pronto (0), vendedor → el más tardío (10), salvo
+    que la tabla diga otra cosa. En empate (o sin tabla) el día que ya propuso el rival: si a nosotros nos da igual, se lo
+    concedemos (la tarta crece cuando cada uno se queda con lo que más valora)."""
     ro = duel.get("rival_offer") or {}
     rd = _num(ro.get("days"))
     pref = int(rd) if rd is not None and rd == int(rd) and 0 <= rd <= 10 else 0
-    return max(range(11), key=lambda k: (_days_value(duel, k), k == pref, -k))
+    return max(range(11), key=lambda k: (days_utility(duel, k), k == pref, -k))
 
 
 def _is_days(duel: dict) -> bool:
@@ -172,7 +257,10 @@ def analyze(d: dict, tick: int, same_deadline: int = 1) -> dict:
     price, days = ro.get("price"), ro.get("days")
     lim = float(d["your_limit"])
     left = d["deadline_tick"] - tick
+    if _is_days(d) and days is None and price is not None and days_known(d):
+        days = min(range(11), key=lambda k: (days_utility(d, k), k))      # sin día en la oferta: se valora el PEOR (prudente)
     m = margin(d, price, days)
+    pm_only = price_margin(d, price)
     traj = rival_trajectory(d)
     if price is not None and (not traj or traj[-1][1] != price):
         traj = traj + [(tick, price)]  # la oferta en pie manda aunque no venga en un mensaje
@@ -213,6 +301,9 @@ def analyze(d: dict, tick: int, same_deadline: int = 1) -> dict:
     risk = round((surplus or 0) * (PARAMS["RISK_BASE"] + PARAMS["RISK_URGENCY"] / useful), 2) if surplus and surplus > 0 else 0.0
     gain = round(max(0.0, rate or 0.0) * (0 if trend in ("STALLED", "WORSENING") else 1), 2)
     return {"duel": d.get("duel"), "role": d["role"], "own_limit": lim, "rival_price": price, "days": days,
+            "price_margin": pm_only, "days_utility": days_utility(d, days) if days is not None else 0.0,
+            "days_sign": days_sign(d)[0] if _is_days(d) else None, "days_format": days_format(d) if _is_days(d) else None,
+            "days_known": days_known(d), "expected_result": expected_result(d, price, days),
             "surplus_now": surplus, "surplus_ratio": ratio, "ticks_left": left, "phase": phase, "trend": trend,
             "recent_improvement_rate": rate, "ticks_since_change": since, "stalled": stalled,
             "expected_extra_gain": gain, "risk_cost": risk, "strong_rate_threshold": round(strong, 2),
@@ -229,10 +320,15 @@ def decide(d: dict, f: dict) -> tuple[str, str]:
     if m is None:
         return ("open", "sin oferta rival: abrir en la ventana de habla") if left <= PARAMS["SPEAK_AT"] \
             and not f["our_offer_exists"] else ("wait", "sin oferta rival todavía")
-    if m < 0:
+    if not f.get("days_known", True):
+        return "wait", "formato de your_days_weight no entendido: no se acepta sin conocer el coste de los días"
+    if m <= 0:      # dos restricciones independientes: límite de precio del servidor Y excedente total positivo
+        outside = (f.get("price_margin") or 0) < 0
+        what = ("oferta rival fuera de límite de precio" if outside else
+                f"el precio está dentro de límite pero los días ({f.get('days_utility'):+.1f} P) dejan el excedente total en {m:.1f} P")
         if left <= PARAMS["SPEAK_AT"] and not f["our_offer_exists"]:
-            return "open", "oferta rival fuera de límite: una oferta propia (ancla, sin revelar el límite)"
-        return "wait", "oferta rival fuera de nuestro límite: nunca se acepta"
+            return "open", f"{what}: una oferta propia realista (sin revelar el límite)"
+        return "wait", f"{what}: nunca se acepta"
     worth_waiting = f["expected_extra_gain"] > f["risk_cost"]
     if left <= f["effective_safe_ticks"]:
         return "accept", "cierre seguro: ventana final con oferta rentable dentro de límite"
@@ -267,15 +363,66 @@ def decide(d: dict, f: dict) -> tuple[str, str]:
 
 
 def counter_price(f: dict) -> int:
-    """Contraoferta: su precio movido una fracción del excedente a nuestro favor. Nunca nuestro límite."""
-    step = max(1, int(round(PARAMS["COUNTER_FRAC"] * f["surplus_now"])))
+    """Contraoferta: su precio movido una fracción del excedente de PRECIO a nuestro favor (los días se negocian aparte, en
+    el día que elegimos). Nunca nuestro límite."""
+    base = f["price_margin"] if f.get("price_margin") is not None else f["surplus_now"]
+    step = max(1, int(round(PARAMS["COUNTER_FRAC"] * max(base, 0))))
     return int(f["rival_price"] - step) if f["role"] == "buyer" else int(f["rival_price"] + step)
 
 
-def duel_candidates(duels: list, tick: int) -> list:
+def vanish_risk(f: dict) -> float:
+    """Probabilidad HEURÍSTICA (no medida) de perder una buena oferta si NO se acepta en este tick: 1.0 si es el último tick útil;
+    si no, por tendencia del rival (empeora > estancado > mejora) y por cercanía del deadline. Solo ordena aceptaciones."""
+    if f["ticks_left"] <= f["effective_safe_ticks"]:
+        return 1.0
+    base = {"WORSENING": 0.5, "STALLED": 0.2, "UNKNOWN": 0.1}.get(f["trend"], 0.05)
+    return min(0.95, base + 0.5 / max(1, f["ticks_left"]))
+
+
+def accept_priority(f: dict) -> float:
+    """Orden de las aceptaciones candidatas (solo una por tick): lo que PERDEMOS si esa oferta espera un tick = excedente neto ·
+    riesgo de que desaparezca. Una oferta mediocre que vence ya (riesgo 1) solo pasa delante de otra claramente mejor si su
+    excedente supera al de la otra × el riesgo de la otra; el excedente neto desempata. Siempre por encima de las ofertas
+    propias (score 100-300)."""
+    s = max(0.0, f["surplus_now"] or 0.0)
+    # desempate: a igual pérdida esperada, antes el deadline más próximo (luego, más excedente neto)
+    return round(500 + s * vanish_risk(f) + s / 100.0 - f["ticks_left"] / 1000.0, 4)
+
+
+def history_share(history: list, role: str, days: bool) -> Optional[float]:
+    """Mediana del margen de PRECIO capturado / límite en tratos cerrados comparables (mismo rol y mismos temas), o None
+    si hay menos de PARAMS["HISTORY_MIN"] casos: con poca historia no se usa."""
+    shares = []
+    for h in history or []:
+        if h.get("status") != "deal" or h.get("role") != role or ("days" in (h.get("issues") or [])) != days:
+            continue
+        if h.get("price") is None or not h.get("your_limit"):
+            continue
+        pm = price_margin({"role": role, "your_limit": h["your_limit"]}, h["price"])
+        if pm is not None and pm >= 0:
+            shares.append(pm / float(h["your_limit"]))
+    if len(shares) < PARAMS["HISTORY_MIN"]:
+        return None
+    shares.sort()
+    return shares[len(shares) // 2]
+
+
+def realistic_share(d: dict, left: int, history: Optional[list] = None) -> float:
+    """Distancia al límite de nuestra oferta propia sin oferta rival: el ancla ANCHOR (0,30) solo con tiempo de sobra; al
+    acercarse el deadline se acerca al límite (un ancla extrema ya no deja tiempo de cerrar). Con historial suficiente
+    (≥ HISTORY_MIN tratos comparables, mismo rol y temas) no se supera la mediana capturada. Siempre dentro del límite."""
+    share = PARAMS["ANCHOR"] * min(1.0, max(0.25, left / float(max(1, PARAMS["SPEAK_AT"]))))
+    hs = history_share(history, d["role"], _is_days(d))
+    if hs is not None:
+        share = min(share, max(0.05, hs))
+    return round(share, 4)
+
+
+def duel_candidates(duels: list, tick: int, history: Optional[list] = None) -> list:
     """Candidatas para el tick, con el mismo espíritu que las del coordinador: dicts con `type`, `duel`, `score`, `du`
     (excedente), `why` y `facts`. type ∈ {"duel_accept", "duel_say"}. Ordenar por `score`; UNA aceptación por tick.
     Los duelos ya aceptados (pendientes de liquidar) NO deben pasarse: consumirían plazas del escalonado."""
+    NOTES.clear()
     playable = [d for d in duels if d.get("status") == "live" and d.get("deadline_tick") is not None
                 and (PARAMS["PLAY_DAYS"] or not _is_days(d))]
     by_deadline: dict = {}
@@ -286,7 +433,7 @@ def duel_candidates(duels: list, tick: int) -> list:
     for d in playable:
         ro = d.get("rival_offer") or {}
         m = margin(d, ro.get("price"), ro.get("days") if _is_days(d) else None)
-        if m is not None and m >= 0:
+        if m is not None and m > 0 and days_known(d):
             in_limit.append(d["deadline_tick"])
     out = []
     for d in playable:
@@ -309,19 +456,26 @@ def duel_candidates(duels: list, tick: int) -> list:
                 muted["facts"] = f
                 out.append(muted)
             continue
-        if prof and prof != "desconocido" and f["surplus_now"] is not None and f["surplus_now"] >= 0:
-            pm = margin(dict(d, your_days_weight=None), f["rival_price"])
+        if prof and prof != "desconocido" and f["surplus_now"] is not None and f["surplus_now"] > 0:
+            pm = price_margin(d, f["rival_price"])      # reglas por perfil: se comparan sobre el PRECIO; el total ya es > 0
             profile_accept, _ = _profile_rule(
                 prof, d, pm, f["own_limit"], traj, f["recent_improvement_rate"] or 0,
                 f["trend"] == "STALLED", left, safe)
             action, reason = (("accept", f"perfil {prof}: aceptar según política del perfil")
                               if profile_accept else ("wait", f"perfil {prof}: esperar según política del perfil"))
         if (PARAMS["PROBE"] and action == "wait" and f["trend"] == "STALLED" and
-                f["rival_price"] is not None and f["surplus_now"] is not None and f["surplus_now"] >= 0 and
+                f["rival_price"] is not None and f["surplus_now"] is not None and f["surplus_now"] > 0 and
                 d.get("your_offer") is None and left > safe + 2):
             action, reason = "counter", "sondeo opt-in a rival estancado"
+        learned = None
+        if PARAMS["LEARN"] and HOOKS["refine"] is not None and f["surplus_now"] is not None and f["surplus_now"] > 0 \
+                and action in ("accept", "wait"):
+            try:   # un fallo del aprendizaje nunca puede frenar ni cambiar una acción legal
+                action, reason, learned = HOOKS["refine"](d, f, action, reason)
+            except Exception as e:  # noqa: BLE001
+                learned = {"learned": False, "note": f"aprendizaje no disponible ({type(e).__name__})"}
         if (PARAMS["LOGROLL"] and days_duel and f["rival_price"] is not None and
-                f["surplus_now"] is not None and f["surplus_now"] >= 0 and prof != "empeora" and
+                f["surplus_now"] is not None and f["surplus_now"] > 0 and prof != "empeora" and
                 left > safe + 1 and not _our_messages(d)):
             lr = logroll_offer(d, f["rival_price"], f.get("days"))
             if lr and lr["gain"] >= PROFILE_PARAMS["LOGROLL_MIN_GAIN"] + _decay(d) * f["surplus_now"]:
@@ -330,23 +484,36 @@ def duel_candidates(duels: list, tick: int) -> list:
                             "text": _say_text(lr["price"], lr["days"]),
                             "why": f"logroll: día {lr['days']} por precio (+{lr['gain']:.1f} P)", "facts": f})
                 continue
+        if action == "accept" and not ((f["surplus_now"] or 0) > 0 and (f.get("price_margin") or 0) >= 0 and f.get("days_known", True)):
+            action, reason = "wait", "no se acepta: excedente total ≤ 0, precio fuera de límite o coste de días desconocido"
         f.update(action=action, reason=reason)
+        NOTES[d["duel"]] = {"action": action, "reason": reason, "learned": learned}
+        if learned is not None:
+            f["learned"] = learned
         why = (f"duelo {d['duel']} fase={f['phase']} {f['role']} límite {f['own_limit']:.0f} rival {f['rival_price']} "
                f"excedente {f['surplus_now']} ({(f['surplus_ratio'] or 0):.1%}) tendencia {f['trend']} mejora "
                f"{f['recent_improvement_rate']} esperado {f['expected_extra_gain']} riesgo {f['risk_cost']} quedan "
                f"{left} ⇒ {action.upper()}: {reason}")
         if action == "accept":
-            urgent = left <= f["effective_safe_ticks"] + 1 or f["phase"] == "LATE"
-            # urgencia primero (antes el deadline más próximo); entre iguales, más excedente
-            score = (1000 + 10 * max(0, 50 - left) if urgent else 500) + int(f["surplus_now"])
-            out.append({"type": "duel_accept", "duel": d["duel"], "du": f["surplus_now"], "score": score,
+            score = accept_priority(f)      # excedente neto × riesgo de perder la oferta; ver accept_priority
+            out.append({"type": "duel_accept", "duel": d["duel"], "du": f["surplus_now"], "score": score, "learned": learned,
+                        "prediction": {"surplus_total": f["surplus_now"], "price_margin": f["price_margin"],
+                                       "days_utility": f["days_utility"], "expected_result": f["expected_result"],
+                                       "price": f["rival_price"], "days": f["days"], "role": f["role"],
+                                       "deadline_tick": d["deadline_tick"], "vanish_risk": round(vanish_risk(f), 3)},
                         "why": why, "facts": f})
             continue
         ours = None
         if action == "counter":
             ours = counter_price(f)
         elif action == "open":
-            ours = _own_price(d, PARAMS["ANCHOR"])
+            share = realistic_share(d, left, history)
+            if PARAMS["LEARN"] and HOOKS["open_share"] is not None:
+                try:
+                    share, learned = HOOKS["open_share"](d, left, share)
+                except Exception as e:  # noqa: BLE001
+                    learned = {"learned": False, "note": f"aprendizaje no disponible ({type(e).__name__})"}
+            ours = _own_price(d, share)
         elif f["rival_price"] is None and left <= PARAMS["SPEAK_AT"] and PARAMS["LADDER"]:
             # escalera (opt-in) solo frente a rivales mudos: un peldaño por tick, nunca hacia atrás
             mine = (d.get("your_offer") or {}).get("price")
@@ -356,7 +523,7 @@ def duel_candidates(duels: list, tick: int) -> list:
             if below:
                 ours, reason = _own_price(d, below[0]), "escalera opt-in frente a rival mudo"
         if ours is not None:
-            c = {"type": "duel_say", "duel": d["duel"], "price": ours, "du": None, "score": 100,
+            c = {"type": "duel_say", "duel": d["duel"], "price": ours, "du": None, "score": 100, "learned": learned,
                  "text": f"{ours} P y cerramos ahora.", "why": why, "facts": f}
             if days_duel:
                 c["days"] = _best_days(d)
@@ -396,6 +563,7 @@ def rival_profile(duel: dict) -> str:
 def _profile_rule(prof, d, pm, lim, traj, slope, stalled, left, safe):
     """(aceptar, prioridad) para un rival con perfil y oferta dentro de límite."""
     urgent, worsened = left <= safe, slope < 0
+    late = left <= PARAMS["LATE_TICKS"]
     if prof == "empeora":                                     # cada tick de espera cuesta: aceptar ya
         return True, 2000
     if prof == "mixto":                                       # aceptar en cuanto empeora un solo tick
@@ -404,8 +572,8 @@ def _profile_rule(prof, d, pm, lim, traj, slope, stalled, left, safe):
     if prof == "salto":                                       # tras el salto se planta: aceptar ya
         jumped = any(x >= PROFILE_PARAMS["JUMP"] for x in _steps(d, traj))
         return urgent or worsened or jumped, 1500
-    if prof in ("cede", "ciclos"):                            # mesetas de Verde no son plantones: esperar
-        return urgent or worsened or pm >= PROFILE_PARAMS["CEDE_SHARE"] * lim, 0
+    if prof in ("cede", "ciclos"):                            # mesetas de Verde no son plantones: esperar; LATE con rival parado = aceptar
+        return urgent or (late and stalled) or worsened or pm >= PROFILE_PARAMS["CEDE_SHARE"] * lim, 0
     return urgent or pm >= PARAMS["GOOD_SHARE"] * lim or worsened or stalled, 0
 
 
@@ -436,7 +604,7 @@ def _mute_offer(d: dict, tick: int, left: int) -> Optional[dict]:
         return None
     if ours and tick - max(x["tick"] for x in ours) < PROFILE_PARAMS["MUTE_GAP"]:
         return None
-    price = _own_price(d, max(0.0, PARAMS["ANCHOR"] - len(ours) * PROFILE_PARAMS["MUTE_STEP"]))
+    price = _own_price(d, max(0.0, realistic_share(d, left) - len(ours) * PROFILE_PARAMS["MUTE_STEP"]))
     c = {"type": "duel_say", "duel": d["duel"], "price": price, "du": None, "score": 100,
          "text": _say_text(price, None), "why": f" ⇒ rival mudo: oferta {len(ours) + 1}"}
     if _is_days(d):
@@ -458,13 +626,15 @@ def rival_days(d: dict) -> Optional[int]:
 
 
 def logroll_offer(d: dict, price: Optional[int], day_ref: Optional[int]) -> Optional[dict]:
-    """Mejor (precio, día) para nosotros que deja al rival (estimado) igual o mejor que (price, day_ref).
+    """Mejor (precio, día) para nosotros que deja al rival (estimado) mejor o igual que (price, day_ref).
 
-    El rival revela su día preferido en sus ofertas; su utilidad se estima como −s·|día − preferido|, con s la
-    pendiente media de la nuestra × RIVAL_DAY_SCALE. Conceder un día que a nosotros nos cuesta poco se cobra en precio
-    (y al revés). El precio NUNCA sale de nuestro límite. None si falta información (`days_table` no entiende el
-    formato de your_days_weight o el rival no ha revelado día) o si no hay mejora."""
-    u = days_table(d)
+    Todo con utilidad FIRMADA desde nuestro lado: U[k] = days_utility(d, k) (comprador ≤ 0: cada día nos cuesta; vendedor ≥ 0).
+    El rival revela su día preferido en sus ofertas; su utilidad se ESTIMA como −s·|día − preferido| con s la pendiente media
+    de |U| × RIVAL_DAY_SCALE (un prior, no una medición). Si cambiar de `day_ref` a k crece la tarta (joint > 0), el precio
+    compensa al rival e incluso le deja LOGROLL_SHARE de ese crecimiento (colchón si subestimamos al rival). El precio NUNCA
+    sale de nuestro límite y el excedente total resultante debe ser positivo y mayor que el de partida.
+    None si falta información (formato de días no entendido, el rival no ha revelado día) o no hay mejora."""
+    u = days_utility_table(d)
     pref = rival_days(d)
     if u is None or pref is None or price is None:
         return None
@@ -473,25 +643,30 @@ def logroll_offer(d: dict, price: Optional[int], day_ref: Optional[int]) -> Opti
     est = lambda k: -s * abs(k - pref)
     lim = float(d["your_limit"])
     buyer = d["role"] == "buyer"
-    base = (-price if buyer else price) + u[ref]
+    base_total = price_margin(d, price) + u[ref]
     best = None
     for k in range(11):
         if k == ref:
             continue
-        comp = est(ref) - est(k)                  # lo que pierde el rival al pasar de ref a k (negativo = gana)
-        joint = (u[k] - u[ref]) - comp            # lo que crece la tarta (estimado) al cambiar de día
-        if joint > 0:                             # cedemos parte de lo que crece: colchón si subestimamos al rival
-            comp += PROFILE_PARAMS["LOGROLL_SHARE"] * joint
-        # redondeo a favor del rival y 1 P más para que prefiera estrictamente nuestra oferta
-        p = math.ceil(price + comp) + 1 if buyer else math.floor(price - comp) - 1
-        if (buyer and p > lim) or (not buyer and p < lim):
+        d_own = u[k] - u[ref]                    # cambio de NUESTRA utilidad por mover el día (firmado)
+        d_riv = est(k) - est(ref)                # cambio estimado de la utilidad del rival
+        joint = d_own + d_riv                    # crecimiento de la tarta
+        if joint <= 0:
             continue
-        ours = (-p if buyer else p) + u[k]
-        if best is None or ours > best[0]:
-            best = (ours, p, k)
-    if best is None or best[0] - base <= 0:
+        # δ = lo que el rival nos paga de más en precio: compensa su pérdida (−d_riv) menos su parte del crecimiento
+        delta = d_riv - PROFILE_PARAMS["LOGROLL_SHARE"] * joint
+        # comprador: pagamos price − δ; vendedor: cobramos price + δ (δ<0 = ceder precio). Redondeo a favor del rival y +1 P
+        p = math.ceil(price - delta) + 1 if buyer else math.floor(price + delta) - 1
+        if p < 1 or (buyer and p > lim) or (not buyer and p < lim):
+            continue
+        total = price_margin(d, p) + u[k]
+        if total <= 0:
+            continue
+        if best is None or total > best[0]:
+            best = (total, p, k)
+    if best is None or best[0] - base_total <= 0:
         return None
-    return {"price": best[1], "days": best[2], "gain": best[0] - base}
+    return {"price": best[1], "days": best[2], "gain": best[0] - base_total}
 
 
 def _maybe_logroll(d: dict, c: dict) -> None:
