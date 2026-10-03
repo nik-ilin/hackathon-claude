@@ -145,4 +145,12 @@ Novedades:
 
 **Banco de pruebas:** `python3 sim_bench.py [--server quote|limit|libre] [--scenario dificil] [--sessions N]`. Reproduce el libro sintético con compradores y vendedores de límite oculto, sombreado, paciencia, relajación cuadrática y firmes, en 6 escenarios (`dificil` = 75 % firmes y 70 % impacientes, como el test de las ~21:30). Ejecuta el puesto, starter_broker, el broker nuevo y sus variantes, y un oráculo miope de referencia. Son resultados de un modelo, no de la API: sirven para comparar entre mecanismos, no para predecir la nota.
 
+**Comisión.** `market_broker` cotiza el punto medio bajado lo justo para que el comprador pague la comisión. Con `fee_bps > 0`, el punto medio de `starter_broker` puede ser ilegal y el motor lo rechaza. En el banco, 300 bps cuestan un 4–11 % de eficiencia solo por los cruces que dejan de ser legales, y un 13–18 % si además la comisión se descuenta del excedente (`--fee-bps 300 --leak`). Las comisiones no puntúan: **el venue debe ir a 0 bps y 0 P por carta.**
+
+**Frente a `broker_engine.py` / `broker_run.py`** (`sim_bench` los ejecuta tal cual):
+- Sin sondeo, a 0 bps, la eficiencia media es la misma.
+- `market_broker` queda por debajo del puesto en menos sesiones gracias al suelo: 8 % frente a 14 % en el escenario normal.
+- `broker_engine` con `defer` rinde menos que el puesto.
+- El tope de 10 cruces por tick de `broker_run.py` pierde un ~4 % en libros densos.
+
 Pruebas: `python3 -m unittest test_market_broker`.

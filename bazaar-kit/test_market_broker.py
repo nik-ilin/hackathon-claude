@@ -83,6 +83,35 @@ class Floor(unittest.TestCase):
         self.assertEqual(t.limit("b9-b9", True, 12), 15)           # sin historia: prior
 
 
+class Fees(unittest.TestCase):
+    def test_legal_price_lowers_midpoint_until_buyer_can_pay_fee(self):
+        fee = mb.fee_fn({"fee_bps": 300})
+        self.assertEqual(mb.legal_price(10, 20, mb.fee_fn({})), 15)
+        p = mb.legal_price(10, 12, fee)
+        self.assertTrue(10 <= p and p + fee(p) <= 12)
+        self.assertIsNone(mb.legal_price(10, 10, fee))  # ⌈3 % de 10⌉ = 1: ni el ask cabe
+
+    def test_stall_plan_repairs_or_drops_illegal_midpoints(self):
+        b = {**book([12, 10], [10, 10]), "fee_bps": 300}
+        fee, q = mb.fee_fn(b), quotes(b)
+        self.assertEqual(len(sb.bench_plan(b)), 2)  # starter_broker los cruza al punto medio
+        plan = mb.stall_plan(b)
+        self.assertEqual(len(plan), 1)
+        for s, y, p in plan:
+            self.assertTrue(q[s] <= p and p + fee(p) <= q[y])
+
+    def test_smart_plan_is_legal_with_fees(self):
+        r = random.Random(4)
+        for _ in range(200):
+            b = {**random_book(r), "fee_bps": r.choice([0, 100, 300]), "fee_per_card": r.choice([0, 1])}
+            fee, q = mb.fee_fn(b), quotes(b)
+            plan = mb.smart_plan(b, mb.Tracker(0.2), 0)
+            self.assertLessEqual({x for s, y, _ in mb.stall_plan(b) for x in (s, y)},
+                                 {x for m in plan for x in (m.sell, m.buy)})
+            for m in plan:
+                self.assertTrue(q[m.sell] <= m.price and m.price + fee(m.price) <= q[m.buy])
+
+
 class Learning(unittest.TestCase):
     def test_shade_learned_from_relaxed_offers_that_left(self):
         t = mb.Tracker(0.2)
@@ -175,12 +204,25 @@ class Bench(unittest.TestCase):
             self.assertEqual([(m.sell, m.buy, m.price) for m in sim.Stall().plan(b, 0)], sb.bench_plan(b))
 
     def test_new_broker_beats_stall_on_average(self):
-        mechs = {"puesto": lambda r, s: sim.Stall(), "nuevo": lambda r, s: mb.BenchBroker(probe=3)}
+        mechs = {"puesto": lambda r, s, t: sim.Stall(), "nuevo": lambda r, s, t: mb.BenchBroker(probe=3)}
         for server in ("quote", "limit"):
             out = sim.bench(["normal", "dificil", "denso"], 20, 5, server, mechs)
             for name, rows in out.items():
                 self.assertGreaterEqual(rows["nuevo"]["ratio"], 1.0, f"{name} / {server}")
         self.assertGreater(out["dificil"]["nuevo"]["ratio"], 1.1, "con validación por límites el sondeo gana")
+
+    def test_fee_hurts_and_raw_starter_loses_crosses(self):
+        runs = [sim.session(9 + i, sim.SCENARIOS["normal"]) for i in range(10)]
+        eff = lambda mech, fee, leak=False: sum(sim.play(r, mech(), 24, "quote", fee, leak)["gain"] for r in runs)  # noqa: E731
+        self.assertGreater(eff(sim.Stall, 0), eff(sim.Stall, 300))
+        self.assertGreater(eff(sim.Stall, 300), eff(sim.Stall, 300, True))
+        self.assertGreaterEqual(eff(sim.Stall, 300), eff(lambda: sim.Stall(raw=True), 300))
+
+    def test_broker_engine_runs_in_the_bench(self):
+        runs = sim.session(2, sim.SCENARIOS["normal"])
+        r = sim.play(runs, sim.Engine(24), 24)
+        self.assertGreater(r["matches"], 0)
+        self.assertEqual(r["refused"], 0)
 
     def test_play_rejects_invalid_matches(self):
         runs = sim.session(1, sim.SCENARIOS["normal"])

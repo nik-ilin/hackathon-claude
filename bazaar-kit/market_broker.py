@@ -2,7 +2,7 @@
 desaprovecha. Se lanza igual que starter_broker.py, sobre un venue `board`:
 
     BROKER_KEY=bk_... python3 market_broker.py              # modo smart con vigilante y sondeo (por defecto)
-    BROKER_KEY=bk_... python3 market_broker.py --mode stall # idéntico al puesto (bench_plan de starter_broker)
+    BROKER_KEY=bk_... python3 market_broker.py --mode stall # el cruce del puesto (bench_plan), con precio legal
 
 Cada tick y en cada run del libro sintético (`b12` en el id `b12-7`):
 
@@ -14,7 +14,9 @@ Cada tick y en cada run del libro sintético (`b12` en el id `b12-7`):
    ask <= precio <= bid), elige el de mayor excedente estimado (Σ límite comprador − Σ límite vendedor) con el algoritmo
    húngaro. Así aprovecha pares que el emparejamiento ordenado del puesto deja sin cruzar (pujas 10 y 8 contra asks 7 y
    9: el puesto cruza 10×7 y para; aquí 10×9 y 8×7) solo cuando el excedente estimado del par extra es positivo.
-4. **Precio justo:** punto medio de las cotizaciones, como el puesto. El precio no cambia el excedente total.
+4. **Precio justo:** punto medio de las cotizaciones, como el puesto, bajado lo justo para que el comprador pueda pagar
+   la comisión del venue (con fee_bps > 0 el punto medio de starter_broker puede ser ilegal y el motor lo rechaza). El
+   precio no cambia el excedente entre límites; la comisión, si se descuenta, sí: el plan la resta del excedente.
 5. **Orden de envío:** primero las ofertas con más prisa (las que se relajan deprisa o caducan antes).
 
 El **vigilante** vuelve al plan del puesto durante el resto de la sesión si el planificador falla, si un plan cruza menos
@@ -31,6 +33,7 @@ Las funciones son puras (sin red) y las usa tal cual el banco de pruebas `sim_be
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -50,6 +53,32 @@ MIN_MOVES = 4
 
 
 # ---------------------------------------------------------------------------------------------------- lectura del libro
+def fee_fn(book: dict):
+    """Comisión del venue sobre un precio, como la cobra (redondeada hacia arriba), la paga el comprador."""
+    bps, per_card = book.get("fee_bps") or 0, book.get("fee_per_card") or 0
+    return lambda price: math.ceil(bps * price / 10000) + per_card
+
+
+def legal_price(ask: int, bid: int, fee) -> int | None:
+    """Punto medio bajado hasta que el comprador pueda pagar también la comisión (ask <= p, p + fee(p) <= bid).
+    None si ni el ask es legal. Con 0 bps es el punto medio del puesto."""
+    if ask + fee(ask) > bid:
+        return None
+    return next(p for p in range((ask + bid) // 2, ask - 1, -1) if p + fee(p) <= bid)
+
+
+def stall_plan(book: dict) -> list:
+    """El cruce del puesto (bench_plan) con el precio corregido para que sea legal con la comisión del venue: con
+    fee_bps > 0, el punto medio de starter_broker puede ser rechazado. Se quitan los pares sin ningún precio legal."""
+    fee, out = fee_fn(book), []
+    q = {o["id"]: o["want"]["cash"] or o["give"]["cash"] for o in book.get("bench_offers") or []}
+    for sell, buy, _ in bench_plan(book):
+        p = legal_price(q[sell], q[buy], fee)
+        if p is not None:
+            out.append((sell, buy, p))
+    return out
+
+
 def bench_runs(book: dict) -> dict:
     """run -> (asks, bids), cada uno [{id, quote, expires}] en el orden del libro (como lo lee bench_plan)."""
     runs = {}
@@ -186,7 +215,7 @@ def smart_plan(book: dict, tracker: Tracker, tick: int, *, floor: str = "cover",
                probe: int = 0, exclude=frozenset()) -> list:
     """Plan del banco. floor: 'cover' (cruza toda oferta que el puesto cruzaría), 'count' (al menos tantos pares como el
     puesto por run) o 'none' (solo excedente estimado). probe: sondeos fuera de cotización como máximo."""
-    stall_ids = {x for s, b, _ in bench_plan(book) for x in (s, b)}
+    stall_ids, fee = {x for s, b, _ in stall_plan(book) for x in (s, b)}, fee_fn(book)
     plan, probes = [], []
     for run, (asks, bids) in sorted(bench_runs(book).items()):
         asks = [a for a in asks if a["id"] not in exclude]
@@ -199,14 +228,16 @@ def smart_plan(book: dict, tracker: Tracker, tick: int, *, floor: str = "cover",
         ua = [1 / (1 + tracker.ticks_left(a["id"], False, a["quote"], a["expires"], tick)) for a in asks]
         quotes = sorted(x["quote"] for x in asks + bids)
         scale = quotes[len(quotes) // 2] or 1
-        est = [[lb[i] - la[j] + urgency * scale * (ub[i] + ua[j]) for j in range(len(asks))] for i in range(len(bids))]
+        price = [[legal_price(a["quote"], b["quote"], fee) for a in asks] for b in bids]
+        cross = lambda i, j: price[i][j] is not None  # noqa: E731
+        est = [[lb[i] - la[j] - (fee(price[i][j]) if cross(i, j) else 0) + urgency * scale * (ub[i] + ua[j])
+                for j in range(len(asks))] for i in range(len(bids))]  # la comisión sale del excedente
         big = 1 + sum(max(x, 0) for row in est for x in row) + scale * len(bids) * len(asks)
-        cross = lambda i, j: bids[i]["quote"] >= asks[j]["quote"]  # noqa: E731
         if floor == "cover":
             gain = lambda i, j: est[i][j] + big * ((bids[i]["id"] in stall_ids) + (asks[j]["id"] in stall_ids))  # noqa: E731
         elif floor == "count":
-            k = sum(1 for s, b, _ in bench_plan({"bench_offers": [o for o in book["bench_offers"]
-                                                                  if o["id"].split("-")[0] == run]}))
+            k = sum(1 for s, b, _ in stall_plan({**book, "bench_offers": [o for o in book["bench_offers"]
+                                                                          if o["id"].split("-")[0] == run]}))
             gain = (lambda i, j: est[i][j] + big) if k else (lambda i, j: est[i][j])  # noqa: E731
         else:
             gain = lambda i, j: est[i][j]  # noqa: E731
@@ -215,8 +246,7 @@ def smart_plan(book: dict, tracker: Tracker, tick: int, *, floor: str = "cover",
             pairs = []
         used_b, used_a = set(), set()
         for i, j in pairs:
-            bid, ask = bids[i]["quote"], asks[j]["quote"]
-            plan.append(Match(asks[j]["id"], bids[i]["id"], (ask + bid) // 2, "smart", max(ub[i], ua[j]), lb[i] - la[j]))
+            plan.append(Match(asks[j]["id"], bids[i]["id"], price[i][j], "smart", max(ub[i], ua[j]), est[i][j]))
             used_b.add(i)
             used_a.add(j)
         if probe:
@@ -225,12 +255,12 @@ def smart_plan(book: dict, tracker: Tracker, tick: int, *, floor: str = "cover",
             margin = 0.05 * scale
             more = best_matching([bids[i] for i in rb], [asks[j] for j in ra],
                                  lambda x, y: lb[rb[x]] - la[ra[y]] - margin,
-                                 lambda x, y: bids[rb[x]]["quote"] < asks[ra[y]]["quote"])
+                                 lambda x, y: not cross(rb[x], ra[y]))
             for x, y in more:
                 i, j = rb[x], ra[y]
-                price = round((lb[i] + la[j]) / 2)
-                if la[j] <= price <= lb[i]:
-                    probes.append(Match(asks[j]["id"], bids[i]["id"], price, "probe", max(ub[i], ua[j]), lb[i] - la[j]))
+                p = round((lb[i] + la[j]) / 2)
+                if la[j] <= p and p + fee(p) <= lb[i]:
+                    probes.append(Match(asks[j]["id"], bids[i]["id"], p, "probe", max(ub[i], ua[j]), lb[i] - la[j] - fee(p)))
     plan.sort(key=lambda m: (-m.urgency, -m.surplus))
     probes.sort(key=lambda m: -m.surplus)
     return plan + probes[:probe]
@@ -256,7 +286,7 @@ class Watchdog:
 
     def check_plan(self, book: dict, plan: list, floor: str) -> None:
         """El plan cruza al menos tantas ofertas como el puesto y, con suelo 'cover', todas las suyas."""
-        stall = bench_plan(book)
+        stall = stall_plan(book)
         ours = {x for m in plan if m.kind == "smart" for x in (m.sell, m.buy)}
         theirs = {x for s, b, _ in stall for x in (s, b)}
         if len(ours) < len(theirs) or (floor == "cover" and not theirs <= ours):
@@ -308,18 +338,18 @@ class BenchBroker:
         if self.use_watchdog:
             self.dog.check_shade(self.tracker)
         if self.mode == "stall" or (self.use_watchdog and self.dog.mode == "stall"):
-            return [Match(s, b, p, "stall") for s, b, p in bench_plan(view)]
+            return [Match(s, b, p, "stall") for s, b, p in stall_plan(view)]
         try:
             probe = self.probe if self.dog.probing else 0
             plan = smart_plan(view, self.tracker, tick, floor=self.floor, urgency=self.urgency, probe=probe)
         except Exception as e:  # noqa: BLE001 — cualquier fallo del planificador: el puesto, nunca nada
             self.dog.errors += 1
             self.dog.trip(f"error del planificador: {e!r}")
-            return [Match(s, b, p, "stall") for s, b, p in bench_plan(view)]
+            return [Match(s, b, p, "stall") for s, b, p in stall_plan(view)]
         if self.use_watchdog:
             self.dog.check_plan(view, plan, self.floor)
             if self.dog.mode == "stall":
-                return [Match(s, b, p, "stall") for s, b, p in bench_plan(view)]
+                return [Match(s, b, p, "stall") for s, b, p in stall_plan(view)]
         return plan
 
     def feedback(self, m: Match, ok: bool) -> None:
