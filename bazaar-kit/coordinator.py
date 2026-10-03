@@ -473,6 +473,16 @@ def describe(c):
     return f"[{c['module']}] {c['kind']} {what} {('· ' + str(c['price']) + ' P') if c.get('price') else ''} {ids}".strip()
 
 
+WRITE_GAP = 0.6  # s entre escrituras (cada una puede ir seguida de lecturas del propio SDK)
+
+
+def pace(reader, gap=WRITE_GAP):
+    last = getattr(reader, "last", None)
+    if last is not None:
+        time.sleep(max(0.0, gap - (time.monotonic() - last)))
+        reader.last = time.monotonic()
+
+
 def send(reader, led, s, c, args, journal):
     tick = s["clock"]["tick"]
     key = tr.idem_key({**c, "type": c["type"], "tick_scope": c.get("thread")})
@@ -506,6 +516,7 @@ def send(reader, led, s, c, args, journal):
     cc = led.setdefault("class_count", {}).get(cls, [None, 0])
     led["class_count"][cls] = [tick, (cc[1] if cc[0] == tick else 0) + 1]
     save(led)  # antes de escribir en red
+    pace(reader)  # las escrituras también respetan el límite de 5 peticiones por segundo
     ratio, basis = tr.expiry_ratio(led["expiry_obs"] + EXPIRY_EVIDENCE, s["clock"].get("tick_seconds") or 60.0)
     try:
         if c["type"] == "accept":
@@ -694,6 +705,20 @@ def cycle(reader, args, led, journal, execute):
     return sent
 
 
+TRANSIENT = {"rate_limited", "network", "wait_for_tick"}
+
+
+def wait_next_tick(api):
+    for attempt in range(5):
+        try:
+            return api.wait_tick()
+        except BazaarError as e:
+            if e.code not in TRANSIENT:
+                raise
+            time.sleep(1.0 + attempt)
+    time.sleep(5.0)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--execute", action="store_true", help="enviar acciones (por defecto solo análisis)")
@@ -745,9 +770,15 @@ def main():
         me = api.me()
         led = load_ledger(me["id"])
         for i in range(args.ticks if args.execute else 1):
-            cycle(reader, args, led, journal, args.execute)
+            try:
+                cycle(reader, args, led, journal, args.execute)
+            except BazaarError as e:
+                if e.code not in TRANSIENT or not args.execute:
+                    raise
+                print(f"   AVISO {e.code}: {e.message} · se reintenta en el siguiente tick (lo enviado está en el registro)")
+                save(led)
             if i + 1 < args.ticks and args.execute:
-                api.wait_tick()
+                wait_next_tick(api)
     finally:
         if args.execute:
             lock.release()
