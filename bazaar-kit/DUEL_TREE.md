@@ -5,6 +5,7 @@ Este árbol expone en JSON la política **vigente de `main`**. La función
 acciones y explica también cuándo esperar. `duel_runner.py` la usa en modo
 análisis y ejecución; conserva el bloqueo compartido, la cadencia de llamadas,
 la gestión de escrituras ambiguas y el máximo de una aceptación por tick.
+Su cuarto argumento opcional es el diario de acciones ya enviadas.
 
 ```text
 ¿Duelo vigente y queda tiempo?
@@ -44,6 +45,23 @@ lo ignora si no existe. El reloj del API aporta el tick actual y el límite
 `accepts_per_team_per_tick`; el ejecutor limita a una aceptación, tal como
 figura ahora en `/api/clock`.
 
+## Memoria que sí cambia la operación
+
+El snapshot autenticado de `/api/duels` trae los mensajes del rival, sus
+precios por tick, nuestra oferta y el deadline. Es la memoria principal para
+decidir si esperar o cerrar. Además, `duel_runner.py` consulta
+`data/duels_log.jsonl` al decidir: tras reiniciar en el mismo tick no repite
+una oferta enviada ni usa una segunda aceptación. Las entradas de análisis
+(`sent: false`) no consumen ese presupuesto. Un `wait_for_tick` también cuenta
+como cuota agotada.
+
+`duels_fixture_practice.json` y `t15-bazaar-bot/intel/duels_session1.json` del
+PR #3 contienen los mismos 24 duelos, con los mismos mensajes y límites; la
+segunda copia no aporta observaciones adicionales. El archivo
+`data/duel_params.json` contiene parámetros experimentales. No se carga ni
+se reajusta automáticamente: la prueba retrospectiva usa la misma muestra
+con la que se eligieron esos parámetros.
+
 ## Uso por otro agente
 
 ```bash
@@ -51,8 +69,9 @@ python3 duel_runner.py                # análisis: JSON por decisión, sin escri
 python3 duel_runner.py --execute      # sólo con clave y bloqueo exclusivo
 ```
 
-Cada registro tiene `action` (`accept`, `offer`, `wait` o `defer`), `path`,
-`reason` y `feed`. `wait` y `defer` nunca se envían al API. También puede
+Cada registro tiene `action` (`accept`, `offer`, `wait`, `defer` o
+`already_sent`), `path`,
+`reason` y `feed`. `wait`, `defer` y `already_sent` nunca se envían al API. También puede
 importarse `duel_tree.plan` directamente en otro agente. `--feed-file RUTA`
 permite leer un historial JSONL distinto.
 

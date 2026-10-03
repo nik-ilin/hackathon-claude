@@ -31,6 +31,29 @@ class DecisionTreeTests(unittest.TestCase):
             result = duel_tree.plan([{"duel": 1}, {"duel": 2}], 10)
         self.assertEqual([step["action"] for step in result], ["accept", "defer"])
 
+    def test_restart_uses_sent_acceptance_memory_for_same_tick(self):
+        candidates = [dict(type="duel_accept", duel=2, score=10, du=5, why="ok")]
+        actions = [{"tick": 10, "type": "duel_accept", "duel": 1, "sent": True}]
+        with patch.object(duels, "duel_candidates", return_value=candidates):
+            result = duel_tree.plan([{"duel": 2}], 10, actions=actions)
+            next_tick = duel_tree.plan([{"duel": 2}], 11, actions=actions)
+        self.assertEqual(result[0]["action"], "defer")
+        self.assertEqual(next_tick[0]["action"], "accept")
+
+    def test_restart_does_not_repeat_sent_offer(self):
+        candidate = dict(type="duel_say", duel=2, score=10, price=50, why="ok")
+        actions = [{"tick": 10, "type": "duel_say", "duel": 2, "sent": True}]
+        with patch.object(duels, "duel_candidates", return_value=[candidate]):
+            result = duel_tree.plan([{"duel": 2}], 10, actions=actions)
+        self.assertEqual(result[0]["action"], "already_sent")
+
+    def test_dry_run_log_does_not_consume_budget(self):
+        candidate = dict(type="duel_accept", duel=2, score=10, du=5, why="ok")
+        actions = [{"tick": 10, "type": "duel_accept", "duel": 1, "sent": False}]
+        with patch.object(duels, "duel_candidates", return_value=[candidate]):
+            result = duel_tree.plan([{"duel": 2}], 10, actions=actions)
+        self.assertEqual(result[0]["action"], "accept")
+
     def test_days_case_stays_unverified(self):
         duel = {"duel": 3, "status": "live", "deadline_tick": 20,
                 "issues": ["price", "days"]}

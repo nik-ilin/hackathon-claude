@@ -132,9 +132,10 @@ def run(b, execute, feed_file: Path | None = None):
                     log({"tick": c["tick"], "duel": d["duel"], "skipped": "days utility not verified"})
             events = load_feed_events(feed_file)
             accepted = False
-            for step in duel_tree.plan(live, c["tick"], events):
+            for step in duel_tree.plan(live, c["tick"], events,
+                                       load_feed_events(LOG)):
                 cand = step["candidate"]
-                if step["action"] in {"wait", "defer"}:
+                if step["action"] in {"wait", "defer", "already_sent"}:
                     log({"tick": c["tick"], "duel": step["duel"],
                          "action": step["action"], "path": step["path"],
                          "reason": step["reason"], "feed": step["feed"], "sent": False})

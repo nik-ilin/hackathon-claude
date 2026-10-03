@@ -53,7 +53,8 @@ def _waiting_reason(duel: dict, tick: int) -> tuple[str, list[str]]:
     return "rival_may_improve_without_our_message", ["inside_own_limit", "wait_for_better_offer"]
 
 
-def plan(live: list[dict], tick: int, events: Iterable[dict] = ()) -> list[dict]:
+def plan(live: list[dict], tick: int, events: Iterable[dict] = (),
+         actions: Iterable[dict] = ()) -> list[dict]:
     """Una decisión JSON por duelo, con máximo una aceptación ejecutable.
 
     Las acciones y el orden son exactamente los de la política actual. `wait`
@@ -61,8 +62,12 @@ def plan(live: list[dict], tick: int, events: Iterable[dict] = ()) -> list[dict]
     """
     evidence = feed_evidence(events)
     candidates = duels.duel_candidates(live, tick)
+    prior = [a for a in actions if isinstance(a, dict) and a.get("tick") == tick]
+    consumed = lambda a: a.get("sent") is True or a.get("error") == "wait_for_tick"
+    accepted = any(a.get("type") == "duel_accept" and consumed(a) for a in prior)
+    offered = {a.get("duel") for a in prior
+               if a.get("type") == "duel_say" and consumed(a)}
     chosen = set()
-    accepted = False
     out = []
     for candidate in candidates:
         duel_id = candidate["duel"]
@@ -77,6 +82,9 @@ def plan(live: list[dict], tick: int, events: Iterable[dict] = ()) -> list[dict]
             path.append("one_accept_per_team_per_tick")
         elif kind == "duel_accept":
             accepted = True
+        elif duel_id in offered:
+            action = "already_sent"
+            path.append("local_action_memory")
         out.append({"duel": duel_id, "action": action, "candidate": candidate,
                     "path": path, "reason": candidate.get("why", ""),
                     "feed": evidence})
