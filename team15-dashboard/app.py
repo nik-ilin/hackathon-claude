@@ -36,7 +36,7 @@ def esc(value) -> str:
 def fmt(value) -> str:
     if value is None:
         return "—"
-    return f"{value:,.1f}".replace(",", " ").replace(".0", "") if isinstance(value, (float, int)) else esc(value)
+    return f"{value:,.2f}".rstrip("0").rstrip(".").replace(",", " ") if isinstance(value, (float, int)) else esc(value)
 
 
 class Reader:
@@ -153,9 +153,9 @@ h3{font-size:17px;margin:0 0 5px}.sub{color:var(--muted);max-width:70ch;margin:9
 .team-button[aria-pressed=true]{background:var(--blue);font-weight:700;color:var(--teal)}.team-button small{color:var(--muted)}
 .section-head{display:flex;justify-content:space-between;gap:16px;align-items:baseline;margin:3px 0 14px}.section-head p{color:var(--muted);margin:0}
 .rank{display:grid;gap:9px}.trade{display:grid;grid-template-columns:34px minmax(0,1.7fr) 105px 130px;gap:14px;align-items:start;background:var(--surface);border:1px solid var(--line);padding:15px 17px}
-.trade.live{border-left:5px solid var(--teal)}.trade.proposal{border-left:5px solid var(--saffron)}.index{font:700 18px Georgia,serif;color:var(--muted)}
+.trade.live,.trade.public-live{border-left:5px solid var(--teal)}.trade.proposal,.trade.public-proposal{border-left:5px solid var(--saffron)}.index{font:700 18px Georgia,serif;color:var(--muted)}
 .trade p{margin:5px 0;color:var(--muted)}.trade .title{font-weight:700;font-size:17px}.trade .why{color:var(--ink);font-size:13px}
-.tag{display:inline-block;font-size:12px;padding:2px 6px;background:var(--blue);color:var(--teal);margin-left:5px}.proposal .tag{background:#f8edd5;color:#865b02}
+.tag{display:inline-block;font-size:12px;padding:2px 6px;background:var(--blue);color:var(--teal);margin-left:5px}.proposal .tag,.public-proposal .tag{background:#f8edd5;color:#865b02}
 .money{font:700 23px Georgia,serif;white-space:nowrap}.gain{color:var(--teal)}.label{display:block;color:var(--muted);font-size:12px}
 .below{display:grid;grid-template-columns:1fr 1fr;gap:25px;margin-top:30px}.panel{border-top:2px solid var(--ink);padding-top:13px}
 .team-profile{background:var(--blue);border-left:4px solid var(--teal);padding:12px 16px;margin-top:16px}.team-profile p{margin:5px 0}
@@ -173,7 +173,7 @@ def render(data: dict) -> str:
     trades = data.get("trades") or []
     parts = ['<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
              '<title>Team 15 · mesa de trades</title><style>', CSS, '</style></head><body><div class="wrap">',
-             '<header><div><h1>Mesa de trades · Team 15</h1><p class="sub">Qué podemos dar, qué podemos recibir y con quién conviene hablar ahora.</p></div>',
+             '<header><div><h1>Vender duplicados · Team 15</h1><p class="sub">Compradores concretos, precio razonado y valor neto para nuestra colección.</p></div>',
              '<div class="status"><span class="flag ', 'live' if live else 'warn', '">',
              'Equipo conectado' if live else 'Sólo feed público', '</span><span class="clock">Tick ', esc(tick), '</span></div></header>',
              '<div class="summary">',
@@ -184,40 +184,45 @@ def render(data: dict) -> str:
              '</div>']
     for warning in data.get("warnings") or []:
         parts.append('<div class="warning">' + esc(warning) + '</div>')
-    parts += ['<div class="layout"><aside class="sidebar"><h2>Equipos</h2><div class="teams">',
+    parts += ['<div class="layout"><aside class="sidebar"><h2>Compradores</h2><div class="teams">',
               '<button class="team-button" data-team="all" aria-pressed="true">Todos <small>↗</small></button>']
     for team in teams:
         code = team["team"]
         count = len(team["declared_wants"])
         parts.append(f'<button class="team-button" data-team="{esc(code)}" aria-pressed="false">{esc(code)} <small>{count} {"pedido" if count == 1 else "pedidos"}</small></button>')
-    parts += ['</div></aside><main><div class="section-head"><div><h2>Mejores trades ahora</h2>',
-              '<p>Primero ofertas activas; después propuestas que requieren respuesta del otro equipo.</p></div>',
+    parts += ['</div></aside><main><div class="section-head"><div><h2>Ranking de ventas</h2>',
+              '<p>Ventas de duplicados primero; los canjes aparecen como alternativa. Las propuestas requieren respuesta.</p></div>',
               '<label><input id="pause" type="checkbox"> Pausar refresco</label></div><div class="rank">']
     if not trades:
-        parts.append('<div class="empty">No hay trades verificables con margen positivo. Conecta la clave de t15 para valorar nuestra mano; el feed público solo no basta.</div>')
+        parts.append('<div class="empty">No hay compradores o canjes rentables para los duplicados libres en este tick.</div>')
     for i, trade in enumerate(trades, 1):
         code = trade["team"]
         give = ", ".join(trade["give"]) or "—"
         receive = ", ".join(trade["receive"]) or "—"
         offer = f' · oferta #{trade["offer_id"]}' if trade["offer_id"] else ""
+        public_only = trade.get("surplus") is None
+        value_label = "Cobro tras comisión" if trade["kind"] == "public-live" else "Valor neto para t15"
+        value_text = (f'{fmt(trade["rank_signal"])} P' if trade["kind"] == "public-live" else "—") if public_only else f'+{fmt(trade["surplus"])} P'
         parts += [f'<article class="trade {esc(trade["kind"])}" data-team="{esc(code)}">',
                   f'<span class="index">{i}</span><div><div class="title">{esc(trade["action"])} · {esc(code)}<span class="tag">{esc(trade["confidence"])}</span></div>',
                   f'<p>Dar {esc(give)} · recibir {esc(receive)}{esc(offer)}</p>',
                   f'<div class="why">{esc(trade["why"])}</div></div>',
                   f'<div class="price"><span class="label">Precio</span><span class="money">{fmt(trade["price"])} P</span><span class="label">Comisión nuestra: {fmt(trade["fee"])} P</span></div>',
-                  f'<div class="surplus"><span class="label">Valor neto para t15</span><span class="money gain">+{fmt(trade["surplus"])} P</span>',
-                  '<span class="label">No equivale a puntos del ranking</span></div></article>']
-    parts += ['</div>']
+                  f'<div class="surplus"><span class="label">{value_label}</span><span class="money gain">{value_text}</span>',
+                  '<span class="label">Puntos futuros: no calculables</span></div></article>']
+    parts += ['</div><div id="filter-empty" class="empty" hidden>No hay ventas o canjes para este equipo en este tick. Selecciona Todos para ver las demás oportunidades.</div>']
     for team in teams:
         parts.append(f'<section class="team-profile" data-team="{esc(team["team"])}" hidden><h3>{esc(team["team"])} · señales del feed</h3>'
                      f'<p><b>Le vimos:</b> {esc(", ".join(team["observed_held"]) or "Sin evidencia")}</p>'
                      f'<p><b>Pidió:</b> {esc(", ".join(team["declared_wants"]) or "Sin demanda declarada")}</p>'
                      f'<p><b>Ofrece ahora:</b> {esc(", ".join(team["offered"]) or "Sin oferta identificada")}</p></section>')
-    parts += ['</main></div><div class="below"><section class="panel"><h2>Nuestra mano</h2>',
+    parts += ['</main></div><div class="below"><section class="panel"><h2>',
+              'Nuestra mano real' if live else 'Nuestra mano observada en el feed', '</h2>',
               '<table><thead><tr><th>Carta</th><th>Copias</th><th>Libres para dar</th><th>Valor perdido al dar una</th></tr></thead><tbody>']
     for card in data.get("inventory") or []:
         parts.append(f'<tr><td>{esc(card["ref"])}</td><td>{card["copies"]}</td><td>{card["free_surplus"]}</td><td>{fmt(card["loss"])} P</td></tr>')
-    parts += ['</tbody></table></section><section class="panel"><h2>Cartas que nos aportan más</h2>',
+    parts += ['</tbody></table></section><section class="panel"><h2>',
+              'Cartas que nos aportan más' if live else 'Cartas que t15 pidió en el feed', '</h2>',
               '<table><thead><tr><th>Carta que falta</th><th>Valor al recibirla</th><th>Página</th></tr></thead><tbody>']
     for card in (data.get("needs") or [])[:20]:
         parts.append(f'<tr><td>{esc(card["ref"])}</td><td>{fmt(card["gain"])} P</td><td>{esc(card["page"] or "")}</td></tr>')
@@ -235,7 +240,8 @@ def render(data: dict) -> str:
               "const buttons=document.querySelectorAll('.team-button');const rows=document.querySelectorAll('.trade,.team-row,.team-profile');"
               "let selected=sessionStorage.getItem('t15.team')||'all';function choose(t){selected=t;sessionStorage.setItem('t15.team',t);"
               "buttons.forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.team===t)));"
-              "rows.forEach(r=>r.hidden=r.classList.contains('team-profile')?(t==='all'||r.dataset.team!==t):(t!=='all'&&r.dataset.team!==t))}"
+              "rows.forEach(r=>r.hidden=r.classList.contains('team-profile')?(t==='all'||r.dataset.team!==t):(t!=='all'&&r.dataset.team!==t));"
+              "document.getElementById('filter-empty').hidden=t==='all'||!!document.querySelector('.trade:not([hidden])')}"
               "buttons.forEach(b=>b.addEventListener('click',()=>choose(b.dataset.team)));choose(selected);"
               "const pause=document.getElementById('pause');pause.checked=sessionStorage.getItem('t15.pause')==='1';"
               "pause.addEventListener('change',()=>sessionStorage.setItem('t15.pause',pause.checked?'1':'0'));"

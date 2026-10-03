@@ -27,6 +27,82 @@ def _cash_and_assets(me: dict, offers: list[dict]):
     return assets, locked
 
 
+def public_sales(result: dict, catalog: dict, clock: dict, venues: list[dict],
+                 boards: dict[str, list[dict]], rivals: dict,
+                 listing_teams: dict[int, str], market_refs: dict | None = None) -> dict:
+    """Feed-only leads. A public duplicate is evidence, not verified inventory."""
+    own = next((row for row in rivals.get("teams", []) if row.get("team") == "t15"), {})
+    duplicates = set(own.get("duplicates_observed") or [])
+    result["public_only"] = True
+    result["inventory"] = [
+        {"ref": ref, "copies": "≥2" if ref in duplicates else "≥1",
+         "free_surplus": "por verificar" if ref in duplicates else "—", "loss": None}
+        for ref in own.get("held") or []]
+    result["needs"] = [{"ref": ref, "gain": None, "page": None}
+                       for ref in own.get("sought") or []]
+    if not duplicates:
+        result["warnings"].append("El feed no acredita duplicados de t15; no se inventan ventas.")
+        return result
+    book = {c.get("id"): c.get("book") for s in catalog.get("sets", []) for c in s.get("cards", [])}
+    available_venues = {v.get("venue"): v for v in venues
+                        if v.get("status") == "open" and v.get("owner") != "t15"}
+    tick = int(clock.get("tick") or 0)
+    active = set()
+    for venue_id, offers in boards.items():
+        venue = available_venues.get(venue_id)
+        if not venue:
+            continue
+        for offer in offers:
+            team = offer_team(offer, listing_teams)
+            if not team or team == "t15" or offer.get("status") != "open":
+                continue
+            if offer.get("to") not in (None, "t15") or (offer.get("expires_tick") or 10**12) <= tick + 1:
+                continue
+            give, want = offer.get("give") or {}, offer.get("want") or {}
+            refs = list(want.get("types") or []) + [f"card:{r}" for r in want.get("cards") or []]
+            if (type(give.get("cash")) is not int or give["cash"] <= 0 or
+                give.get("assets") or give.get("types") or want.get("assets") or want.get("cash") or
+                len(refs) != 1 or not refs[0].startswith("card:")):
+                continue
+            ref = refs[0][5:]
+            if ref not in duplicates:
+                continue
+            price = give["cash"]
+            try:
+                fee = tr.fee(price, 1, venue)
+            except ValueError:
+                continue
+            active.add((team, ref))
+            result["trades"].append({"kind": "public-live", "team": team,
+                "action": "Posible venta", "give": [ref], "receive": [], "price": price,
+                "fee": fee, "surplus": None, "rank_signal": price - fee,
+                "offer_id": offer.get("id"), "confidence": "Puja activa · duplicado observado",
+                "why": f"{team} ofrece {price} P por {ref} en {venue_id}; cobraríamos {price-fee} P tras comisión."
+                       " El feed vio al menos dos copias nuestras, pero hay que confirmar que una siga libre y cuánto vale para t15."})
+    for rv in rivals.get("teams", []):
+        team = rv.get("team")
+        if not team or team == "t15":
+            continue
+        for ref in rv.get("sought") or []:
+            if ref not in duplicates or (team, ref) in active:
+                continue
+            last_bid = (rv.get("best_bids") or {}).get(ref)
+            fair = ((market_refs or {}).get(ref) or {}).get("fair")
+            anchors = [math.ceil(v) for v in (last_bid, fair, book.get(ref)) if isinstance(v, (int, float)) and v > 0]
+            if not anchors:
+                continue
+            price = max(anchors)
+            result["trades"].append({"kind": "public-proposal", "team": team,
+                "action": "Proponer venta", "give": [ref], "receive": [], "price": price,
+                "fee": 0, "surplus": None, "rank_signal": price,
+                "offer_id": None, "confidence": "Demanda observada · precio orientativo",
+                "why": f"{team} pidió {ref}. {price} P toma como referencia el mayor dato observado:"
+                       f" puja anterior {last_bid or '—'}, mercado {math.ceil(fair) if isinstance(fair,(int,float)) else '—'},"
+                       f" catálogo {book.get(ref) or '—'}. Confirma nuestro valor privado y la aceptación del rival."})
+    result["trades"].sort(key=lambda row: (row["kind"] != "public-live", -row["rank_signal"], row["team"]))
+    return result
+
+
 def build_rank(me: dict, catalog: dict, clock: dict, venues: list[dict], boards: dict[str, list[dict]],
                own_offers: list[dict], rivals: dict, listing_teams: dict[int, str],
                *, reserve: int = 100, margin: float = 2.0,
@@ -49,7 +125,7 @@ def build_rank(me: dict, catalog: dict, clock: dict, venues: list[dict], boards:
     if not me.get("id") or not catalog.get("sets"):
         if not catalog.get("sets"):
             result["warnings"].append("No se pudo leer el catálogo; no se calculan operaciones.")
-        return result
+        return public_sales(result, catalog, clock, venues, boards, rivals, listing_teams, market_refs)
     val = tr.Valuation(catalog, me.get("affinity") or {})
     assets, locked = _cash_and_assets(me, own_offers)
     resources = tr.resources(own_offers, me["id"], [])
@@ -108,6 +184,8 @@ def build_rank(me: dict, catalog: dict, clock: dict, venues: list[dict], boards:
                                        my_assets=assets, locked=locked)
             if p is None:
                 continue
+            if not p.deliver:  # esta mesa prioriza convertir duplicados en efectivo o canjes
+                continue
             try:
                 ev = tr.evaluate(p, val, counts, venue)
             except (ValueError, TypeError, KeyError):
@@ -124,7 +202,7 @@ def build_rank(me: dict, catalog: dict, clock: dict, venues: list[dict], boards:
                 "cash_out": p.cash_out, "fee": ev.fee, "delta_value": ev.dv,
                 "surplus": ev.du, "venue": venue_id, "offer_id": p.offer_id,
                 "expires": p.expires_tick, "confidence": "Oferta activa",
-                "why": f"Oferta #{p.offer_id} visible en {venue_id}; ΔU = efectivo neto {ev.cash:+.1f} P + colección {ev.dv:+.1f} P.",
+                "why": f"Oferta #{p.offer_id} visible en {venue_id}; ΔU = efectivo neto {ev.cash:+g} P + colección {ev.dv:+g} P.",
                 "notes": ev.notes})
 
     # A declared want identifies a counterparty, not a guaranteed sale.
@@ -150,7 +228,7 @@ def build_rank(me: dict, catalog: dict, clock: dict, venues: list[dict], boards:
                 "fee": 0, "delta_value": -loss, "surplus": round(price - loss, 2),
                 "venue": None, "offer_id": None, "expires": None,
                 "confidence": "Demanda declarada; aceptación incierta",
-                "why": f"{team} pidió {ref} en el feed. Suelo nuestro {floor} P = pérdida {loss:.1f} P + margen {margin:.1f} P."
+                "why": f"{team} pidió {ref} en el feed. Suelo nuestro {floor} P: redondeamos hacia arriba la pérdida {loss:g} P + margen {margin:g} P."
                        + (f" Referencia de mercado {fair} P ({ref_market.get('confidence','sin confianza')})." if fair else "")
                        + (f" Última puja observada {market} P; puede haber caducado." if market else " Sin puja vigente verificada."),
                 "notes": []})
@@ -169,9 +247,10 @@ def build_rank(me: dict, catalog: dict, clock: dict, venues: list[dict], boards:
                     "fee": 0, "delta_value": dv, "surplus": dv, "venue": None,
                     "offer_id": None, "expires": None,
                     "confidence": "Intereses observados; aceptación incierta",
-                    "why": f"{team} pidió {give} y ofreció {receive}. Para t15, recibir {receive} y dar {give} cambia la colección {dv:+.1f} P."
+                    "why": f"{team} pidió {give} y ofreció {receive}. Para t15, recibir {receive} y dar {give} cambia la colección {dv:+g} P."
                            " Sin efectivo; la comisión propia sería cero si el rival acepta una propuesta nuestra.",
                     "notes": notes})
         result["trades"].extend(sorted(candidates, key=lambda c: -c["surplus"])[:3])
-    result["trades"].sort(key=lambda t: (t["kind"] != "live", -t["surplus"], t["team"], t["price"]))
+    sale_priority = {"Vender": 0, "Proponer venta": 1, "Canjear": 2, "Proponer canje": 3}
+    result["trades"].sort(key=lambda t: (sale_priority.get(t["action"], 4), -t["surplus"], t["team"], t["price"]))
     return result
