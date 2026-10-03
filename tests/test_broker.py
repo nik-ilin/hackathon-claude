@@ -22,7 +22,7 @@ sys.path.insert(0, ROOT)
 
 from bazaar import broker as B  # noqa: E402
 
-STARTER = "/Users/Cibran/Downloads/bazaar-kit/starter_broker.py"
+STARTER = os.environ.get("STARTER_BROKER", os.path.expanduser("~/Downloads/bazaar-kit/starter_broker.py"))
 SEEDS = 300
 
 
