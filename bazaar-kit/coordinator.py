@@ -824,6 +824,19 @@ def _cards_of(c):
     return out
 
 
+def rival_venue_blocker(c, s):
+    """Bloqueo si la candidata publicaría o aceptaría en el venue de otro equipo: el market-making puntúa el valor
+    creado entre otros equipos en tu venue, así que cada trato nuestro allí suma puntos a un rival (--no-rival-venues).
+    Cancelar sigue permitido: retirar una puja de un venue rival nunca le suma."""
+    if c["type"] not in ("list", "bid", "swap_list", "accept"):
+        return None
+    v = c.get("venue") or "rastro"
+    for x in (s.get("venues") or {}).get("venues", []):
+        if x.get("venue") == v and x.get("owner") not in (s["me"]["id"], "world", None):
+            return f"venue {v} es de {x['owner']}: le sumaría market-making"
+    return None
+
+
 def select(cands, led, tick, max_posts=1):
     """Como mucho una acción por clase de límite y tick (publicar: hasta `max_posts`, acotado por el servidor);
     dentro de cada clase, la de mayor puntuación."""
@@ -1118,6 +1131,11 @@ def cycle(reader, args, led, journal, execute, cache=None):
         print("   AVISO actividad no registrada por este ordenador: " + "; ".join(flags))
     for line in camp_lines:
         print(f"   {line}")
+    if getattr(args, "no_rival_venues", False):
+        for c in cands:
+            why = rival_venue_blocker(c, s)
+            if why:
+                c["blockers"] = list(c.get("blockers") or []) + [why]
     shown = sorted(cands, key=lambda c: (bool(c.get("blockers")), -c.get("score", 0)))
     for c in shown[:args.show]:
         tag = "CANDIDATA " if not c.get("blockers") else "descartada"
@@ -1243,6 +1261,9 @@ def main():
     p.add_argument("--engine", choices=["intel", "basic"], default="intel",
                    help="intel: inteligencia de mercado multi-venue (Day 2); basic: solo El Rastro (anterior)")
     p.add_argument("--duende-venue", default="v02", help="venue de El Duende")
+    p.add_argument("--no-rival-venues", action="store_true",
+                   help="no publicar ni aceptar en venues de otros equipos (les suma market-making); usar con "
+                        "--duende-venue rastro o nuestro venue")
     p.add_argument("--duende-expiry", type=int, default=120, help="expires_in_ticks en El Duende (recomendación oficial)")
     p.add_argument("--max-posts", type=int, default=4, help="publicaciones/cancelaciones por tick (≤ límite del servidor)")
     p.add_argument("--intel", type=int, default=6, help="cartas a detallar en el informe de inteligencia (0 = ninguno)")

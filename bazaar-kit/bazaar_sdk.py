@@ -290,7 +290,7 @@ class Bazaar(_Http):
         if price is not None:
             body["price"] = int(price)
             if days is not None:
-                body["offer"] = {"price": int(price), "days": int(days)}
+                body["days"] = int(days)        # RULES: {"price", "days"} juntos arriba; price sin days ⇒ missing_days
         return self._call("POST", f"/api/duels/{int(duel_id)}/messages", body)
 
     def duel_accept(self, duel_id: int) -> dict:
