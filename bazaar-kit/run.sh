@@ -31,6 +31,7 @@ case "${1:-}" in
   market) shift; exec python3 market_agent.py "$@" ;;
   broker) exec python3 starter_broker.py ;;
   market-broker) shift; exec python3 market_broker.py "$@" ;;
+  duels) shift; exec python3 duel_runner.py "$@" ;;
   agent)  shift; exec python3 starter_agent.py "$@" ;;
   *)      exec python3 starter_agent.py "$@" ;;
 esac

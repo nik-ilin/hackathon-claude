@@ -154,3 +154,6 @@ Novedades:
 - El tope de 10 cruces por tick de `broker_run.py` pierde un ~4 % en libros densos.
 
 Pruebas: `python3 -m unittest test_market_broker`.
+## Campaña de página (Malasaña)
+
+`--page-campaign MAL` (por defecto) prioriza las cartas que faltan de Malasaña: compra ya los asks rentables (la última carta sin regatear), propone trueques dirigidos con duplicados que el dueño quiere, puja dirigida por debajo del techo, cancela búsquedas ya cumplidas o redundantes y no dispersa efectivo en pujas públicas ajenas. Nunca paga por encima del valor privado, nunca usa copias protegidas y nunca desanonimiza alias. El informe `=== MAL COMPLETION CAMPAIGN ===` sale en cada tick.

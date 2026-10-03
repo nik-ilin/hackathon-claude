@@ -54,38 +54,26 @@ def _waiting_reason(duel: dict, tick: int) -> tuple[str, list[str]]:
 
 
 def decision_facts(duel: dict, tick: int, same_deadline: int = 1) -> dict:
-    """Números visibles detrás de la ruta; no cambia la política."""
+    """Números visibles detrás de la ruta (los MISMOS que usa la política: duels.analyze); no cambia la política."""
     deadline = duel.get("deadline_tick")
     facts = {"tick": tick, "deadline_tick": deadline,
              "ticks_left": deadline - tick if isinstance(deadline, (int, float)) else None,
              "issues": duel.get("issues") or ["price"],
              "our_offer_exists": duel.get("your_offer") is not None}
-    if duel.get("role") not in ("buyer", "seller") or duel.get("your_limit") is None:
+    if duel.get("role") not in ("buyer", "seller") or duel.get("your_limit") is None or deadline is None:
         return facts
-    limit = float(duel["your_limit"])
-    offer = duel.get("rival_offer") or {}
-    price = offer.get("price")
-    trajectory = duels.rival_trajectory(duel)
-    slope = 0.0
-    if len(trajectory) >= 2:
-        (t0, p0), (t1, p1) = trajectory[max(0, len(trajectory) - 4)], trajectory[-1]
-        if t1 > t0:
-            slope = ((p0 - p1) if duel["role"] == "buyer" else (p1 - p0)) / (t1 - t0)
-    n = duels.PARAMS["STALL_TICKS"]
-    facts.update(role=duel["role"], own_limit=limit, rival_price=price,
-                 margin=duels.margin(duel, price, offer.get("days")),
-                 good_margin_threshold=duels.PARAMS["GOOD_SHARE"] * limit,
-                 improvement_per_tick=round(slope, 3),
-                 stalled=len(trajectory) >= n and
-                 all(p == trajectory[-1][1] for _, p in trajectory[-n:]),
-                 safe_ticks=duels.PARAMS["SAFE_TICKS"] + max(0, same_deadline - 1),
-                 speak_at_ticks=duels.PARAMS["SPEAK_AT"])
+    f = duels.analyze(duel, tick, same_deadline)
+    action, reason = duels.decide(duel, f)
+    facts.update(f)
+    facts.update(margin=f["surplus_now"], improvement_per_tick=f["recent_improvement_rate"],
+                 speak_at_ticks=duels.PARAMS["SPEAK_AT"], safe_ticks=f["effective_safe_ticks"],
+                 policy_action=action, reason=reason, deprecated=duels.DEPRECATED)
     return facts
 
 
 def _trigger(action: str, facts: dict) -> str:
     if action == "offer":
-        return "opening_window"
+        return "rival_stalled_counter" if facts.get("policy_action") == "counter" else "opening_window"
     if action == "defer":
         return "acceptance_quota_used"
     if action == "already_sent":
@@ -93,16 +81,17 @@ def _trigger(action: str, facts: dict) -> str:
     if action != "accept":
         return "wait"
     left = facts.get("ticks_left")
-    if left is not None and left <= facts.get("safe_ticks", -1):
+    if left is not None and left <= facts.get("effective_safe_ticks", -1):
         return "deadline_safety"
-    margin = facts.get("margin")
-    if margin is not None and margin >= facts.get("good_margin_threshold", float("inf")):
-        return "large_margin"
-    if facts.get("improvement_per_tick", 0) < 0:
+    if facts.get("phase") == "LATE":
+        return "late_phase_positive_deal"
+    if facts.get("trend") == "WORSENING":
         return "rival_offer_worsened"
+    if facts.get("trend") == "UNKNOWN":
+        return "exceptional_first_offer"
     if facts.get("stalled"):
         return "rival_stalled"
-    return "policy_accept"
+    return "surplus_dominates_wait"
 
 
 def plan(live: list[dict], tick: int, events: Iterable[dict] = (),

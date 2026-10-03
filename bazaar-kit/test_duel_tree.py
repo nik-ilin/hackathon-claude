@@ -21,8 +21,10 @@ class DecisionTreeTests(unittest.TestCase):
         live = dict(duel, status="live", messages=[first],
                     rival_offer={"price": first["price"], "days": first.get("days")})
         result = duel_tree.plan([live], first["tick"])
-        self.assertEqual(result[0]["action"], "wait")
-        self.assertIn("wait_for_better_offer", result[0]["path"])
+        # Duelo 7 es una primera oferta «explosiva» (78) que después empeoró (90): tomarla captura el máximo (+42);
+        # la política antigua esperaba y se quedó en +30.
+        self.assertEqual(result[0]["action"], "accept")
+        self.assertEqual(result[0]["trigger"], "exceptional_first_offer")
         self.assertEqual(result[0]["facts"]["own_limit"], 120)
         self.assertEqual(result[0]["facts"]["rival_price"], 78)
         self.assertEqual(result[0]["facts"]["margin"], 42)
@@ -36,7 +38,7 @@ class DecisionTreeTests(unittest.TestCase):
                     rival_offer={"price": first["price"]})
         result = duel_tree.plan([live], first["tick"])[0]
         self.assertEqual(result["action"], "accept")
-        self.assertEqual(result["trigger"], "large_margin")
+        self.assertEqual(result["trigger"], "exceptional_first_offer")  # antes "large_margin" (umbral 60 % del límite)
         self.assertEqual(result["facts"]["margin"], 34)
 
     def test_one_acceptance_per_tick_is_explicit(self):

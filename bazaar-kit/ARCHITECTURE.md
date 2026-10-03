@@ -351,3 +351,25 @@ Parámetros tomados de `t15-bazaar-bot/intel/AUDITORIA_LIDERES.md` (tick ~280) y
 ```
 
 Pruebas: `test_dealer_ladder.py`.
+## CAMPAÑA DE PÁGINA · objetivo actual: Malasaña (`page_campaign.py`, `--page-campaign MAL`)
+
+- **Objetivos:** las cartas de página que FALTAN según el inventario actual. `need = 1` si no la tenemos y 0 si ya la tenemos; nunca se persigue una segunda copia.
+- **Estado:** 3_MISSING → 2_MISSING → 1_MISSING → COMPLETE, con prioridad de ordenación HIGH → VERY HIGH → CRITICAL. La prioridad solo ordena: nunca autoriza ΔU < margen.
+- **Valor no lineal:** `gain_if_bought` se recalcula cada tick con `Valuation.delta` sobre el inventario actual; la última carta incluye el bono de página. La nota de secuencia muestra el valor de cada carta si fuera la última, porque conviene dejar para el final la más disponible.
+- **Rutas** (se elige la de mayor utilidad esperada entre las que tienen ΔU ≥ margen):
+  - ask existente, público o dirigido, por coste total con comisión: la última carta o una muy rentable se compran ya, sin regatear;
+  - trueque existente;
+  - trueque dirigido con un duplicado que el dueño quiere (nunca una copia protegida ni comprometida, nunca la última copia);
+  - puja dirigida que abre por debajo del techo, sin revelarlo.
+- **Dueños:** `owners_ranked(ref)` usa solo equipos identificables (`tNN`) y evidencia publicada o liquidada.
+  - **Alias:** una oferta que un tablón muestra bajo un alias nunca se atribuye a un equipo, aunque el feed exponga otro maker. En venues que anonimizan, lo que solo vemos por el feed tampoco.
+  - **Dueño coleccionista:** su probabilidad de respuesta se multiplica por (1 − P(también la quiere)).
+- **Higiene:**
+  - se cancela toda oferta propia que pida una carta que ya tenemos;
+  - con una ruta inmediata se cancelan las búsquedas pasivas de esa carta;
+  - una vía por carta;
+  - mientras la campaña esté activa no hay pujas públicas para cartas ajenas a ella (foco de capital);
+  - si un cierre de campaña necesita efectivo, rebalanceo por cancelación.
+- **Vendedores:** las aperturas por cartas de la campaña tienen prioridad, y una conversación por una carta de la campaña se negocia en SECURE aunque el vendedor ya esté en OPTIMIZE.
+- **Al completarse:** la campaña termina y `page_guard` protege una copia de cada carta de la página; solo los duplicados son negociables.
+- **Evidencia:** las rutas propuestas se guardan en `market.db` (`interactions`, `campaign:*`).
