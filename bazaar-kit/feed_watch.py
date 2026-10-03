@@ -108,7 +108,7 @@ def report(o: Oracle, *, top: int = 12) -> None:
     print(f"\ncobertura: {c['events']} eventos · ticks {c['tick_min']}-{c['tick_max']} "
           f"({c['ticks']}) · {c['cards']} cartas · {c['settled']} liquidaciones")
 
-    print("\n== SUELOS DE DEALER (lo que acaban aceptando con OTROS equipos) ==")
+    print("\n== PRECIOS OBSERVADOS DE DEALER (cotizaciones y liquidaciones separadas; no suelos garantizados) ==")
     print(f"{'dealer':8} {'carta':8} {'lado':5} {'abre':>5} {'suelo':>6} {'pasos':>12} "
           f"{'n':>3}  conf")
     lines = sorted(o.dealers.values(), key=lambda d: (-d.n, d.dealer, d.ref))

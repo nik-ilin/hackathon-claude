@@ -381,7 +381,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
-    Agent(dry_run=a.dry_run).run()
+    if not a.dry_run:
+        ap.error("Agente alternativo en evaluación: usa --dry-run; para operar usa bazaar-kit/run.sh memory")
+    Agent(dry_run=True).run()
 
 
 if __name__ == "__main__":

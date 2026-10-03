@@ -1,3 +1,5 @@
+> Integración en main: ver [INTEGRATION.md](INTEGRATION.md). `./run.sh memory` conecta el historial al coordinador. Los extremos de cotizaciones no son límites garantizados; una cancelación no demuestra rechazo del precio. Los ejecutores alternativos de duelos están en análisis.
+
 # Oráculo del feed · add-on de inteligencia
 
 Add-on independiente. **No importa ni modifica ningún módulo existente** y
@@ -26,9 +28,9 @@ evento, y `data/` ya está en `.gitignore`.
 ## Qué da, y por qué sirve
 
 El feed publica las negociaciones de **todos** los equipos con los dealers.
-Los dealers aplican las mismas reglas a todo el mundo, así que la escalera que
-otro equipo le saca a Abuela es la que nos va a aplicar a nosotros. Los otros
-17 equipos pagan la cuota horaria de descubrir el suelo; nosotros lo leemos.
+Las negociaciones de otros equipos aportan comparables, no promesas: contexto,
+existencias, conversación y comportamiento pueden cambiar. Usamos precios liquidados
+y cotizaciones como evidencia histórica diferenciada; no como un suelo verdadero.
 
 - **Suelos de dealer** por carta y sentido, con la apertura, los pasos de
   concesión observados y un nivel de confianza

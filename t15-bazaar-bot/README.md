@@ -1,3 +1,5 @@
+> Estado de integración: agente alternativo para evaluación. Los comandos de agente en vivo están desactivados; `python3 -m bazaar.agent --dry-run` permite analizar. El ejecutor operativo es `../bazaar-kit/run.sh memory`. Las auditorías siguientes son históricas, no hechos actuales. Ver [revisión de integración](../bazaar-kit/INTEGRATION.md).
+
 # Team 15 · The Bazaar — agente de negociación y mercado
 
 > *Scores come only from value created, never from activity.*

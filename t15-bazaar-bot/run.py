@@ -11,7 +11,6 @@ import os
 # Ensure the project directory is on the path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from agent import Agent
 
 
 def main():
@@ -22,8 +21,7 @@ def main():
         print("  python3 run.py")
         sys.exit(1)
 
-    agent = Agent()
-    agent.run()
+    raise SystemExit("Ejecutor heredado desactivado en esta integración. Usa bazaar-kit/run.sh memory o python3 -m bazaar.agent --dry-run")
 
 
 if __name__ == "__main__":
