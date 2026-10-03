@@ -12,7 +12,10 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+import tempfile  # noqa: E402
+import bazaar.executor as EX  # noqa: E402
 from bazaar.executor import Executor, Intent, Journal  # noqa: E402
+EX.STATE = tempfile.mkdtemp()  # unit test: ignore the real state/STOP kill switch
 from bazaar.strategy import dealers as SD  # noqa: E402
 from bazaar.values import PROTECTED, ValueBook  # noqa: E402
 
