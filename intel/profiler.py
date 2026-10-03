@@ -44,7 +44,8 @@ def load(db):
 def haggles(q, dealers):
     """One record per persona thread: who, what, prices on both sides, outcome."""
     topics = {tid: json.loads(t) if t else None for tid, t in q("SELECT id, topic FROM threads")}
-    rarity_of_asset = dict(q("SELECT asset_id, rarity FROM provenance WHERE rarity IS NOT NULL"))
+    rarity_of_asset = dict(q("SELECT asset_id, rarity FROM settlement_items WHERE rarity IS NOT NULL"))
+    rarity_of_asset.update(q("SELECT asset_id, rarity FROM provenance WHERE rarity IS NOT NULL"))
     rarity_of_ref = dict(q("SELECT ref, rarity FROM provenance WHERE rarity IS NOT NULL"))
     msgs = collections.defaultdict(list)
     for tid, tick, team, with_, sender, price, final in q(
