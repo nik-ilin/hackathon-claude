@@ -44,7 +44,8 @@ def load(db):
 def haggles(q, dealers):
     """One record per persona thread: who, what, prices on both sides, outcome."""
     topics = {tid: json.loads(t) if t else None for tid, t in q("SELECT id, topic FROM threads")}
-    rarity_of_asset = dict(q("SELECT asset_id, rarity FROM provenance WHERE rarity IS NOT NULL"))
+    rarity_of_asset = dict(q("SELECT asset_id, rarity FROM settlement_items WHERE rarity IS NOT NULL"))
+    rarity_of_asset.update(q("SELECT asset_id, rarity FROM provenance WHERE rarity IS NOT NULL"))
     rarity_of_ref = dict(q("SELECT ref, rarity FROM provenance WHERE rarity IS NOT NULL"))
     msgs = collections.defaultdict(list)
     for tid, tick, team, with_, sender, price, final in q(
@@ -239,8 +240,86 @@ def recommendations(dealer_prof, team_prof, rmed):
     }
 
 
+def self_improve(dealer_prof, team_prof, q):
+    """Close the loop: where we lose points vs the leader, the cheapest lever, and dealer params
+    learned from the best observed deals (opening as a fraction of the dealer's opening, step, cap)."""
+    me = team_prof.get(US, {})
+    lead = min(team_prof.values(), key=lambda p: p["rank"] or 99) if team_prof else {}
+    hist = q("SELECT tick, score, negotiating, market FROM leaderboard WHERE team=? ORDER BY snap_ts DESC LIMIT 13", US)
+    trend = round(hist[0][1] - hist[-1][1], 2) if len(hist) > 1 else None   # ~last hour of snapshots
+    stall = st.mode([p["mkt"] for p in team_prof.values() if p.get("mkt") is not None]) if team_prof else None
+    params = {}
+    for k, v in dealer_prof.items():
+        b, op = v.get("best_by"), v.get("open_median")
+        if b and b.get("team_open") and op:
+            params[k] = {"open_frac": round(b["team_open"] / op, 2), "step": b["step"],
+                         "cap": v["deal_best"], "target_final": v["final_median"]}
+    levers = []
+    if stall is not None and (me.get("mkt") or 0) <= stall:
+        best_mm = max((p["mkt"] for p in team_prof.values() if p.get("mkt") is not None), default=stall)
+        levers.append((round(best_mm - (me.get("mkt") or 0), 2),
+                       f"market-making: 1 trato en nuestro mercado propio (líderes con 1-2 tratos sacan {best_mm} vs puesto {stall})"))
+    if me.get("dealer_capture") is not None and lead.get("dealer_capture"):
+        gap = round((lead.get("neg") or 0) - (me.get("neg") or 0), 2)
+        levers.append((gap, f"negociación: captura con dealers {me['dealer_capture']} vs {lead['dealer_capture']} del líder; "
+                            f"tratos/hilos {me.get('dealer_deals')}/{me.get('dealer_threads')} → abrir más bajo y pasos cortos (ver dealer_params)"))
+    levers.sort(reverse=True)
+    # our live score breakdown (GET /api/me → score): which component actually moves
+    parts = {}
+    row = q("SELECT payload FROM me_snapshots ORDER BY snap_ts DESC LIMIT 1")
+    if row:
+        sc = json.loads(row[0][0]).get("score") or {}
+        parts = {k: sc.get(k) for k in ("neg_points", "duel_points", "ladder_points", "mm_points",
+                                        "bench_efficiency", "bench_points", "negotiating", "market")}
+    return {"gap_to_first": round((lead.get("score") or 0) - (me.get("score") or 0), 2), "score_parts": parts,
+            "our_trend_last_snapshots": trend, "levers": [t for _, t in levers], "dealer_params": params}
+
+
 def render(dealer_prof, team_prof, rmed, recs, q):
     L = [f"# Inteligencia de mercado — {recs['generated']}", ""]
+    si = recs.get("self_improve")
+    if si:
+        L += ["## Bucle de automejora (t15)", "",
+              f"- Distancia al 1º: {si['gap_to_first']} · tendencia últimas instantáneas: {si['our_trend_last_snapshots']}"]
+        if si.get("score_parts"):
+            L.append("- Desglose propio (/api/me): " + " · ".join(f"{k} {v}" for k, v in si["score_parts"].items()))
+        L += [f"- Palanca {i}: {t}" for i, t in enumerate(si["levers"], 1)]
+        L += ["- Parámetros aprendidos del mejor trato por dealer/artículo en `recommendations.json` → `self_improve.dealer_params`", ""]
+    # bad faith: words vs attached price (flag candidates) and bluffs (negotiation hint, never flag)
+    try:
+        import lies
+        mism, bluffs = lies.scan(q)
+        ours = [m for m in mism if m["team"] == US]
+        L += ["## Mala fe de dealers", "",
+              f"- Palabras ≠ precio de la oferta: {len(mism)} en total, {len(ours)} en nuestros hilos "
+              "(candidatos a `POST /api/flags`; solo los nuestros, un flag erróneo resta)"]
+        L += [f"  - msg {m['message_id']} {m['dealer']} t{m['tick']}: oferta {m['price']} vs palabras {m['words']} · «{m['text']}»"
+              for m in ours[:5]]
+        by = {}
+        for b in bluffs:
+            by.setdefault(b["dealer"], []).append(b)
+        L += [f"- Faroles «final» sin `final: true` que luego se mueven: " +
+              ("; ".join(f"{d} ×{len(v)} (p. ej. {v[-1]['said']}→{v[-1]['then']})" for d, v in by.items()) or "ninguno")
+              + " → seguir regateando", ""]
+    except Exception as e:  # analysis only: never break the report
+        L += ["## Mala fe de dealers", "", f"- error: {e!r}", ""]
+    # venue changes over the last ~hour of snapshots (fee cuts, new venues, first trades)
+    vs = q("SELECT tick, payload FROM json_snapshots WHERE kind='venues' ORDER BY snap_ts DESC LIMIT 7")
+    if len(vs) > 1:
+        def vmap(p):
+            return {v["venue"]: v for v in json.loads(p)}
+        new, old = vmap(vs[0][1]), vmap(vs[-1][1])
+        ch = []
+        for vid, v in new.items():
+            o = old.get(vid)
+            if o is None:
+                ch.append(f"{vid} nuevo de {v['owner']} ({v['fee_bps']}bps {v['rules'].get('mechanism')})")
+            else:
+                if o["fee_bps"] != v["fee_bps"]:
+                    ch.append(f"{vid} ({v['owner']}) comisión {o['fee_bps']}→{v['fee_bps']}bps")
+                if (v.get("trades") or 0) > (o.get("trades") or 0):
+                    ch.append(f"{vid} ({v['owner']}) tratos {o.get('trades') or 0}→{v['trades']}")
+        L += [f"## Cambios en mercados (ticks {vs[-1][0]}→{vs[0][0]})", ""] + [f"- {c}" for c in ch or ["sin cambios"]] + [""]
     clock = q("SELECT payload FROM json_snapshots WHERE kind='clock' ORDER BY snap_ts DESC LIMIT 1")
     if clock:
         L.append(f"Ronda: {json.loads(clock[0][0]).get('round_name')}")
@@ -301,6 +380,7 @@ def run_once() -> None:
     dprof = dealer_profiles(hs)
     tprof, rmed = team_profiles(q, hs, dprof)
     recs = recommendations(dprof, tprof, rmed)
+    recs["self_improve"] = self_improve(dprof, tprof, q)
     db.executescript("""
       CREATE TABLE IF NOT EXISTS profile_team (ts REAL, team TEXT, payload TEXT);
       CREATE TABLE IF NOT EXISTS profile_dealer (ts REAL, key TEXT, payload TEXT);""")
