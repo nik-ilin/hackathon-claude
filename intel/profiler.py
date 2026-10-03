@@ -257,7 +257,8 @@ def self_improve(dealer_prof, team_prof, q):
     if stall is not None and (me.get("mkt") or 0) <= stall:
         best_mm = max((p["mkt"] for p in team_prof.values() if p.get("mkt") is not None), default=stall)
         levers.append((round(best_mm - (me.get("mkt") or 0), 2),
-                       f"market-making: 1 trato en nuestro mercado propio (líderes con 1-2 tratos sacan {best_mm} vs puesto {stall})"))
+                       f"market-making: conseguir tratos entre otros equipos en nuestro mercado (hoy "
+                       f"{sum(int(x.rsplit('trades=', 1)[-1] or 0) for x in me.get('venues', []) if 'trades=' in x and x.rsplit('trades=', 1)[-1].isdigit())}; el mejor mercado saca {best_mm} vs puesto {stall})"))
     if me.get("dealer_capture") is not None and lead.get("dealer_capture"):
         gap = round((lead.get("neg") or 0) - (me.get("neg") or 0), 2)
         levers.append((gap, f"negociación: captura con dealers {me['dealer_capture']} vs {lead['dealer_capture']} del líder; "
