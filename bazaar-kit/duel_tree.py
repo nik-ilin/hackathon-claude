@@ -68,6 +68,11 @@ def decision_facts(duel: dict, tick: int, same_deadline: int = 1) -> dict:
     facts.update(margin=f["surplus_now"], improvement_per_tick=f["recent_improvement_rate"],
                  speak_at_ticks=duels.PARAMS["SPEAK_AT"], safe_ticks=f["effective_safe_ticks"],
                  policy_action=action, reason=reason, deprecated=duels.DEPRECATED)
+    if duels.PARAMS.get("PROFILES"):
+        facts["rival_profile"] = duels.rival_profile(duel)
+    if "days" in facts["issues"] and duels.PARAMS.get("PLAY_DAYS"):
+        facts.update(days_weight_format="reconocido" if duels.days_table(duel) else "desconocido_solo_precio",
+                     rival_day=duels.rival_days(duel), days_meaning=duel.get("days_meaning"))
     return facts
 
 
