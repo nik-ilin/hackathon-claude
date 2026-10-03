@@ -247,6 +247,11 @@ header{border:0;border-radius:22px;background:linear-gradient(120deg,#102a35 0%,
 @media(max-width:700px){.wrap{padding:16px 12px 48px}header{padding:23px 20px;border-radius:18px}h1{font-size:32px}.summary{grid-template-columns:1fr 1fr}.metric{padding:14px}.metric strong{font-size:22px}.dashboard-overview{gap:12px}.action-strip{grid-template-columns:1fr}.coverage-grid{grid-template-columns:1fr}.viz-card{padding:16px}.catalog{padding:16px}.catalog-brief{grid-template-columns:1fr 1fr}.bar-row{grid-template-columns:88px 1fr 56px}}
 """
 
+CSS += r"""
+.rank-strategy{margin:0 0 30px;background:linear-gradient(135deg,#102a35,#174f56);border-radius:18px;padding:21px;color:#fff;box-shadow:var(--shadow)}.rank-strategy-head{display:flex;justify-content:space-between;gap:18px;align-items:end;margin-bottom:15px}.rank-strategy h2{margin:0;color:#fff}.rank-strategy .sub{color:#c4dfe0;margin:4px 0 0}.rank-gap{display:flex;gap:9px;flex-wrap:wrap}.rank-pill{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.18);border-radius:10px;padding:9px 12px}.rank-pill strong{display:block;font-size:20px}.rank-pill small{color:#c4dfe0;font-size:11px}.rank-opportunities{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.rank-opportunity{background:#fff;color:var(--ink);border-radius:12px;padding:12px}.rank-opportunity .op-index{color:var(--teal);font-weight:800;font-size:12px}.rank-opportunity b{display:block;margin-top:4px;font-size:14px}.rank-opportunity span{display:block;color:var(--muted);font-size:11px;margin-top:5px}.rank-opportunity .op-gain{color:var(--teal);font-weight:800;font-size:15px}.refresh-diff{display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.14);border-radius:99px;padding:5px 9px;font-size:11px;color:#e3f4f3;margin-left:8px}.freshness-note{margin:-18px 0 22px;color:var(--muted);font-size:11px}@media(max-width:1100px){.rank-opportunities{grid-template-columns:repeat(3,1fr)}}@media(max-width:700px){.rank-strategy{padding:16px}.rank-strategy-head{display:block}.rank-gap{margin:13px 0}.rank-opportunities{grid-template-columns:1fr 1fr}.rank-opportunity:last-child{display:none}}
+
+"""
+
 
 def render_dashboard_overview(data: dict) -> str:
     """Compact decision visualizations using the same live rows as the detailed views."""
@@ -312,6 +317,33 @@ def _group_rows(rows, key):
         groups.setdefault(row.get(key) or 'Sin colección', []).append(row)
     return groups
 
+def render_rank_strategy(data: dict) -> str:
+    leaderboard = (data.get('leaderboard') or {}).get('teams') or []
+    ordered = sorted([r for r in leaderboard if isinstance(r.get('score'), (int, float))], key=lambda r: r.get('score', 0), reverse=True)
+    pos = next((i for i, r in enumerate(ordered, 1) if r.get('team') == 't15'), None)
+    score = next((r.get('score') for r in ordered if r.get('team') == 't15'), data.get('score', {}).get('score'))
+    next_score = ordered[pos - 2].get('score') if pos and pos > 1 else None
+    leader = ordered[0].get('score') if ordered else None
+    gap_next = round(next_score - score, 2) if next_score is not None and score is not None else None
+    gap_leader = round(leader - score, 2) if leader is not None and score is not None else None
+    pills = (f'<span class="rank-pill"><strong>{pos or "—"}</strong><small>posición actual</small></span>'
+             f'<span class="rank-pill"><strong>{fmt(score)}</strong><small>puntos</small></span>'
+             f'<span class="rank-pill"><strong>{fmt(gap_next) if gap_next is not None else "—"}</strong><small>para superar al siguiente</small></span>'
+             f'<span class="rank-pill"><strong>{fmt(gap_leader) if gap_leader is not None else "—"}</strong><small>para alcanzar al líder</small></span>')
+    ops = []
+    for i, trade in enumerate((data.get('trades') or [])[:5], 1):
+        gain = trade.get('surplus')
+        if gain is None:
+            gain = trade.get('rank_signal')
+        gain_text = f'+{fmt(gain)} P' if gain is not None and trade.get('kind') != 'public-live' else f'{fmt(gain)} P' if gain is not None else '—'
+        ops.append(f'<article class="rank-opportunity"><span class="op-index">#{i} · {esc(trade.get("confidence") or "señal")}</span><b>{esc(trade.get("action") or "Acción")} · {esc(trade.get("team") or "")}</b><span>{esc(", ".join(trade.get("give") or []) or "—")} → {esc(", ".join(trade.get("receive") or []) or "—")}</span><span class="op-gain">{gain_text}</span></article>')
+    if not ops:
+        ops.append('<div class="rank-opportunity">Sin oportunidades ordenadas en este tick.</div>')
+    return ('<section class="rank-strategy" id="estrategia-ranking" aria-label="Estrategia para subir posiciones">'
+            '<div class="rank-strategy-head"><div><h2>Ruta para subir posiciones</h2><p class="sub">Prioriza acciones por valor neto observado; los puntos futuros dependen de una fórmula que el servidor no publica.</p></div>'
+            f'<div class="rank-gap">{pills}</div></div><div class="rank-opportunities">{"".join(ops)}</div></section>')
+
+
 
 def strategy_export(data: dict) -> dict:
     """Agent-friendly, evidence-preserving strategy payload."""
@@ -333,6 +365,10 @@ def strategy_export(data: dict) -> dict:
         'gap_to_leader': round(leader_score - current_score, 2) if leader_score is not None and current_score is not None else None,
         'leaderboard_order': [{'team': r.get('team'), 'score': r.get('score')} for r in board_sorted],
     }
+    opportunities = []
+    for i, trade in enumerate((data.get('trades') or [])[:20], 1):
+        gain = trade.get('surplus') if trade.get('surplus') is not None else trade.get('rank_signal')
+        opportunities.append({'rank': i, 'action': trade.get('action'), 'team': trade.get('team'), 'give': trade.get('give') or [], 'receive': trade.get('receive') or [], 'kind': trade.get('kind'), 'confidence': trade.get('confidence'), 'price': trade.get('price'), 'net_or_signal': gain})
     cards = []
     for row in rows:
         minted, print_run = row.get('minted'), row.get('print_run')
@@ -362,9 +398,11 @@ def strategy_export(data: dict) -> dict:
             'sell_floor': row.get('sell_floor'), 'buy_ceiling': row.get('buy_ceiling'),
         })
     return {
-        'schema': 'team15.strategy.v1', 'team': 't15', 'tick': data.get('tick'),
+        'schema': 'team15.strategy.v2', 'schema_compatibility': 'team15.strategy.v1 fields retained', 'team': 't15', 'tick': data.get('tick'),
         'generated_at': data.get('built_at'), 'verified_private_data': bool(data.get('verified')),
+        'freshness': {'snapshot_tick': data.get('tick'), 'built_at': data.get('built_at'), 'status': 'live' if data.get('live') else 'public_only', 'cache_max_age_seconds': 12},
         'ranking': ranking,
+        'opportunities': opportunities,
         'kpis': {
             'published_cards': len(released), 'catalog_cards': len(rows),
             'owned_references': sum(1 for r in released if isinstance(r.get('stock'), int) and r['stock'] > 0),
@@ -569,7 +607,7 @@ def render(data: dict) -> str:
     teams = data.get("teams") or []
     trades = data.get("trades") or []
     parts = ['<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
-             '<title>Team 15 · mesa de trades</title><style>', CSS, '</style></head><body><div class="wrap">',
+             '<title>Team 15 · mesa de trades</title><style>', CSS, '</style></head><body data-tick="' + esc(tick) + '"><div class="wrap">',
              '<header><div><h1>Vender duplicados · Team 15</h1><p class="sub">Compradores concretos, precio razonado y valor neto para nuestra colección.</p></div>',
              '<div class="status"><span class="flag ', 'live' if live else 'warn', '">',
              'Equipo conectado' if live else 'Sólo feed público', '</span><span class="clock">Tick ', esc(tick), '</span></div></header>',
@@ -578,7 +616,7 @@ def render(data: dict) -> str:
              f'<div class="metric"><small>Valor de colección</small><strong>{fmt(data.get("collection_value"))} P</strong></div>',
              f'<div class="metric"><small>{"Puntos propios en vivo" if live else "Puntos del leaderboard (con retraso)"}</small><strong>{fmt(score.get("score"))}</strong></div>',
              f'<div class="metric"><small>Ofertas visibles · venues</small><strong>{data.get("board_count",0)} · {data.get("venue_count",0)}</strong></div>',
-             '</div><nav class="jump"><a href="#guide">Venta rápida</a><a href="#radio">Radio y decisión</a><a href="#ranking">Ranking</a><a href="#catalogo">Catálogo completo</a></nav>', render_dashboard_overview(data)]
+             '</div><nav class="jump"><a href="#guide">Venta rápida</a><a href="#radio">Radio y decisión</a><a href="#ranking">Ranking</a><a href="#estrategia-ranking">Estrategia</a><a href="#catalogo">Catálogo completo</a></nav>', render_dashboard_overview(data), render_rank_strategy(data)]
     for warning in data.get("warnings") or []:
         parts.append('<div class="warning">' + esc(warning) + '</div>')
     guide = data.get("sale_guide") or []
@@ -680,6 +718,9 @@ def render(data: dict) -> str:
               "document.getElementById('filter-empty').hidden=t==='all'||!!document.querySelector('.trade:not([hidden])')}"
               "buttons.forEach(b=>b.addEventListener('click',()=>choose(b.dataset.team)));choose(selected);"
               "const pause=document.getElementById('pause');pause.checked=sessionStorage.getItem('t15.pause')==='1';"
+              "const tickNow=Number(document.body.dataset.tick||0),tickPrev=Number(sessionStorage.getItem('t15.last_tick')||0);"
+              "if(tickPrev&&tickNow>tickPrev){const jump=document.querySelector('.jump');const note=document.createElement('span');note.className='refresh-diff';note.textContent='+'+(tickNow-tickPrev)+' ticks nuevos';jump.appendChild(note)}"
+              "sessionStorage.setItem('t15.last_tick',String(tickNow));"
               "pause.addEventListener('change',()=>sessionStorage.setItem('t15.pause',pause.checked?'1':'0'));",
               CATALOG_JS,
               "setInterval(()=>{if(!pause.checked)location.reload()},15000);",

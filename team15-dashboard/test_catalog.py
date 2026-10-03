@@ -44,7 +44,7 @@ class StrategyExportTest(unittest.TestCase):
         payload = strategy_export({'catalog_rows': rows, 'verified': True, 'buy_capacity': 12,
                                    'tick': 8, 'leaderboard': {'teams': [
                                        {'team': 't15', 'score': 10}, {'team': 't02', 'score': 12}]}})
-        self.assertEqual(payload['schema'], 'team15.strategy.v1')
+        self.assertEqual(payload['schema'], 'team15.strategy.v2')
         self.assertEqual(payload['ranking']['position'], 2)
         self.assertEqual(payload['cards'][0]['holder_count_observed'], 2)
         self.assertEqual(payload['cards'][0]['demand_to_holder_ratio'], .5)

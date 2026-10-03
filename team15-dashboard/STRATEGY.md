@@ -1,6 +1,6 @@
 # Datos y ratios para agentes
 
-El dashboard expone `GET /api/strategy`. La respuesta tiene el esquema `team15.strategy.v1` y está pensada para que un agente pueda ordenar oportunidades sin leer el HTML.
+El dashboard expone `GET /api/strategy`. La respuesta tiene el esquema `team15.strategy.v2` y está pensada para que un agente pueda ordenar oportunidades sin leer el HTML.
 
 ## Señales por carta
 
