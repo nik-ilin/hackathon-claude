@@ -258,6 +258,20 @@ def render(dealer_prof, team_prof, rmed, recs, q):
                 L.append(f"- {t}: {m} ({tag}) · {'; '.join(v) or 'sin mercado propio'}")
         for (tick, payload) in q("SELECT tick, payload FROM events WHERE type LIKE 'bench.%' ORDER BY tick DESC LIMIT 3"):
             L.append(f"- evento tick {tick}: {payload[:160]}")
+    # what is being done with OUR key this round (whatever process does it)
+    rs = q("SELECT max(tick) FROM events WHERE type='round.started'")
+    rt = rs[0][0] if rs and rs[0][0] is not None else 0
+    th = q("SELECT with_, topic, count(*) FROM threads WHERE team=? AND opened_tick>=? GROUP BY 1,2 ORDER BY 3 DESC", US, rt)
+    dl = q("SELECT count(*) FROM settlements WHERE (party_a=? OR party_b=?) AND persona IS NOT NULL AND tick>=?", US, US, rt)[0][0]
+    ven = q("SELECT venue, count(*) FROM offers WHERE maker=? AND tick>=? GROUP BY 1", US, rt)
+    leaders = set(recs["leaders"])
+    lv = {v.get("venue") for t, p in team_prof.items() if t in leaders for v in [] }
+    leader_venues = {x.split()[0] for t in leaders for x in team_prof.get(t, {}).get("venues", [])}
+    L += ["", f"## Actividad con nuestra clave en esta ronda (desde tick {rt})", "",
+          f"- Hilos con dealers: {sum(n for _, _, n in th)} · tratos cerrados con dealers: {dl}"]
+    L += [f"  - {w}: {t} ×{n}" for w, t, n in th[:8]]
+    L += [f"- Ofertas publicadas en {v}: {n}" + ("  ⚠️ mercado de un LÍDER (le suma market-making)" if v in leader_venues else "")
+          for v, n in ven]
     L += ["", "## Precios P2P liquidados (mediana por carta suelta)", ""]
     L += [f"- {r}: {round(v, 1)} P" for r, v in sorted(rmed.items())]
     L += ["", "## A quién vender cada set", ""]
