@@ -41,3 +41,8 @@ python3 -m unittest discover -s bazaar-kit -p 'test_*.py' -q
 ## Integración para agentes
 
 El endpoint `GET /api/strategy` expone el mismo conocimiento que usa la interfaz en JSON: KPIs, ratios globales, campos por carta, decisiones sugeridas y definiciones de cada señal. Consulta [STRATEGY.md](STRATEGY.md) para las fórmulas y límites de interpretación.
+
+
+## Auditoría y siguiente versión
+
+La auditoría extrema y el roadmap de V2 están en [AUDIT_NEXT_VERSION.md](AUDIT_NEXT_VERSION.md).
