@@ -2,6 +2,7 @@
 
     ./run.sh coord                                            # análisis (por defecto): solo lecturas
     ./run.sh coord --execute --ticks 20 --max-spend 80 --reserve 100 --per-card 60
+    ./run.sh coord --deny-teams t12,t13,t14 --deny-margin 15 --pilar-sell SAL:1.25 --pilar-last-copy --ladder-fill
 
 Cada tick: observa (una instantánea) -> reconcilia lo enviado con evidencia del servidor -> genera CANDIDATAS de todos
 los módulos (mercado entre equipos, vendedores, seguridad) -> SELECCIONA como mucho una acción por clase de límite
@@ -31,6 +32,7 @@ import market_agent as ma
 import market_intel as mi
 import negotiation as neg
 import intelligence as intel_mod
+import ladder_plus as lplus
 import page_guard as pg
 import performance as perf
 import team_sale as ts
@@ -244,6 +246,26 @@ def capital_cfg(args):
                             dealer_cash_buffer_mode=getattr(args, "dealer_buffer_mode", "active_max"))
 
 
+def deny_cfg(args):
+    """--deny-teams / --deny-margin (opt-in): (equipos denegados, excedente mínimo o None)."""
+    return lplus.parse_deny_teams(getattr(args, "deny_teams", "")), getattr(args, "deny_margin", None)
+
+
+def pilar_cfg(args):
+    """--pilar-sell SET[:MULT] (opt-in); --ladder-fill sin --pilar-sell vende a Pilar cualquier barrio a precio mediano."""
+    cfg = lplus.parse_pilar_sell(getattr(args, "pilar_sell", None))
+    if cfg is None and getattr(args, "ladder_fill", False):
+        cfg = lplus.PilarConfig(sets=frozenset())
+    if cfg is not None:
+        cfg.from_tick, cfg.until_tick = getattr(args, "pilar_from_tick", None), getattr(args, "pilar_until_tick", None)
+        cfg.dealer = getattr(args, "pilar_id", None) or lplus.PILAR
+        cfg.last_copy = bool(getattr(args, "pilar_last_copy", False))
+        for k, a in (("open_ask", "pilar_open"), ("step", "pilar_step")):
+            if getattr(args, a, None) is not None:
+                setattr(cfg, k, int(getattr(args, a)))
+    return cfg
+
+
 def dealer_context(s, led, journal, val, counts, args):
     """Escalera (tratos que puntúan por vendedor), nuestras negociaciones activas con su máximo ECONÓMICO (sin capital)
     y el mejor máximo económico de una apertura viable (para la liquidez de vendedores cuando no hay ninguna activa)."""
@@ -251,7 +273,12 @@ def dealer_context(s, led, journal, val, counts, args):
     open_dealer = [t for t in s["threads"]["open"] if t.get("kind") == "persona"]
     outcomes = journal.records("outcome")
     names = {n for n in set(s.get("dealers") or {}) | {t.get("with") for t in open_dealer + deal} if n}
-    ladder = {d: neg.qualifying_deals(d, deal, outcomes) for d in sorted(names)}
+    if pilar_cfg(args) is not None:  # opt-in: las ventas negociadas también llenan la escalera de cada vendedor
+        buys = [t for t in deal if not lplus.is_sell_topic(t.get("topic"))]
+        ladder = {d: neg.qualifying_deals(d, buys, [o for o in outcomes if o.get("side") != "sell"]) +
+                  lplus.qualifying_sell_deals(d, deal, outcomes) for d in sorted(names)}
+    else:
+        ladder = {d: neg.qualifying_deals(d, deal, outcomes) for d in sorted(names)}
     mine = set(led["threads"]) | {d.get("thread") for d in journal.records("decision")}
     active = []
     for t in open_dealer:
@@ -283,7 +310,8 @@ def candidates(s, led, args, journal):
     me, val = s["me"], tr.Valuation(s["catalog"], s["me"].get("affinity") or {})
     counts = tr.counts_of(me["assets"])
     ccfg = capital_cfg(args)
-    ladder_on = bool(getattr(args, "dealer_ladder", False))
+    fill = bool(getattr(args, "ladder_fill", False))
+    ladder_on = bool(getattr(args, "dealer_ladder", False)) or fill  # --ladder-fill usa la escalera de #8
     lc = ladder_cfg(args)
     pend_actions = [a for a in led["actions"]
                     if a["type"] in ("accept", "dealer_accept", "team_accept") and a["status"] in ("intent", "ambiguous", "submitted")]
@@ -302,6 +330,8 @@ def candidates(s, led, args, journal):
         target = ccfg.dealer_idle_liquidity
     else:
         target = ca.dealer_liquidity_target([a["econ"] for a in active], min(ccfg.dealer_idle_liquidity, viable))
+    if fill:  # --ladder-fill: la caja del siguiente trato de cada escalera incompleta va antes que las pujas pasivas
+        target = max(target, ladder_fill_need(s, led, args, lc, val, counts, ladder, active))
     dealer_need = max(0, target - exposure)
     market_reserve = args.reserve + dealer_need
     # Capital ANTES de planificar: las pujas abiertas cuentan enteras (obligaciones reales, nunca × P(ejecución)).
@@ -465,7 +495,9 @@ def candidates(s, led, args, journal):
                     blockers.append(f"máximo {ceiling} P frente a precio publicado {lp} P")
                 out.append({"type": "dealer_open", "module": "vendedores", "kind": f"abrir con {did} [{mode}]",
                             "dealer": did, "ref": f"card:{ref}", "price": lp, "ceiling": ceiling,
-                            "du": round(value - (lp or 0), 2), "score": 10 ** 3 + bonus + value - (lp or 0),
+                            "du": round(value - (lp or 0), 2),
+                            "score": 10 ** 3 + bonus + value - (lp or 0) +
+                            (lplus.fill_priority(did, c["rarity"]) if fill and n_q < neg.LADDER_SLOTS else 0),
                             "blockers": blockers, "ladder_mode": mode,
                             "notes": [f"valor {value:.1f} P (con bono si completa página)",
                                       "precio real desconocido hasta su primera oferta",
@@ -514,9 +546,18 @@ def candidates(s, led, args, journal):
         out += sell_open_candidates(s, led, args, lc, val, counts, busy, open_count)
     if getattr(args, "dedupe_bids", False):
         out += dealer_bid_cancels(s, out, open_dealer, mine_threads)
+    # 10. --pilar-sell / --ladder-fill (opt-in): abrir una venta a Pilar; la copia en venta no sale por otra vía.
+    pilar, pilar_report, selling_assets = pilar_candidates(s, led, args, val, counts, ladder)
+    for c in out if selling_assets else ():
+        if c["type"] not in pg.NON_DELIVERING and not str(c["type"]).startswith("dealer_sell") and \
+                set(pg.delivery_of(c, s)[1]) & selling_assets:
+            c["blockers"] = list(c.get("blockers") or []) + ["esa copia está en una conversación de venta a un vendedor"]
+    out += pilar
     out = dedupe_cancels(out)
     pl["capital"], pl["dealer_diag"], pl["open_bids"] = view.as_dict(), diag, scored
     pl["ladder"] = {d: len(x) for d, x in ladder.items()}
+    if pilar_report is not None:
+        pl["pilar"] = pilar_report
     return out, pl, exposure
 
 
@@ -524,6 +565,8 @@ def ladder_cfg(args):
     """Parámetros de la escalera (--dealer-ladder / --dealer-sell-dups); los de vendedores nuevos de nivel 3 y los de
     venta se ajustan por línea de órdenes."""
     lc = neg.LadderConfig()
+    if getattr(args, "ladder_fill", False):
+        lplus.top3_ladder_config(lc)  # --ladder-fill: aperturas de ESTRATEGIA_TOP3 (los flags --ladder-* mandan)
     for k in ("new_open", "new_gap_frac", "new_counters", "new_ticks", "new_max_frac", "sell_margin", "sell_open"):
         v = getattr(args, f"ladder_{k}", None)
         if v is not None:
@@ -587,7 +630,9 @@ def sell_thread_candidates(s, t, args, lc, val, counts):
     """Siguiente paso en una conversación de VENTA nuestra a un vendedor."""
     tick, did = s["clock"]["tick"], t["with"]
     base = {"module": "vendedores", "thread": t["id"], "dealer": did, "blockers": []}
-    if not getattr(args, "dealer_sell_dups", False):
+    pc = pilar_cfg(args)
+    pilar = pc is not None and did == pc.dealer  # --pilar-sell: escalera propia de Pilar (pedir alto, bajar de 2 en 2)
+    if not pilar and not getattr(args, "dealer_sell_dups", False):
         return [dict(base, type="info", kind=f"{did}: venta", ref=str(t.get("topic")), du=0, score=-1,
                      blockers=["conversación de venta: requiere --dealer-sell-dups"])]
     ids = neg.sell_assets_of(t.get("topic"))
@@ -596,15 +641,25 @@ def sell_thread_candidates(s, t, args, lc, val, counts):
         return [dict(base, type="dealer_close", kind=f"{did}: cerrar venta", ref=str(ids), du=0, score=10 ** 5,
                      reason="la copia ya no está en nuestras manos")]
     asset_id, ref = ids[0], mine[ids[0]]["ref"]
-    loss, floor = sell_floor(val, counts, ref, lc)
     st = neg.state_from_thread(t, did, tick, neg.Config(), side="sell")
-    d = neg.decide_ladder_sell(st, lc, floor, lc.sell_ticks - neg.conversation_ticks_used(t, tick), args.mode)
+    if pilar:
+        loss, floor = pilar_floor(val, counts, ref)
+        d = lplus.decide_sell(st, floor, lplus.first_ask(floor, pc), pc,
+                              pc.max_ticks - neg.conversation_ticks_used(t, tick))
+    else:
+        loss, floor = sell_floor(val, counts, ref, lc)
+        d = neg.decide_ladder_sell(st, lc, floor, lc.sell_ticks - neg.conversation_ticks_used(t, tick), args.mode)
     kind = {"counter": "dealer_sell_counter", "accept": "dealer_sell_accept", "abandon": "dealer_close"}.get(d.action)
     if not kind:
         return []
     c = dict(base, type=kind, kind=f"{did}: venta {d.action}", item=f"card:{ref}", ref=f"card:{ref}", price=d.price,
              offer=d.offer_id, opening=st.opening, floor=floor, du=round((d.price or 0) - loss, 2), score=10 ** 5,
              reason=d.reason, turns=st.turns, side="sell", notes=[f"venta escalera, suelo {floor} P"])
+    if pilar:
+        c["notes"] = [f"--pilar-sell: suelo = valor privado {loss:.1f} P → {floor} P; primera petición "
+                      f"{lplus.first_ask(floor, pc)} P, pasos de {pc.step} P"]
+        if kind == "dealer_sell_accept":
+            c["score"] = 3 * 10 ** 5  # cerrar una venta que llena la escalera de nivel 3 antes que otras aceptaciones
     if kind != "dealer_close":
         c["asset"] = asset_id  # page_guard la revisa: entrega esta copia
     if kind == "dealer_sell_accept":
@@ -612,6 +667,118 @@ def sell_thread_candidates(s, t, args, lc, val, counts):
         c["blockers"] = neg.sell_offer_problems(o, dealer=did, asset_id=asset_id, floor=floor)
         c["cash"] = d.price
     return [c]
+
+
+def pilar_floor(val, counts, ref):
+    """--pilar-sell: suelo = valor privado de la copia que perdemos (aceptar su final si lo cubre)."""
+    loss = -val.delta(counts, Counter(), Counter({ref: 1}))[0]
+    return loss, max(1, math.ceil(loss - 1e-9))
+
+
+def pilar_candidates(s, led, args, val, counts, ladder):
+    """--pilar-sell: abrir UNA venta a Pilar (una carta por hilo) mientras falten tratos negociados con ella; los hilos
+    abiertos los lleva sell_thread_candidates. Devuelve (candidatas, informe, activos en ventas abiertas)."""
+    cfg = pilar_cfg(args)
+    if cfg is None:
+        return [], None, set()
+    did, tick, me = cfg.dealer, s["clock"]["tick"], s["me"]
+    dealer = (s.get("dealers") or {}).get(did)
+    rows = [r for r in ((dealer or {}).get("menu") or {}).get("buys", []) if "rarity" in r]
+    rarities = {r["rarity"] for r in rows} or set(lplus.PILAR_RARITIES)
+    n_q = len(ladder.get(did, []))
+    allow = {x.strip().upper() for x in str(getattr(args, "allow_last_copy", "") or "").split(",") if x.strip()}
+    by_id = {a["id"]: a for a in me["assets"] if a.get("kind") == "card"}
+    selling = {a for t in s["threads"]["open"] if t.get("kind") == "persona" for a in neg.sell_assets_of(t.get("topic"))}
+    busy_refs = {by_id[a]["ref"] for a in selling if a in by_id}
+    report = {"dealer": did, "qualifying": n_q, "target": cfg.target_deals, "sets": sorted(cfg.sets) or ["*"],
+              "mult": cfg.mult, "open": cfg.open_ask, "step": cfg.step, "window": [cfg.from_tick, cfg.until_tick],
+              "next": None}
+    blockers = []
+    if not dealer_available(s, did):
+        blockers.append(f"{did} no está en juego o no está desbloqueado")
+    if n_q >= cfg.target_deals:
+        blockers.append(f"objetivo cumplido: {n_q} tratos negociados con {did}")
+    if not cfg.in_window(tick):
+        blockers.append(f"fuera de la ventana --pilar-from-tick/--pilar-until-tick ({cfg.from_tick}-{cfg.until_tick})")
+    if any(t.get("with") == did for t in s["threads"]["open"]):
+        blockers.append(f"ya hay una conversación abierta con {did}")
+    if led["blocked"].get(did, 0) > tick:
+        blockers.append(f"{did} bloqueado hasta el tick {led['blocked'][did]} (cupo o enfriamiento)")
+    if len(s["threads"]["open"]) >= s["clock"]["limits"].get("max_open_threads_per_team", 6):
+        blockers.append("sin conversaciones libres")
+    committed = committed_ids(s, led)
+    tried = led.get("pilar_sell") or {}
+    best = None
+    for ref in sorted(counts):
+        card = val.cards.get(ref) or {}
+        if card.get("rarity") not in rarities or card.get("hidden") or not cfg.covers(card.get("set", "")):
+            continue
+        if ref in busy_refs:
+            continue  # un hilo por carta
+        if counts[ref] < 2 and not lplus.last_copy_allowed(ref.upper(), card.get("set", "").upper(), allow, cfg):
+            continue  # última copia: solo con --pilar-last-copy o --allow-last-copy REF|SET
+        free = [i for i in pg.tradeable_assets(ref, counts, s["catalog"], me["assets"], committed)
+                if i not in selling and tick - int(tried.get(str(i), -10 ** 9)) >= 30]
+        if not free:
+            continue  # page_guard: la copia mantiene una página completa (o ya está comprometida)
+        loss, floor = pilar_floor(val, counts, ref)
+        exp = lplus.expected_price(card, cfg, next((r for r in rows if r["rarity"] == card.get("rarity")), None))
+        if exp < floor:
+            continue
+        if best is None or exp - loss > best[0]:
+            best = (exp - loss, ref, free[-1], floor, exp, loss)
+    out = []
+    if best is None:
+        blockers.append("ninguna copia vendible: barrio/rareza fuera del modo, última copia sin permiso, página "
+                        "completa o precio esperado por debajo de nuestro valor privado")
+    else:
+        surplus, ref, aid, floor, exp, loss = best
+        report["next"] = {"ref": ref, "asset": aid, "floor": floor, "expected": exp,
+                          "first_ask": lplus.first_ask(floor, cfg)}
+        bonus = 5000 if n_q == neg.LADDER_SLOTS - 1 else 2000
+        out.append({"type": "dealer_sell_open", "module": "vendedores", "kind": f"vender a {did}", "dealer": did,
+                    "ref": f"card:{ref}", "asset": aid, "price": exp, "floor": floor, "du": round(surplus, 2),
+                    "score": 10 ** 3 + bonus + surplus, "blockers": blockers, "ladder_mode": neg.ladder_mode(n_q),
+                    "notes": [f"--pilar-sell: esperado ~{exp} P; pediremos {lplus.first_ask(floor, cfg)} P y bajaremos "
+                              f"de {cfg.step} en {cfg.step}; mínimo {floor} P (valor privado {loss:.1f} P)",
+                              f"escalera {did} {n_q}/{cfg.target_deals}: cuenta solo si cobramos más que su apertura"]})
+    report["blockers"] = blockers
+    return out, report, selling
+
+
+def ladder_fill_need(s, led, args, lc, val, counts, ladder, active):
+    """--ladder-fill: caja para el siguiente trato de cada vendedor de COMPRA con la escalera incompleta y sin
+    conversación activa (las activas ya cuentan con su máximo). Así las pujas pasivas no se la comen."""
+    tick, need = s["clock"]["tick"], 0
+    busy = {a["thread"].get("with") for a in active}
+    for did, dealer in (s.get("dealers") or {}).items():
+        if did in busy or len(ladder.get(did, [])) >= neg.LADDER_SLOTS or led["blocked"].get(did, 0) > tick \
+                or not dealer_available(s, did):
+            continue
+        best = None
+        for row in (dealer.get("menu") or {}).get("sells", []):
+            list_p = row.get("list_price")
+            if not list_p or lplus.fill_priority(did, row.get("rarity")) <= 0:
+                continue
+            for ref, c in val.cards.items():
+                if c["released"] and c["rarity"] == row["rarity"] and not counts.get(ref) and not c.get("hidden"):
+                    econ = math.floor(min(args.per_card, val.next_copy(counts, ref) - args.margin))
+                    if econ >= list_p * neg.ladder_profile(did, lc, args.mode).min_viable_frac:
+                        best = min(econ, list_p) if best is None else min(best, econ, list_p)
+        need += best or 0
+    return need
+
+
+def pilar_line(r):
+    line = (f"{r['dealer'].upper()} VENTA · escalera {r['qualifying']}/{r['target']} · barrios {','.join(r['sets'])} "
+            f"× {r['mult']} · pedir {r['open']} bajando {r['step']} · ventana "
+            f"{r['window'][0] if r['window'][0] is not None else '—'}-{r['window'][1] if r['window'][1] is not None else '—'}")
+    if r.get("next"):
+        n = r["next"]
+        line += f" · siguiente {n['ref']} (copia {n['asset']}): pedir {n['first_ask']}, mínimo {n['floor']}"
+    if r.get("blockers"):
+        line += " · no abre: " + "; ".join(r["blockers"])
+    return line
 
 
 def dealer_bid_cancels(s, cands, open_dealer, mine_threads):
@@ -925,6 +1092,8 @@ def campaign_candidates(s, led, args, pl, execute):
                 blockers.append("ya hay una negociación activa por esa carta")
             if o.get("asset") in busy_assets:
                 blockers.append("esa copia ya está comprometida")
+            blockers += lplus.deny_blockers({"type": "team_open", "team": o["team"], "du": o.get("du_est")},
+                                            *deny_cfg(args))  # --deny-teams: antes de ocupar un hueco
             need = o.get("first_cash", 0)
             if need > min(camp_left, pl["free_cash"]):
                 blockers.append(f"sin efectivo libre para la primera propuesta ({need} P; libre {pl['free_cash']} P, "
@@ -1135,6 +1304,7 @@ def send(reader, led, s, c, args, journal):
             resp = reader.api.open_thread(c["dealer"], topic={"sell": {"assets": [c["asset"]]}})
             rec["thread"] = resp.get("id")
             led["threads"].append(resp.get("id"))
+            led.setdefault("pilar_sell", {})[str(c["asset"])] = tick  # no reabrir la misma copia enseguida
         elif c["type"] in ("dealer_sell_counter", "dealer_sell_accept"):
             if c["type"] == "dealer_sell_counter":
                 resp = reader.api.say(c["thread"], neg.ladder_message(c["dealer"], c.get("turns", 0), c["price"],
@@ -1273,6 +1443,12 @@ def cycle(reader, args, led, journal, execute, cache=None):
     cands, pl, exposure = candidates(s, led, args, journal)
     camp_cands, camp_lines = campaign_candidates(s, led, args, pl, execute)
     cands += camp_cands
+    deny, deny_margin = deny_cfg(args)
+    if deny:  # --deny-teams (opt-in): ni dirigidas a, ni aceptadas de, ni campañas con esos equipos
+        n = lplus.apply_deny(cands, deny, deny_margin)
+        if n:
+            print(f"   DENY_TEAMS: {n} candidata(s) con {','.join(sorted(deny))} bloqueadas"
+                  + (f" (excepción: excedente ≥ {deny_margin} P)" if deny_margin is not None else ""))
     committed = committed_ids(s, led)
     blocked = pg.apply_guard(cands, s, committed)  # antes de ordenar: inviables, fuera de la selección
     if blocked:
@@ -1308,6 +1484,8 @@ def cycle(reader, args, led, journal, execute, cache=None):
         print("   " + ts.report_block(rep_).replace("\n", "\n   "))
     for line in dealer_lines(pl.get("dealer_diag") or {}):
         print(f"   {line}")
+    if pl.get("pilar"):
+        print("   " + pilar_line(pl["pilar"]))
     performance = perf.realized(led["actions"], {d: [None] * n for d, n in (pl.get("ladder") or {}).items()},
                                 sum(1 for o in s["offers"].get("offers", []) if o.get("maker") == team
                                     and o.get("status") == "open"))
@@ -1508,9 +1686,33 @@ def main():
                    help="venta a vendedores: excedente mínimo sobre el valor perdido (1.0 P)")
     g.add_argument("--ladder-sell-open", dest="ladder_sell_open", type=int, default=None,
                    help="venta a vendedores: primera petición (10 P)")
+    g = p.add_argument_group("contrapartes, Pilar y escalera completa (opt-in, ladder_plus.py; sin ellos nada cambia)")
+    g.add_argument("--deny-teams", default="",
+                   help="no operar con estos equipos: ni ofertas dirigidas, ni aceptar las suyas, ni campañas "
+                        "(p. ej. t12,t13,t14)")
+    g.add_argument("--deny-margin", type=float, default=None,
+                   help="con --deny-teams: permitirlo solo si nuestro excedente a valores privados es ≥ N P")
+    g.add_argument("--pilar-sell", default=None, metavar="SET[:MULT]",
+                   help="vender a Doña Pilar poco comunes/raras de esos barrios (p. ej. SAL:1.25; * = todos): pedir "
+                        "33, bajar de 2 en 2, aceptar su final si ≥ valor privado, objetivo 3 tratos negociados")
+    g.add_argument("--pilar-open", type=int, default=None, help="con --pilar-sell: primera petición (33 P; t04: 40)")
+    g.add_argument("--pilar-step", type=int, default=None, help="con --pilar-sell: bajada por petición (2 P; t04: 1)")
+    g.add_argument("--pilar-last-copy", action="store_true",
+                   help="con --pilar-sell SET: vender también la ÚLTIMA copia de esos barrios (nunca la que mantiene "
+                        "una página completa); equivale a --allow-last-copy SET")
+    g.add_argument("--pilar-from-tick", type=int, default=None, help="con --pilar-sell: no abrir antes de este tick")
+    g.add_argument("--pilar-until-tick", type=int, default=None, help="con --pilar-sell: no abrir después de este tick")
+    g.add_argument("--pilar-id", default=lplus.PILAR, help="id de Pilar en /api/dealers")
+    g.add_argument("--ladder-fill", action="store_true",
+                   help="3 tratos negociados por vendedor desbloqueado (abuela, chato, pilar) antes que pujas pasivas: "
+                        "--dealer-ladder con las aperturas de ESTRATEGIA_TOP3 y venta a Pilar")
     args = p.parse_args()
     if not 1 <= args.ticks <= 120:
         p.error("--ticks entre 1 y 120")
+    try:
+        lplus.parse_pilar_sell(args.pilar_sell)
+    except ValueError as e:
+        p.error(str(e))
     DATA.mkdir(exist_ok=True)
     # retries=3: el SDK solo reintenta lo seguro (rate_limited = rechazada sin ejecutar; fallos de red en LECTURAS).
     # Una escritura con fallo de red nunca se repite a ciegas: queda ambigua hasta reconciliar. wait_for_tick no se
