@@ -480,3 +480,10 @@ cálculo acumulado por tick; compras bloqueadas si el saldo no es fiable o el ba
 (tope de contraofertas nuestras por conversación con vendedores, también en la escalera), fases B desde cierre−60 min (cerrar y
 comprar a vendedores) y C desde cierre−25 min (liquidar duplicados y cancelar lo que no cierre), sin publicaciones nuevas en los
 últimos 10 ticks (confirmar liquidaciones). Sin campañas con otros equipos ni de página. La radio no se activa (`--radio` actúa en ventas).
+
+## Radio e inteligencia pública (dashboard)
+
+`radio_intel.py` (módulo opcional del dashboard, mismo camino de ingestión): `GET /api/news` (público, sin clave) se sondea como mucho una vez por
+tick desde `Builder.build`, más los `news.posted` del feed; todo se guarda SOLO añadiendo en `data/radio_intel.jsonl` (idempotente por id). La
+correlación con eventos públicos (feed + `agent_memory.sqlite3` en solo lectura) es siempre «posible conexión» con criterio, línea base y
+confianza; el texto de las conversaciones con vendedores y la audiencia de la radio son no observables. Única escritura: `/radio/review` (local).

@@ -61,7 +61,7 @@ TICKS_PER_HOUR = 120.0
 REFRESH_MIN, REFRESH_MAX = 15.0, 30.0
 
 #: Módulos hermanos que pueden existir o no: se están escribiendo en paralelo.
-OPTIONAL = ("playbook", "rivals", "signals", "feed_stream", "opportunities")
+OPTIONAL = ("playbook", "rivals", "signals", "feed_stream", "opportunities", "radio_intel")
 
 #: Orden de fiabilidad, para que la chuleta empiece por lo que está probado.
 CONF_RANK = {"SETTLED": 5, "FINAL": 4, "HIGH": 3, "MEDIUM": 2, "RARITY": 1,
@@ -177,6 +177,7 @@ class Snapshot:
     build_ms: int = 0
     events: list = field(default_factory=list)   # eventos del feed vistos (para contrastar pistas con ofertas vivas)
     agent: dict = field(default_factory=dict)    # estado que escribe el coordinador (data/opportunities*.json)
+    radio: dict = field(default_factory=dict)    # vista «Radio e inteligencia pública» (radio_intel.RadioIntel.view)
 
 
 class Builder:
@@ -203,6 +204,10 @@ class Builder:
         self._cache: Optional[Snapshot] = None
         self._lock = threading.Lock()
         self._events: dict = {}
+        self.radio = None                  # radio_intel.RadioIntel, creado la primera vez que el módulo existe
+        self._seen_live: dict = {}         # id de evento → cuándo lo vimos EN VIVO (los históricos del arranque no figuran)
+        self._booted = False
+        self._dealers: dict = {}
 
     def _new_aggs(self) -> dict:
         """Los agregadores de los módulos hermanos que existan.
@@ -238,6 +243,8 @@ class Builder:
             return
         for ev in events:
             if isinstance(ev, dict) and ev.get("id") is not None:
+                if ev["id"] not in self._events and self._booted:
+                    self._seen_live[ev["id"]] = round(time.time(), 1)
                 self._events[ev["id"]] = ev
         if len(self._events) > 6000:   # acotado: solo los más recientes
             for k in sorted(self._events)[:len(self._events) - 6000]:
@@ -286,6 +293,30 @@ class Builder:
         return out if isinstance(out, str) else ""
 
     # -- construcción -----------------------------------------------------
+    def _radio_step(self, fetch, clock: dict) -> dict:
+        """Ingesta de radio por el MISMO camino que el resto: sondeo de /api/news (limitado a un tick), eventos news.posted del feed ya
+        leídos y vista con los eventos públicos acumulados. Un fallo aquí nunca rompe el panel."""
+        mod = self.mods.get("radio_intel")
+        if mod is None or self.client is None and not self._events:
+            return {"error": "módulo radio_intel no disponible" if mod is None else "sin red ni datos locales"}
+        try:
+            if self.radio is None:
+                ts = float(clock.get("tick_seconds") or 30.0)
+                self.radio = mod.RadioIntel(self.root / "data" / "radio_intel.jsonl", self.root / "data" / "agent_memory.sqlite3",
+                                            poll_every=max(15.0, ts))
+            tick = clock.get("tick")
+            self.radio.poll_every = max(15.0, float(clock.get("tick_seconds") or self.radio.poll_every))
+            events = list(self._events.values())
+            self.radio.ingest_events(events, tick)
+            if self.client is not None:
+                self.radio.poll(lambda: self.client.get("/api/news"), tick)      # el error real (timeout, 5xx…) llega al registro
+                dd = fetch("/api/dealers", "vendedores")
+                rows = dd.get("personas") or dd.get("dealers") or [] if isinstance(dd, dict) else dd
+                self._dealers = {r["id"]: r for r in rows if isinstance(r, dict) and r.get("id")} or self._dealers
+            return self.radio.view(events, self._dealers, clock, None, self._seen_live)
+        except Exception as exc:                   # noqa: BLE001
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
     def snapshot(self, max_age: float = 5.0) -> Snapshot:
         """Devuelve el último snapshot, o construye uno si ya está viejo."""
         with self._lock:
@@ -325,9 +356,12 @@ class Builder:
         if feed:
             self._feed(feed.get("events") or [])
 
+        clock = fetch("/api/clock", "reloj")
+        radio_view = self._radio_step(fetch, clock)
+        self._booted = True
         snap = Snapshot(
             oracle=self.oracle,
-            clock=fetch("/api/clock", "reloj"),
+            clock=clock,
             schedule=fetch("/api/schedule", "agenda"),
             leaderboard=fetch("/api/leaderboard", "clasificación"),
             venues=fetch("/api/venues", "venues"),
@@ -341,6 +375,7 @@ class Builder:
             signals_text=self._signals_text(),
             events=sorted(self._events.values(), key=lambda e: (e.get("tick") or 0, e.get("id") or 0)),
             agent=self._agent_state(),
+            radio=radio_view,
         )
         snap.build_ms = int((time.time() - t0) * 1000)
         return snap
@@ -646,6 +681,9 @@ color:#c6d2e2;margin:0;max-height:340px;overflow:auto}
 .err{background:#2a1418;border:1px solid #5a2230;color:#ffb3b3;border-radius:10px;
 padding:9px 12px;margin-top:10px;font-size:14px}
 .spacer{flex:1}
+blockquote.lit{margin:8px 0;padding:8px 12px;border-left:4px solid var(--cool);background:#0e131b;font-size:18px;white-space:pre-wrap}
+.rmsg{margin:10px 0}.rmsg details{margin-top:8px}.rmsg summary{cursor:pointer;color:var(--dim)}
+.rmsg ul.tl{margin:6px 0 6px 16px;padding:0}.rmsg button{margin-left:8px;background:#1f2937;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:2px 8px;cursor:pointer}
 @media(max-width:700px){.huge{font-size:40px}.big{font-size:30px}td,th{padding:5px 5px}}
 """
 
@@ -805,6 +843,126 @@ def _panel_radio(snap: Snapshot) -> str:
                        f'<div class="dim">{e("; ".join(x["dir"] + ": " + x["text"] for x in (r.get("evidence") or [])))}</div>'
                        f'{"<div class=dim>asociación: " + e(r["association"]) + "</div>" if r.get("association") else ""}</td></tr>'
                        for r in rows) + '</tbody></table></div>')
+    return "".join(out)
+
+
+
+def _fmt_clock(ts: Any) -> str:
+    try:
+        return time.strftime("%H:%M:%S", time.localtime(float(ts)))
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _chips(items: Iterable[str], cls: str = "") -> str:
+    return "".join(f'<span class="b {cls}">{e(x)}</span>' for x in items)
+
+
+def _ev_line(c: dict) -> str:
+    bits = [f'tick {e(c.get("tick"))} (+{e(c.get("delta_ticks"))})', f'<b>{e(c.get("type"))}</b>']
+    for k, lab in (("team", "equipo"), ("dealer", "vendedor"), ("ref", "carta"), ("rarity", "rareza"), ("price", "precio"), ("venue", "venue")):
+        if c.get(k) is not None:
+            bits.append(f"{lab} {e(c[k])}")
+    if c.get("type") == "thread.message":
+        bits.append("texto no observable" + (" · oferta estructurada visible" if c.get("offer") else ""))
+    live = (f" · visto en vivo {_fmt_clock(c['observed_ts'])}" if c.get("observed_ts") else " · histórico (hora de observación desconocida)")
+    return (f'<li>{" · ".join(bits)}<span class="b b-{ {"baja": "low", "media": "medium", "media-alta": "high"}.get(c.get("confidence"), "none") }">'
+            f'{e(c.get("confidence"))}</span><div class="dim">evidencia: evento público #{e(c.get("id"))}{live}<br>{e(c.get("note"))}</div></li>')
+
+
+def _radio_msg(m: dict, base_url: str) -> str:
+    inf, ver, tl = m["inferred"], m["verification"], m["timeline"]
+    st = ver["status"]
+    badge = {"confirmado": '<span class="b b-settled">HECHO CONFIRMADO</span>',
+             "rumor_no_confirmado": '<span class="b b-low">RUMOR NO CONFIRMADO</span>',
+             "sin_efecto_de_mercado": '<span class="b b-none">SIN EFECTO DE MERCADO</span>'}.get(st, '<span class="b b-none">SIN VERIFICAR</span>')
+    ent = [*inf["dealers"], *inf["cards"], *inf["sets"], *inf["rarities"], *inf["teams"]]
+    cands = tl.get("candidates") or []
+    tline = ('<ul class="tl">' + "".join(_ev_line(c) for c in cands) + "</ul>") if cands else \
+        f'<div class="dim">{e(tl.get("no_events") or tl.get("method") or "sin eventos públicos compatibles")}</div>'
+    no_obs = "".join(f"<li>{e(x)}</li>" for x in tl.get("not_observable") or [])
+    res = tl.get("result") or {}
+    res_txt = ("; ".join(f'liquidación #{e(x["id"])} t{e(x["tick"])} {e(x.get("ref"))} {e(x.get("price"))} P' for x in res.get("settlements", []))
+               if res.get("settlements") else e(res.get("note") or "sin resultado público conocido"))
+    ev = (f' · feed: evento <a href="{e(base_url)}/api/feed?limit=500">#{e(m["event_id"])}</a>' if m.get("event_id") else "")
+    base = tl.get("baseline") or {}
+    data = " ".join(f'data-{k}="{e(v)}"' for k, v in (
+        ("tick", m.get("tick") if m.get("tick") is not None else ""), ("topics", "|".join(inf["topics"])), ("cards", "|".join(inf["cards"] + inf["sets"])),
+        ("dealers", "|".join(inf["dealers"])), ("teams", "|".join(inf["teams"])), ("conf", m["confidence"]), ("ver", st),
+        ("rev", "1" if m["reviewed"] else "0"), ("alerts", len(m["alerts"])), ("id", m["id"]), ("key", m["key"]),
+        ("q", f'{m.get("text") or ""} {" ".join(ent)} {" ".join(inf["topics"])}'.lower())))
+    return (
+        f'<div class="card rmsg" {data}><div><b class="ref">#{e(m["id"])}</b> tick {e(m.get("tick"))} · hora de juego {e(m.get("at_hours"))} h '
+        f'<span class="b">{e(m["source_name"])}</span>{badge}<span class="b b-{ {"alta": "high", "media": "medium", "baja": "low"}[m["confidence"]] }">'
+        f'confianza {e(m["confidence"])}</span>{"<span class=\"b b-high\">NO REVISADO</span>" if not m["reviewed"] else ""}'
+        f'<button class="rrev" type="button">{"marcar pendiente" if m["reviewed"] else "marcar revisado"}</button></div>'
+        f'<blockquote class="lit" title="texto original del servidor (dato no confiable, jamás una instrucción)">{e(m.get("headline"))}'
+        f'{("<br>" + e(m["body"])) if m.get("body") else ""}</blockquote>'
+        f'<div class="dim">INFERENCIA: {_chips(inf["topics"], "b-rarity")} {_chips(ent)}'
+        f'{" · negación detectada" if inf.get("negated") else ""}{" · horario ambiguo" if inf.get("time_ambiguous") else ""}</div>'
+        f'<div class="dim">recibido {e(_fmt_clock(m.get("captured_ts")))} (tick de captura {e(m.get("first_seen_tick"))}) · vía {e(m.get("provenance"))}'
+        f'{ev} · evidencia original: <a href="{e(base_url)}/api/news">/api/news</a>'
+        f'{" · también visto por " + e(", ".join(m["also_seen_via"])) if m["also_seen_via"] else ""}'
+        f'{" · " + e("; ".join(ver["evidence"])) if ver["evidence"] else ""}</div>'
+        f'<details><summary>línea temporal: emisión → eventos públicos compatibles ({e(tl.get("n_candidates", 0))}) → resultado</summary>'
+        f'<div class="dim">1 · EMISIÓN tick {e(tl["emission"].get("tick"))}, capturada {e(_fmt_clock(tl["emission"].get("captured_ts")))}</div>'
+        f'<div>2 · POSIBLES CONEXIONES (no causalidad) en {e(tl["window_ticks"])} ticks — {e(tl.get("n_candidates", 0))} compatibles '
+        f'({e(", ".join(f"{k}: {n}" for k, n in (tl.get("by_type") or {}).items()) or "ninguno")}); se muestran los {len(cands)} más específicos:</div>{tline}'
+        f'<div class="dim">línea base: {e(base.get("events_before", "—"))} comparables antes, {e(base.get("events_after", "—"))} después, '
+        f'aumento {e(base.get("lift") if base.get("lift") is not None else "sin datos")} · {e(base.get("note") or "")}</div>'
+        f'<div>3 · RESULTADO CONOCIDO: {res_txt}</div>'
+        f'<div class="dim">criterio: {e(tl.get("method"))}</div><ul class="dim">{no_obs}</ul></details></div>')
+
+
+def _panel_radio_intel(snap: Snapshot) -> str:
+    v = snap.radio or {}
+    out = ['<h2>Radio e inteligencia pública <small>todos los mensajes · texto literal ≠ inferencia · conexiones solo como «posibles»</small></h2>']
+    if v.get("error") or "messages" not in v:
+        out.append(f'<div class="empty">radio no disponible: {e(v.get("error") or "sin datos")}. Se muestran solo las fuentes reales ya disponibles '
+                   '(feed y API); no se reconstruye ningún mensaje.</div>')
+        return "".join(out)
+    ing = v["ingestion"]
+    age = ing.get("last_ok_age_s")
+    stale = age is None or age > 120
+    out.append(
+        '<div class="card"><table><tbody>'
+        f'<tr><td>fuente</td><td>{e(ing["source"])}</td></tr>'
+        f'<tr><td>sondeo</td><td>cada {e(int(ing["interval_s"]))} s (≥ un tick) · {e(ing["polls"])} sondeos · último correcto hace '
+        f'<span class="{"bad" if stale else "win"}">{e(age if age is not None else "nunca")} s</span>'
+        f'{" — OBSOLETO" if stale else ""}{(" · último error: " + e(ing["last_error"])) if ing.get("last_error") else ""}</td></tr>'
+        f'<tr><td>almacén</td><td>{e(ing["stored"])} mensajes en data/radio_intel.jsonl (solo se añade; idempotente por id) · {e(ing["history"])}</td></tr>'
+        f'<tr><td>correlación</td><td>{e(ing["events_for_correlation"])} eventos públicos desde el tick {e(ing["events_first_tick"])} (feed + memoria)</td></tr>'
+        f'<tr><td>no observable</td><td class="dim">{e("; ".join(v["limits"]))}</td></tr></tbody></table></div>')
+    unrev = [a for a in v["alerts"] if not a["reviewed"]]
+    out.append(f'<div class="card {"hot" if unrev else ""}"><b>alertas</b> <span class="dim">(informan; no envían ofertas, no cambian precios, '
+               f'no activan decisiones)</span>')
+    if unrev:
+        out.append("<ul>" + "".join(f'<li>radio #{e(a["news_key"].split(":")[-1])} · <b>{e(a["kind"])}</b> {e(a["entity"])}: {e(a["text"])}'
+                                    f'{" (rumor)" if a["rumor"] else ""} <span class="dim">· {e(a["headline"])}</span></li>' for a in unrev[:20]) + "</ul>")
+    else:
+        out.append('<div class="empty">sin alertas pendientes</div>')
+    out.append("</div>")
+    base_url = DEFAULT_URL
+    out.append(
+        '<div class="card" id="rfilters"><div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">'
+        '<input type="search" id="rq" placeholder="buscar en el texto…">'
+        'tick <input id="rfrom" size="5" placeholder="desde"> <input id="rto" size="5" placeholder="hasta">'
+        '<select id="rtopic"><option value="">tema (todos)</option>'
+        + "".join(f'<option>{e(t)}</option>' for t in ("vendedor", "carta", "rareza", "equipo", "comisión/fee", "mercado", "menú", "sobres/regalo",
+                                                       "evento", "ambiente", "sin clasificar")) +
+        '</select><input id="rcard" size="9" placeholder="carta/barrio"><input id="rdealer" size="9" placeholder="vendedor">'
+        '<input id="rteam" size="6" placeholder="equipo">'
+        '<select id="rconf"><option value="">confianza (todas)</option><option>alta</option><option>media</option><option>baja</option></select>'
+        '<select id="rver"><option value="">estado (todos)</option><option value="confirmado">hecho confirmado</option>'
+        '<option value="rumor_no_confirmado">rumor no confirmado</option><option value="sin_verificar">sin verificar</option>'
+        '<option value="sin_efecto_de_mercado">sin efecto de mercado</option></select>'
+        '<select id="rrev"><option value="">procesamiento (todos)</option><option value="0">pendientes</option><option value="1">revisados</option></select>'
+        '<label class="chk"><input type="checkbox" id="rflip"> más reciente arriba</label>'
+        '<span class="dim" id="rcount"></span></div></div>')
+    msgs = v["messages"]
+    out.append('<div id="rlist">' + ("".join(_radio_msg(m, base_url) for m in msgs) if msgs else
+                                     '<div class="empty">la radio no ha devuelto mensajes todavía</div>') + "</div>")
+    out.append(f"<script>{RADIO_JS}</script>")
     return "".join(out)
 
 
@@ -1085,6 +1243,45 @@ def _panel_trust(snap: Snapshot) -> str:
     return "".join(out)
 
 
+RADIO_JS = """
+(function(){
+  var K='bz.radio.';
+  function g(k,d){try{var v=sessionStorage.getItem(K+k);return v===null?d:v}catch(e){return d}}
+  function s(k,v){try{sessionStorage.setItem(K+k,v)}catch(e){}}
+  var ids=['rq','rfrom','rto','rtopic','rcard','rdealer','rteam','rconf','rver','rrev'];
+  var list=document.getElementById('rlist');
+  if(!list) return;
+  ids.forEach(function(i){var el=document.getElementById(i); el.value=g(i,''); el.addEventListener('input',apply);});
+  var flip=document.getElementById('rflip'); flip.checked=g('flip','0')==='1'; flip.addEventListener('change',apply);
+  function has(attr,needle){needle=needle.toLowerCase(); return !needle || (attr||'').toLowerCase().indexOf(needle)>=0;}
+  function apply(){
+    var v={}; ids.forEach(function(i){v[i]=document.getElementById(i).value.trim(); s(i,v[i]);});
+    s('flip',flip.checked?'1':'0');
+    var nodes=[].slice.call(list.querySelectorAll('.rmsg')), shown=0;
+    nodes.sort(function(a,b){var d=(+a.dataset.tick||0)-(+b.dataset.tick||0)||(+a.dataset.id)-(+b.dataset.id); return flip.checked?-d:d;});
+    nodes.forEach(function(n){
+      list.appendChild(n);
+      var t=+n.dataset.tick, ok=true;
+      if(v.rfrom && !(t>=+v.rfrom)) ok=false;
+      if(v.rto && !(t<=+v.rto)) ok=false;
+      if(v.rtopic && (n.dataset.topics||'').split('|').indexOf(v.rtopic)<0) ok=false;
+      if(!has(n.dataset.cards,v.rcard)||!has(n.dataset.dealers,v.rdealer)||!has(n.dataset.teams,v.rteam)||!has(n.dataset.q,v.rq)) ok=false;
+      if(v.rconf && n.dataset.conf!==v.rconf) ok=false;
+      if(v.rver && n.dataset.ver!==v.rver) ok=false;
+      if(v.rrev && n.dataset.rev!==v.rrev) ok=false;
+      n.style.display=ok?'':'none'; if(ok) shown++;
+    });
+    document.getElementById('rcount').textContent=shown+' de '+nodes.length+' mensajes';
+  }
+  list.addEventListener('click',function(ev){
+    var b=ev.target.closest('.rrev'); if(!b) return;
+    var n=b.closest('.rmsg'), on=n.dataset.rev!=='1';
+    fetch('/radio/review?key='+encodeURIComponent(n.dataset.key)+'&on='+(on?'1':'0'),{headers:{'X-Bazaar-Local':'1'}})
+      .then(function(r){return r.json()}).then(function(j){ if(j.ok){n.dataset.rev=on?'1':'0'; b.textContent=on?'marcar pendiente':'marcar revisado'; apply();}});
+  });
+  apply();
+})();
+"""
 JS = """
 (function(){
   var K='bz.dash.';
@@ -1129,6 +1326,7 @@ def render_page(snap: Snapshot) -> str:
         _panel_urgencies(snap),
         _panel_agent(snap),
         _panel_radio(snap),
+        _panel_radio_intel(snap),
         _panel_now(snap),
         _panel_cheatsheet(snap),
         _panel_cards(snap),
@@ -1153,7 +1351,7 @@ def render_page(snap: Snapshot) -> str:
 # ------------------------------------------------------------------ servidor
 
 class Handler(BaseHTTPRequestHandler):
-    """Sirve la página y un volcado JSON. Sólo GET: no hay otro verbo."""
+    """Sirve la página y un volcado JSON. Solo GET; la única escritura es local (/radio/review: marcar un mensaje como revisado)."""
 
     builder: Builder = None            # inyectado por `serve()`
     protocol_version = "HTTP/1.1"
@@ -1178,6 +1376,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(json.dumps(snap.oracle.to_json(), ensure_ascii=False,
                                       indent=2).encode("utf-8"),
                            "application/json; charset=utf-8")
+            elif path == "/radio/review":
+                self._radio_review()
             elif path == "/healthz":
                 self._send(b"ok\n", "text/plain; charset=utf-8")
             else:
@@ -1187,6 +1387,22 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:                   # una pantalla rota es peor que un error
             self._send(f"error: {exc}\n".encode("utf-8"),
                        "text/plain; charset=utf-8", 500)
+
+    def _radio_review(self) -> None:
+        """ÚNICA escritura del panel y LOCAL: marca un mensaje de radio como revisado en su propio registro (data/radio_intel.jsonl). Nada se
+        envía al juego. Solo desde la propia página: exige la cabecera personalizada X-Bazaar-Local (un `<img>` o enlace de otra web no
+        puede añadirla sin CORS) y valida la clave."""
+        from urllib.parse import parse_qs, urlsplit
+        q = parse_qs(urlsplit(self.path).query)
+        key, on = (q.get("key") or [""])[0], (q.get("on") or ["1"])[0] != "0"
+        if self.headers.get("X-Bazaar-Local") != "1":
+            self._send(b'{"ok":false,"error":"cabecera local ausente"}', "application/json", 403)
+            return
+        radio = getattr(self.builder, "radio", None)
+        ok = bool(radio and key.startswith("news:") and len(key) < 24 and radio.mark_reviewed(key, on))
+        if ok:
+            self.builder._cache = None                 # la siguiente carga refleja la marca
+        self._send(json.dumps({"ok": ok}).encode("utf-8"), "application/json; charset=utf-8", 200 if ok else 404)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         pass                                       # el log por petición sólo estorba

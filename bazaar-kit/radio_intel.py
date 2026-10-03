@@ -38,7 +38,7 @@ MAX_CANDIDATES = 12
 SOURCES = {"radio": "Radio Rastro", "boletin": "Boletín del Bazar", "tablon": "El Tablón (rumores)"}
 CARD = re.compile(r"\b([A-Z]{3}-\d{1,2})\b")
 TEAM = re.compile(r"\b(?:team|equipo)\s*(\d{1,2})\b|\b(t\d{1,2})\b", re.I)
-VENUE = re.compile(r"\b(v\d{1,2})\b|\b(el rastro|el duende|rastro|duende)\b", re.I)
+VENUE = re.compile(r"\b(v\d{1,2})\b|(?<!radio )\b(el rastro|el duende|rastro|duende)\b", re.I)
 FEE = re.compile(r"\b(fee|fees|commission|commissions|comisi[oó]n|comisiones|tax|charge)\b", re.I)
 PACK = re.compile(r"\b(packs?|sobres?)\b", re.I)
 MENU = re.compile(r"\b(menu|menú|stock|vault|sells?|buys?|pays?|paying|price|prices)\b", re.I)
@@ -247,9 +247,10 @@ def correlate(msg: dict, events: list, tick_now: Optional[int], first_event_tick
     for c in cands:
         specific = sum(1 for x in c["criteria"] if x.split()[0] in ("carta", "rareza", "barrio", "equipo", "comisión/mercado"))
         generic = any(x.startswith("vendedor") for x in c["criteria"])
+        # coincidir solo en el vendedor es actividad habitual (muchos equipos hablan con él a todas horas): como mucho «baja»
         if specific and generic and c["delta_ticks"] <= 60 and (lift or 0) >= 1.5:
             conf = "media-alta"
-        elif (specific or generic) and have_base and (lift or 0) >= 1.2:
+        elif specific and have_base and (lift or 0) >= 1.2:
             conf = "media"
         else:
             conf = "baja"
@@ -260,8 +261,13 @@ def correlate(msg: dict, events: list, tick_now: Optional[int], first_event_tick
                      + ("" if have_base else "; sin línea base previa suficiente"))
         if seen_live and c.get("id") in seen_live:
             c["observed_ts"] = seen_live[c["id"]]
-    base["candidates"] = cands[:MAX_CANDIDATES]
+    by_type: dict = {}
+    for c in cands:
+        by_type[c["type"]] = by_type.get(c["type"], 0) + 1
+    rank = sorted(cands, key=lambda c: (-len(c["criteria"]), c["delta_ticks"], c.get("id") or 0))[:MAX_CANDIDATES]
+    base["candidates"] = sorted(rank, key=lambda c: (c["tick"], c.get("id") or 0))      # los más específicos, en orden temporal
     base["n_candidates"] = n_post
+    base["by_type"] = by_type
     base["baseline"] = {"events_before": n_pre, "events_after": n_post, "lift": lift,
                         "note": ("actividad comparable en la ventana previa; si es parecida, la conexión es indistinguible de lo habitual"
                                  if have_base else "sin eventos públicos anteriores suficientes: no se puede estimar lo habitual")}
@@ -456,7 +462,9 @@ class RadioIntel:
             al = alerts_for(full, mon)
             reviewed = self.store.reviews.get(key, False)
             sights = self.store.sightings.get(key, {})
-            rows.append({"key": key, "id": m["id"], "tick": m.get("tick"), "at_hours": m.get("at_hours"), "source": m.get("source"),
+            conf = ("alta" if ver["status"] == "confirmado" else
+                    "baja" if m.get("source") == "tablon" or full["inferred"]["topics"] == ["sin clasificar"] else "media")
+            rows.append({"confidence": conf, "key": key, "id": m["id"], "tick": m.get("tick"), "at_hours": m.get("at_hours"), "source": m.get("source"),
                          "source_name": m.get("source_name") or SOURCES.get(m.get("source")), "headline": m.get("headline"), "body": m.get("body"),
                          "text": m.get("text"), "captured_ts": m.get("captured_ts"), "first_seen_tick": m.get("first_seen_tick"),
                          "provenance": m.get("provenance"), "event_id": m.get("event_id") or next((s.get("event_id") for s in sights.values()
