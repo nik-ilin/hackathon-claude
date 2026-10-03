@@ -334,3 +334,20 @@ BAZAAR API → snapshot() del coordinador (única ola de lecturas; SlowCache par
 **Sobres.** `tr.pack_analysis` da RAW_COLLECTION_EV, STRATEGIC_EV (con la reventa de duplicados × P(venta) HEURISTIC), P(página nueva) y P(duplicado). Sigue sin comprarse por rutina.
 
 **CLI** (solo lectura): `--capital-report`, `--open-bid-audit`, `--intel-db-stats`, `--intel-team tXX`, `--intel-card REF` y `--intel-counterparties REF`.
+
+## ESCALERA DE VENDEDORES · opt-in (`--dealer-ladder`, `--dealer-sell-dups`, `--dedupe-bids`)
+
+Parámetros tomados de `t15-bazaar-bot/intel/AUDITORIA_LIDERES.md` (tick ~280) y `PLAN_PRIMER_PUESTO.md`. Salen de pocas conversaciones, así que son hipótesis de trabajo y no fórmulas del servidor. **Sin estos flags el comportamiento no cambia** (`test_dealer_ladder.Bids.test_default_flags_leave_candidates_unchanged`). La caja para vendedores y las pujas duplicadas ya las cubre `capital.py` (`--dealer-liquidity`, `--dealer-buffer-mode`, `--max-passive-frac`, `--stale-age`, `duplicate_pursuit_cancels`), al igual que el arreglo de reconciliación de `dealer_accept`.
+
+| Flag | Qué hace |
+|---|---|
+| `--dealer-ladder` | Sustituye `decide_dealer` por `neg.decide_ladder` en nuestras conversaciones de compra, también en SECURE. El máximo económico, el capital y la validación estructural de la oferta no cambian. **Chato:** apertura al 0,70 (t18 abre a 0,72); pasos fijos de +3 en poco común y +4 en rara, porque copia nuestro paso y con +1 no se mueve; acepta a 1 P de su precio (él acepta cuando estamos a 1-2 P). Tras su final, una sola contraoferta de final-1 (funcionó 2/2); nunca en el mismo tick se acepta su final, sino en el siguiente si no responde. **Abuela:** apertura al 0,60 (t18 abre una común de 12 a 7), pasos de 1 y hasta 15 contraofertas, porque su final baja con la paciencia. **Enrutado:** las poco comunes se compran a la Abuela (21-22 P frente a 27-31 P de Chato). **Vendedores nuevos de nivel 3 (Pilar…):** apertura al 0,80, 35 % de la brecha por paso, 3 contraofertas y nunca más del 95 % de su apertura; se ajusta con `--ladder-new-open/-step/-counters/-ticks/-max-frac`. En modo score nunca se paga su apertura. |
+| `--dealer-sell-dups` | Vende duplicados comunes a la Abuela (abre en 5 P, final 6 P abras como abras). Como t02, pide 10 P y baja de 1 en 1. El suelo es el valor perdido más `--ladder-sell-margin`. En modo score no se acepta su apertura. Solo se ofrecen copias de `page_guard.tradeable_surplus`, y las tres barreras de páginas completas siguen activas (la candidata lleva `asset`). Nuestra petición anterior en el mismo hilo no cuenta como segundo compromiso de la copia. |
+| `--dedupe-bids` | Bloquea la puja nueva y cancela la puja pasiva abierta por una carta que ya negociamos con un vendedor (dos cierres = un duplicado). |
+
+```bash
+./run.sh coord --dealer-ladder --dealer-sell-dups --dedupe-bids                                   # análisis
+./run.sh coord --execute --ticks 120 --dealer-ladder --dealer-sell-dups --dedupe-bids --duende-venue rastro
+```
+
+Pruebas: `test_dealer_ladder.py`.
