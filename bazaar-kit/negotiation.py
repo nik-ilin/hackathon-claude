@@ -451,6 +451,10 @@ DEALER_TRAITS = {
                     sell_open_mult=2.2, sell_gap_frac=0.30, sell_step=2),
     "picaros": dict(open_frac=0.50, gap_frac=0.40, max_counteroffers=2, max_ticks=5,
                     sell_open_mult=2.0, sell_gap_frac=0.35, sell_step=3),
+    # Don Ernesto (banco): paciencia 0.95 / astucia 0.95 / rigor 1.0 -> no se le gana por desgaste; una propuesta y
+    # como mucho DOS contraofertas, luego se reevalúa. Sin observaciones propias todavía: valores prudentes, no medidos.
+    "banco":   dict(open_frac=0.55, gap_frac=0.40, max_counteroffers=2, max_ticks=6,
+                    sell_open_mult=1.9, sell_gap_frac=0.35, sell_step=2),
 }
 
 # `sell_step` sale de playbook.py sobre data/feed_history.jsonl (15 planes, 9 con cierre observado):

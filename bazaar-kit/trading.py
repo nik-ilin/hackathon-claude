@@ -644,7 +644,8 @@ def evaluate_own_open_offer(o: dict, val: Valuation, counts: Counter) -> dict:
             "receive": receive, "deliver": deliver, "dv": dv, "du": du, "notes": notes, "unknown": unknown}
 
 
-def unsafe_own_offers(my_offers: list, team: str, val: Valuation, counts: Counter) -> list:
+def unsafe_own_offers(my_offers: list, team: str, val: Valuation, counts: Counter,
+                      allow_last_copy: frozenset = frozenset()) -> list:
     """Publicaciones nuestras abiertas que venden la última copia, tienen ΔU < 0 si se llenan (con el evaluador
     canónico: un trueque cuenta la carta que RECIBIMOS) o repiten el mismo activo en varias ofertas.
     Candidatas a cancelar (nunca se cancelan solas: ver --cancel-unsafe)."""
@@ -663,7 +664,7 @@ def unsafe_own_offers(my_offers: list, team: str, val: Valuation, counts: Counte
                 why.append(f"{a['ref']} (activo {a['id']}) ya está en la oferta {seen[a['id']]}")
             seen.setdefault(a["id"], o["id"])
         for ref, k in ev["deliver"].items():
-            if counts.get(ref, 0) - k + ev["receive"].get(ref, 0) < 1:
+            if counts.get(ref, 0) - k + ev["receive"].get(ref, 0) < 1 and ref not in allow_last_copy:  # --allow-last-copy
                 why.append(f"vende la última copia de {ref}")
         if ev["du"] is not None and ev["du"] < 0:
             got = f"{ev['cash_in']} P" + (f" + {dict(ev['receive'])}" if ev["receive"] else "")

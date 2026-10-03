@@ -29,11 +29,14 @@ def integrated(path=agent_memory.DEFAULT):
                 window=getattr(args, 'history_window', 240),
                 market_actions=coordinator.ma.load_json(coordinator.ma.LEDGER).get('actions', []))
             coordinator.ma.save(coordinator.DATA / 'agent_memory_report.json', report)
+            coordinator.MEMORY_STATUS.update(integrated=True, ok=True, error=None, stored_events=report['stored_events'],
+                                             events_in_window=report['events_in_window'])
             print(f"   MEMORIA: {report['stored_events']} eventos persistidos; "
                   f"{report['events_in_window']} en ventana; "
                   f"{len(report['own_single_card_settlements'])} liquidaciones propias de una carta observadas")
         except (OSError, sqlite3.Error, ValueError, TypeError, KeyError) as e:
             # Memory failure must not change the operational guards or stop reconciliation.
+            coordinator.MEMORY_STATUS.update(integrated=True, ok=False, error=type(e).__name__)
             print(f'   MEMORIA no disponible ({type(e).__name__}); análisis con snapshot actual')
             return original_candidates(snapshot, ledger, args, journal)
         result = original_candidates(enriched, ledger, args, journal)

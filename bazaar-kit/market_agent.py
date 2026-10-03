@@ -16,6 +16,7 @@ import time
 from bazaar_sdk import Bazaar, BazaarError
 from negotiation import InstanceLock, Journal
 import page_guard
+import accounting
 import trading
 
 HERE = Path(__file__).resolve().parent
@@ -466,10 +467,16 @@ def reconcile_v2(led, s, sets):
                 break
         if hit:
             a.update(status="settled", settlement=hit["settlement"], settled_tick=hit["tick"])
+            # UNA liquidación = UN conteo, la vean las acciones que la vean (clave canónica del feed)
+            skey = accounting.key_settlement(hit["settlement"])
             if hit["cash_direction"] == "pagamos":
-                led["spent_confirmed"] += hit["price"] + (hit["fee"] if a["type"] == "accept" else 0)
+                if not accounting.count(led, skey, "spend", hit["price"] + (hit["fee"] if a["type"] == "accept" else 0),
+                                        hit["tick"], a["type"]):
+                    a["duplicate_of"] = skey
             elif hit["cash_direction"] == "cobramos":
-                led["cash_received"] += hit["price"] - (hit["fee"] if a["type"] == "accept" else 0)
+                if not accounting.count(led, skey, "income", hit["price"] - (hit["fee"] if a["type"] == "accept" else 0),
+                                        hit["tick"], a["type"]):
+                    a["duplicate_of"] = skey
             continue
         if a["type"] in ("list", "bid", "swap_list"):
             if a.get("offer_id") in mine_open:

@@ -36,6 +36,7 @@ class CampaignConfig:
     per_card: int = 100
     open_frac: float = 0.6          # apertura de una puja dirigida: fracción del ancla (sin revelar el techo)
     anchor_near: bool = False       # perfil fast-close: abrir cerca de una referencia comparable (ask/mercado)
+    min_open_frac: float = 0.6      # una puja financiable por debajo de esta fracción del ancla no es creíble: se descarta
     strong_frac: float = 0.2        # ask "muy rentable": ΔU ≥ 20 % de la ganancia → aceptar ya
     directed_expiry: int = 20
 
@@ -142,7 +143,8 @@ def p_response(owner: dict) -> float:
 
 
 def plan_target(ref: str, gain: float, completes: bool, level: str, snap: dict, val: tr.Valuation, cfg: CampaignConfig,
-                venues: dict, intel, trade_assets: list, market: Optional[dict] = None) -> dict:
+                venues: dict, intel, trade_assets: list, market: Optional[dict] = None,
+                afford: Optional[int] = None) -> dict:
     """Rutas para UNA carta objetivo, ordenadas por utilidad esperada: ask existente, oferta dirigida, trueque con
     un dueño que quiere un duplicado nuestro, puja dirigida al dueño. Devuelve informe + candidatas."""
     counts = tr.counts_of(snap["me"]["assets"])
@@ -203,7 +205,15 @@ def plan_target(ref: str, gain: float, completes: bool, level: str, snap: dict, 
         frac = cfg.open_frac
         if cfg.anchor_near and market and (market.get("best_ask") or market.get("value")):
             frac = max(cfg.open_frac, 0.92)  # cerca de un comparable real, no una apertura extrema
-        opening = int(max(1, min(ceiling - 1, round(frac * anchor))))
+        wanted_open = int(max(1, min(ceiling - 1, round(frac * anchor))))
+        opening = wanted_open if afford is None else int(min(wanted_open, max(0, afford)))
+        if afford is not None and wanted_open > afford:
+            if opening < math.floor(cfg.min_open_frac * anchor) or opening < 1:
+                # NUNCA abrir a una cifra que no podemos pagar ni a una tan baja que no sea creíble
+                rep.setdefault("unfunded_routes", []).append({
+                    "route": "B puja dirigida", "via": f"{o['team']} a {wanted_open} P", "need": wanted_open,
+                    "afford": afford, "deficit": wanted_open - afford, "team": o["team"]})
+                continue
         if ceiling >= 1 and opening >= 1:
             du = round(gain - opening, 2)
             rep["routes"].append({

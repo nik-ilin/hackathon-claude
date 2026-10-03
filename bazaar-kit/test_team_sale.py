@@ -357,6 +357,21 @@ class Operational(unittest.TestCase):
             co.reconcile(led, s, neg.Journal(d))
         self.assertEqual((led["actions"][0]["status"], led["spent_confirmed"]), ("settled", 10))
 
+    def test_22_new_dealer_is_noticed_once_and_unsupported_menu_flagged(self):
+        s = snap10(latina())
+        s["levels"] = {"levels": [{"id": "banco", "kind": "persona", "name": "Don Ernesto", "state": "announced",
+                                   "teaser": "Gold is not shown."}]}
+        led = {}
+        first = co.dealer_notices(s, led)
+        self.assertTrue(any("ANUNCIADO banco" in x for x in first))
+        self.assertEqual(co.dealer_notices(s, led), [], "solo una vez")
+        s["dealers"] = {"banco": {"name": "Don Ernesto", "open_to_all": False,
+                                  "menu": {"sells": [{"gold": 5, "list_price": 100}], "buys": []}}}
+        s["me"]["unlocked"] = ["banco"]
+        out = co.dealer_notices(s, led)
+        self.assertTrue(out and "NUEVO VENDEDOR banco" in out[0] and "ACCESIBLE" in out[0] and "NO SOPORTADAS" in out[0])
+        self.assertEqual(co.dealer_notices(s, led), [])
+
 
 if __name__ == "__main__":
     unittest.main()

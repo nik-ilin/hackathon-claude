@@ -69,6 +69,98 @@ def sync_approval(state: dict, thread: dict, team: str, now: datetime | None = N
     return changed
 
 
+import re
+
+STRICT_FIELDS = ("card", "buyer", "price", "venue", "date", "valid_until", "commission", "commission_payer")
+_TEAM = re.compile(r"^t\d+$")
+
+
+def parse_structured_approval(text: str, now: datetime | None = None) -> tuple[dict | None, str]:
+    """Aprobación del formato estricto de UNA línea, con TODOS los campos y sin ambigüedad sobre la comisión:
+
+        APPROVE card=MAL-07 buyer=t02 price=14 venue=v10 date=2026-10-03 valid_until=18:30 commission=1 commission_payer=t05
+
+    `commission` es lo que Team 5 abona a Team 15 por venta liquidada (puede ser 0) y `commission_payer` quién la abona.
+    Falta un campo, un valor raro, otra fecha distinta de hoy o una hora ya pasada ⇒ se rechaza con el motivo. La
+    comisión por cobrar NUNCA se trata como efectivo."""
+    line = str(text or "").strip()
+    if "\n" in line or not line.startswith("APPROVE "):
+        return None, "debe ser una sola línea que empiece por APPROVE"
+    kv = {}
+    for part in line[len("APPROVE "):].split():
+        if "=" not in part:
+            return None, f"campo mal formado: {part!r}"
+        k, v = part.split("=", 1)
+        if k in kv:
+            return None, f"campo repetido: {k}"
+        kv[k] = v
+    missing = [f for f in STRICT_FIELDS if f not in kv]
+    extra = [k for k in kv if k not in STRICT_FIELDS]
+    if missing or extra:
+        return None, f"campos obligatorios ausentes {missing} o desconocidos {extra}"
+    if not re.fullmatch(r"[A-Z]{3}-\d{2}", kv["card"]):
+        return None, "card no válida"
+    if not _TEAM.match(kv["buyer"]) or not _TEAM.match(kv["commission_payer"]):
+        return None, "buyer y commission_payer deben ser ids de equipo (tNN)"
+    if not re.fullmatch(r"v\d+|rastro", kv["venue"]):
+        return None, "venue no válido"
+    try:
+        price, commission = int(kv["price"]), int(kv["commission"])
+        day = datetime.strptime(kv["date"], "%Y-%m-%d").date()
+        hh, mm = map(int, kv["valid_until"].split(":"))
+        deadline = datetime.combine(day, time(hh, mm), TZ)
+    except ValueError:
+        return None, "price/commission enteros, date AAAA-MM-DD y valid_until HH:MM"
+    if price < 1 or commission < 0:
+        return None, "price ≥ 1 y commission ≥ 0"
+    now = now or datetime.now(TZ)
+    now = now.astimezone(TZ) if now.tzinfo else now.replace(tzinfo=TZ)
+    if deadline <= now:
+        return None, "aprobación vencida"
+    if day != now.date():
+        return None, "la fecha debe ser hoy (no se extiende a otro día)"
+    return {"card": kv["card"], "buyer": kv["buyer"], "price": price, "venue": kv["venue"],
+            "commission_per_sale": commission, "commission_payer": kv["commission_payer"],
+            "expires_at": deadline.isoformat()}, ""
+
+
+def sync_structured(state: dict, thread: dict, team: str, now: datetime | None = None) -> list[str]:
+    """Importa aprobaciones estrictas de t05 de un hilo oficial de EQUIPO (t05↔nosotros). Cada mensaje queda ligado a
+    su id inmutable; si su cuerpo cambia después se marca `tampered`. Los mensajes ambiguos se registran y rechazan."""
+    if not thread or thread.get("kind") != "team":
+        return []
+    parties = {str(thread.get(k, "")).lower() for k in ("team", "with")}
+    if APPROVER not in parties or str(team).lower() not in parties:
+        return []
+    state.setdefault("approvals", {})
+    state.setdefault("rejected_messages", {})
+    changed = []
+    for message in thread.get("messages", []):
+        if str(message.get("sender", "")).lower() != APPROVER or not str(message.get("text") or "").startswith("APPROVE"):
+            continue
+        key = f"{thread.get('id')}:{message.get('id')}"
+        sale_key = f"{key}:strict"
+        body = str(message.get("text") or "")
+        prior = state["approvals"].get(sale_key)
+        if prior:
+            if prior.get("body") != body:
+                prior.update(status="tampered", error="el mensaje aprobado cambió")
+                changed.append(sale_key)
+            continue
+        if message.get("offer") is not None:
+            state["rejected_messages"][key] = {"body": body, "reason": "debe ser un mensaje, sin oferta estructurada"}
+            continue
+        terms, why = parse_structured_approval(body, now)
+        if terms is None:
+            state["rejected_messages"][key] = {"body": body, "reason": why}
+            continue
+        state["approvals"][sale_key] = {**terms, "key": sale_key, "source_key": key, "thread_id": thread.get("id"),
+                                        "message_id": message.get("id"), "author_team": APPROVER, "body": body,
+                                        "status": "approved", "strict": True}
+        changed.append(sale_key)
+    return changed
+
+
 def _live(approval: dict, now: datetime | None = None) -> bool:
     if approval.get("status") != "approved" or not approval.get("expires_at"):
         return False
@@ -113,8 +205,8 @@ def listing_candidates(state: dict, me: dict, tick_seconds: float | None,
             blockers.append("comprador top 6: la API no permite comprobar si esta venta completa su página")
         out.append({"type": "list", "module": "comision v10", "kind": "venta aprobada",
                     "asset": asset["id"], "ref": f"card:{approval['card']}", "price": approval["price"],
-                    "venue": VENUE, "to": approval["buyer"], "expires_in": expires_in,
-                    "v10_approval": True, "approval_key": key, "score": 10**8, "du": None,
+                    "venue": approval.get("venue", VENUE), "to": approval["buyer"], "expires_in": expires_in,
+                    "v10_approval": True, "approval_key": key, "score": 4.5 * 10 ** 5, "du": None,
                     "blockers": blockers, "reason": f"autorización #{THREAD_ID}/{MESSAGE_ID}"})
     return out
 
@@ -125,7 +217,8 @@ def validate_candidate(candidate: dict, state: dict) -> tuple[bool, str | None]:
         return False, "aprobación ausente o vencida"
     actual = (candidate.get("to"), candidate.get("price"),
               str(candidate.get("ref", "")).removeprefix("card:"), candidate.get("asset"), candidate.get("venue"))
-    expected = (approval["buyer"], approval["price"], approval["card"], approval.get("asset_id"), VENUE)
+    expected = (approval["buyer"], approval["price"], approval["card"], approval.get("asset_id"),
+                approval.get("venue", VENUE))
     if candidate.get("type") != "list" or not candidate.get("v10_approval") or actual != expected:
         return False, "carta, comprador, precio, copia o venue no coincide con la autorización"
     return True, None
@@ -169,7 +262,7 @@ def reconcile_feed(state: dict, events: list, team: str) -> list[dict]:
                        and i.get("frm") == team and str(i.get("to", "")).lower() == approval["buyer"]
                        for i in payload.get("items", []))
         parties = {str(p).lower() for p in payload.get("parties", [])}
-        exact = (payload.get("venue") == VENUE and payload.get("price") == approval["price"]
+        exact = (payload.get("venue") == approval.get("venue", VENUE) and payload.get("price") == approval["price"]
                  and (buyer == approval["buyer"] or approval["buyer"] in parties)
                  and team in parties and approval["buyer"] in parties and card_out)
         settlement = payload.get("settlement", event.get("id"))

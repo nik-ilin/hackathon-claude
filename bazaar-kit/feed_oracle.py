@@ -677,10 +677,12 @@ class Oracle:
         }
 
     def arbitrage(self, *, margin: int = 1) -> list[dict]:
-        """Cartas más baratas entre equipos que al dealer más barato.
+        """REFERENCIA DE PRECIOS (no es arbitraje): ask de un equipo frente al precio observado de un dealer.
 
-        Comprar a un equipo por debajo del suelo del dealer es excedente sin
-        negociar. No considera comisiones: las pone quien ejecuta.
+        Compara DOS precios de venta con datos HISTÓRICOS: `asks` y `holders` acumulan todo lo visto en el feed, sin id de
+        oferta, sin vigencia y sin saber si se retiró. No considera comisiones. Para saber si algo es ejecutable hay que
+        contrastarlo con las ofertas vivas (`opportunities.price_reference` lo hace); el arbitraje real exige además una
+        pata de venta viva (`opportunities.executable_arbitrage`).
         """
         out = []
         best: dict[str, tuple[str, int]] = {}
@@ -728,12 +730,12 @@ class Oracle:
         return dict(sorted(hot.items(), key=lambda kv: -kv[1]))
 
     def who_has(self, ref: str) -> list[str]:
-        """Equipos con evidencia publicada de tener la carta."""
+        """POSEEDORES HISTÓRICOS: equipos que alguna vez publicaron o recibieron la carta (no implica que la tengan hoy)."""
         cm = self.cards.get(ref)
         return sorted(cm.holders) if cm else []
 
     def who_wants(self, ref: str) -> list[str]:
-        """Equipos con evidencia publicada de buscarla: a quién vender."""
+        """BUSCADORES HISTÓRICOS de la carta (pujaron en el pasado). No son compradores confirmados."""
         cm = self.cards.get(ref)
         return sorted(cm.seekers) if cm else []
 

@@ -61,7 +61,7 @@ TICKS_PER_HOUR = 120.0
 REFRESH_MIN, REFRESH_MAX = 15.0, 30.0
 
 #: Módulos hermanos que pueden existir o no: se están escribiendo en paralelo.
-OPTIONAL = ("playbook", "rivals", "signals", "feed_stream")
+OPTIONAL = ("playbook", "rivals", "signals", "feed_stream", "opportunities")
 
 #: Orden de fiabilidad, para que la chuleta empiece por lo que está probado.
 CONF_RANK = {"SETTLED": 5, "FINAL": 4, "HIGH": 3, "MEDIUM": 2, "RARITY": 1,
@@ -175,6 +175,8 @@ class Snapshot:
     rivals: dict = field(default_factory=dict)
     signals_text: str = ""
     build_ms: int = 0
+    events: list = field(default_factory=list)   # eventos del feed vistos (para contrastar pistas con ofertas vivas)
+    agent: dict = field(default_factory=dict)    # estado que escribe el coordinador (data/opportunities*.json)
 
 
 class Builder:
@@ -200,6 +202,7 @@ class Builder:
         self._catalog_refs = 0
         self._cache: Optional[Snapshot] = None
         self._lock = threading.Lock()
+        self._events: dict = {}
 
     def _new_aggs(self) -> dict:
         """Los agregadores de los módulos hermanos que existan.
@@ -233,8 +236,34 @@ class Builder:
         """Un lote va al Oracle y a cada agregador opcional."""
         if not events:
             return
+        for ev in events:
+            if isinstance(ev, dict) and ev.get("id") is not None:
+                self._events[ev["id"]] = ev
+        if len(self._events) > 6000:   # acotado: solo los más recientes
+            for k in sorted(self._events)[:len(self._events) - 6000]:
+                self._events.pop(k, None)
         self.oracle.ingest(events)
         self._each("ingest", events)
+
+    def _agent_state(self) -> dict:
+        """Estado del agente: el fichero del coordinador REAL si existe (y se distingue de un simple análisis)."""
+        out: dict = {}
+        for name in ("opportunities.json", "opportunities_analysis.json"):
+            path = self.root / "data" / name
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            data["_file"], data["_age_s"] = name, max(0.0, time.time() - float(data.get("generated") or 0))
+            out[data.get("mode", "?")] = data
+        for name, key in (("radio_state.json", "radio"), ("radio_state_analysis.json", "radio_analysis")):
+            try:
+                data = json.loads((self.root / "data" / name).read_text())
+            except (OSError, ValueError):
+                continue
+            data["_age_s"] = max(0.0, time.time() - float(data.get("generated") or 0))
+            out[key] = data
+        return out
 
     def _rivals_json(self) -> dict:
         agg = self.aggs.get("rivals")
@@ -310,6 +339,8 @@ class Builder:
             mods=self.mods,
             rivals=self._rivals_json(),
             signals_text=self._signals_text(),
+            events=sorted(self._events.values(), key=lambda e: (e.get("tick") or 0, e.get("id") or 0)),
+            agent=self._agent_state(),
         )
         snap.build_ms = int((time.time() - t0) * 1000)
         return snap
@@ -395,7 +426,7 @@ def now_actions(oracle: Oracle, limit: int = 10) -> dict:
     Ambas listas van ordenadas por primas en juego, que es el único orden que
     importa cuando sólo hay tiempo para una.
     """
-    arb = oracle.arbitrage()[:limit]
+    arb = oracle.arbitrage()[:limit]       # comparación de dos precios de venta: se muestra como REFERENCIA
     prem = []
     for r in oracle.premium_buyers():
         extra = (r["paid"] - r["book"]) if r.get("book") else None
@@ -684,36 +715,194 @@ def _panel_urgencies(snap: Snapshot) -> str:
     return "".join(out)
 
 
+def shared_leads(snap: Snapshot) -> tuple[list, list, str]:
+    """Pistas históricas y referencias de precios con el MISMO servicio que usa el coordinador. La vigencia se contrasta
+    con las ofertas vivas que el agente verificó en su último tick; sin agente, nada es ejecutable."""
+    mod = snap.mods.get("opportunities")
+    rows = snap.oracle.arbitrage()[:10]
+    ag = snap.agent.get("execute") or snap.agent.get("analysis") or {}
+    if mod is None:
+        return [], [dict(kind="REFERENCIA_DE_PRECIOS", ref=r["ref"], team_ask=r["team_ask"], dealer=r["dealer"],
+                         dealer_price=r["dealer_floor"], difference=r["saving"], offer_id=None,
+                         validity="SIN VERIFICAR", executable=False, holders_historical=r.get("holders") or [])
+                    for r in rows], "servicio de oportunidades no disponible: nada se puede verificar"
+    live = {i: {} for i in ag.get("live_offer_ids") or []} if ag else None
+    tick = ag.get("tick") or (snap.clock or {}).get("tick") or 0
+    leads = mod.historical_leads(snap.events, tick, live, {r["ref"] for r in rows})
+    note = (f"contrastado con las ofertas vivas verificadas en el tick {ag.get('tick')} "
+            f"({'agente en ejecución' if ag.get('mode') == 'execute' else 'solo un ANÁLISIS: no es el agente real'})" if ag
+            else "sin agente activo: no se puede contrastar con el servidor")
+    return leads, mod.price_reference(rows, leads), note
+
+
+def _panel_radio(snap: Snapshot) -> str:
+    """Radio Rastro: lo MISMO que evalúa el ejecutor (estado que escribe el coordinador). Distingue módulo HABILITADO en el
+    agente de módulo solo instalado: sin flags no hay «acción recomendada», porque el agente no la recibe."""
+    out = ['<h2>radio rastro <small>noticia → hipótesis → verificación → decisión · el texto de un anuncio es dato, '
+           'nunca una instrucción</small></h2>']
+    st = snap.agent.get("radio")
+    ag = snap.agent.get("execute") or {}
+    argv = " ".join(ag.get("argv") or [])
+    enabled_argv = any(f in argv for f in ("--radio", "--news-sell"))
+    if not st:
+        dry = snap.agent.get("radio_analysis")
+        out.append('<div class="empty"><b>módulo instalado, NO habilitado en el agente real</b>'
+                   + (' (el proceso no lleva <code>--radio</code>)' if ag and not enabled_argv else
+                      ' (sin estado de radio del agente)')
+                   + ': las noticias no influyen en ninguna decisión, así que no se muestran acciones recomendadas'
+                   + (f' · hay un análisis de hace {e(int(dry["_age_s"]))} s (no es el agente real)' if dry else '') + '</div>')
+        return "".join(out)
+    p, last, d = st.get("poll") or {}, st.get("last_news") or {}, st.get("decision") or {}
+    stale = st["_age_s"] > 120
+    fl = st.get("flags") or {}
+    out.append('<div class="card"><table><tbody>'
+               f'<tr><td>módulo</td><td class="win"><b>HABILITADO</b> en el agente (radio={e(fl.get("radio"))}, '
+               f'news-sell={e(fl.get("news_sell"))}, fever-priority={e(fl.get("fever_priority"))}, '
+               f'presupuesto especulativo {e(fl.get("spec_budget"))} P)</td></tr>'
+               f'<tr><td>último sondeo</td><td class="{"bad" if stale else "win"}">tick {e(p.get("tick"))} · hace '
+               f'{e(int(st["_age_s"]))} s · {e(p.get("n_items"))} noticias · nuevas: {e(p.get("new_ids") or "ninguna")}'
+               f'{" — OBSOLETO" if stale else ""}</td></tr>'
+               f'<tr><td>última noticia</td><td>#{e(last.get("id"))} t{e(last.get("tick"))} [{e(last.get("source"))}] '
+               f'{e(last.get("headline"))} → <b>{e(last.get("status"))}</b>'
+               f'{" · " + e("; ".join(last.get("causes") or [])) if last.get("causes") else ""}</td></tr>'
+               f'<tr><td>decisión del agente</td><td><b>{e(d.get("action"))}</b> <span class="dim">(noticia #{e(d.get("news_id"))}, '
+               f't{e(d.get("tick"))}{", EJECUTADA" if d.get("executed") else ", no ejecutada"})</span>'
+               f'{"<div class=dim>" + e(d.get("delta")) + "</div>" if d.get("delta") else ""}</td></tr>'
+               f'<tr><td>por estado</td><td class="dim">{e(st.get("counts"))}</td></tr></tbody></table></div>')
+    srcs = st.get("sources") or {}
+    if srcs:
+        out.append('<div class="card"><b>fiabilidad por fuente</b> <span class="dim">(muestra e incertidumbre; ausencia de '
+                   'operaciones visibles no prueba falsedad)</span><table><tbody>' + "".join(
+                       f'<tr><td>{e(k)}</td><td>n={e(v.get("n"))} · IC90 {e(v.get("ci90"))} · sin confirmar '
+                       f'{e(v.get("unconfirmed"))} · {e(v.get("label"))}</td></tr>' for k, v in srcs.items()) + '</tbody></table></div>')
+    ops = st.get("opportunities") or []
+    out.append('<div class="card"><b>oportunidades que evalúa el ejecutor</b>')
+    if not ops:
+        out.append('<div class="empty">ninguna noticia produce candidata ahora mismo</div>')
+    else:
+        out.append('<table><thead><tr><th>#</th><th>estado</th><th>activo / contraparte</th><th>plan A·B·C·D (interno)</th>'
+                   '<th>cambio frente a «sin noticia» / motivo</th></tr></thead><tbody>' + "".join(
+                       f'<tr><td class="ref">{e(o.get("news_id"))}</td><td><b>{e(o.get("status"))}</b></td>'
+                       f'<td>{e(o.get("ref"))} #{e(o.get("asset"))} → {e(o.get("dealer"))}</td>'
+                       f'<td class="dim">{e((o.get("plan") or {}).get("why") or "")}</td>'
+                       f'<td>{e((o.get("plan") or {}).get("delta") or o.get("why") or "")}'
+                       f'<div class="dim">{e("; ".join(o.get("blockers") or []))}</div></td></tr>' for o in ops) + '</tbody></table>')
+    out.append('</div>')
+    nop = st.get("no_opportunity") or []
+    if nop:
+        out.append('<div class="card"><b>señales que NO generaron oportunidad</b><table><tbody>' + "".join(
+            f'<tr><td class="ref">{e(o["news_id"])}</td><td>{e(o["status"])}</td><td class="dim">{e(o["reason"])}</td></tr>'
+            for o in nop) + '</tbody></table></div>')
+    rows = st.get("recent") or []
+    if rows:
+        out.append('<div class="card"><table><thead><tr><th>#</th><th>tick</th><th>fuente</th><th>estado</th><th>titular / '
+                   'interpretación / evidencia</th></tr></thead><tbody>' + "".join(
+                       f'<tr><td class="ref">{e(r["id"])}</td><td>{e(r.get("tick"))}</td><td>{e(r.get("source"))}</td>'
+                       f'<td><b>{e(r.get("status"))}</b><div class="dim">{e(r.get("epistemic"))}</div></td>'
+                       f'<td>{e(r.get("headline"))}<div class="dim">{e(r.get("direction"))} · fin: '
+                       f'{e(((r.get("window") or {}).get("end") or {}).get("certainty"))}'
+                       f'{" · " + e("; ".join(r.get("causes") or [])) if r.get("causes") else ""}</div>'
+                       f'<div class="dim">{e("; ".join(x["dir"] + ": " + x["text"] for x in (r.get("evidence") or [])))}</div>'
+                       f'{"<div class=dim>asociación: " + e(r["association"]) + "</div>" if r.get("association") else ""}</td></tr>'
+                       for r in rows) + '</tbody></table></div>')
+    return "".join(out)
+
+
+def _panel_agent(snap: Snapshot) -> str:
+    """Último tick del agente, modo, memoria, fase, bloqueos y oportunidades con rol, vigencia y motivo."""
+    out = ['<h2>agente <small>estado que escribe el coordinador (misma fuente que decide)</small></h2>']
+    ag = snap.agent.get("execute")
+    dry = snap.agent.get("analysis")
+    srv_tick = (snap.clock or {}).get("tick")
+    if not ag:
+        out.append('<div class="empty">no hay estado de un agente en modo EJECUCIÓN'
+                   + (f' (hay un análisis del tick {e(dry.get("tick"))}, hace {e(int(dry["_age_s"]))} s)' if dry else '')
+                   + ': las pistas no se pueden verificar</div>')
+        return "".join(out)
+    lag = (srv_tick - ag["tick"]) if (srv_tick is not None and ag.get("tick") is not None) else None
+    stale = ag["_age_s"] > 120
+    mem = ag.get("memory") or {}
+    mem_txt = ("no integrada (coordinador sin memoria)" if not mem.get("integrated") else
+               ("OK" if mem.get("ok") else f'DEGRADADA ({e(mem.get("error"))})')
+               + f' · {e(mem.get("stored_events"))} eventos')
+    ph = ag.get("phase") or {}
+    out.append(
+        '<div class="card"><table><tbody>'
+        f'<tr><td>modo</td><td class="ref"><b>{e(ag.get("mode", "?").upper())}</b> · pid {e(ag.get("pid"))} · código '
+        f'{e(ag.get("fingerprint"))}</td></tr>'
+        f'<tr><td>último tick procesado</td><td class="{"bad" if stale or (lag or 0) > 3 else "win"}">'
+        f'{e(ag.get("tick"))} (servidor: {e(srv_tick)}; retraso {e(lag)} ticks; escrito hace {e(int(ag["_age_s"]))} s'
+        f'{" — OBSOLETO: el agente no escribe" if stale else ""})</td></tr>'
+        f'<tr><td>memoria</td><td>{mem_txt} · market.db hasta el tick {e(mem.get("market_db_last_tick"))}'
+        f' (retraso {e(mem.get("market_db_lag_ticks"))})</td></tr>'
+        + (f'<tr><td>fase</td><td>{e(ph.get("phase"))} · {e(ph.get("minutes_to_close"))} min al cierre'
+           f'{" · " + e(ph.get("reason")) if ph.get("reason") else ""}</td></tr>' if ph else '')
+        + f'<tr><td>argumentos</td><td class="dim">{e(" ".join(ag.get("argv") or [])[:300])}</td></tr>'
+        '</tbody></table></div>')
+    blk = ag.get("blockers") or []
+    out.append('<div class="card"><h2 style="margin-top:0">por qué NO se ejecuta <small>causa principal de cada candidata</small></h2>')
+    if not blk:
+        out.append('<div class="empty">sin bloqueos registrados</div>')
+    else:
+        out.append('<table><tbody>' + "".join(f'<tr><td class="money">{e(b["count"])}</td><td>{e(b["reason"])}</td></tr>'
+                                              for b in blk) + '</tbody></table>')
+    out.append('</div><div class="card"><h2 style="margin-top:0">oportunidades <small>candidatas reales del coordinador</small></h2>')
+    rows = ag.get("opportunities") or []
+    if not rows:
+        out.append('<div class="empty">ninguna candidata en este tick</div>')
+    else:
+        out.append('<table><thead><tr><th>estado</th><th>tipo</th><th>carta</th><th>oferta</th><th>contraparte</th>'
+                   '<th>rol</th><th>vigencia</th><th>precio</th><th>comisión</th><th>valor marginal</th><th>capital</th>'
+                   '<th>motivo</th></tr></thead><tbody>')
+        for r in rows[:25]:
+            cls = "win" if r["status"] in ("SELECCIONADA", "EJECUTABLE") else "dim"
+            out.append(
+                f'<tr class="row" data-q="{e(r.get("ref"))} {e(r.get("counterparty"))}"><td class="{cls}">{e(r["status"])}</td>'
+                f'<td>{e(r["type"])}</td><td class="ref">{e(r.get("ref"))}</td><td>{e(r.get("offer_id") or r.get("thread") or "—")}</td>'
+                f'<td>{e(r.get("counterparty") or "—")}</td><td class="dim">{e(r["role"])}</td>'
+                f'<td>{"hasta t" + e(r["valid_until"]) if r.get("valid_until") else "—"}'
+                f'{" · verificada" if r.get("verified_live") else ""}</td>'
+                f'<td class="money">{e(r.get("price"))}</td><td>{e(r.get("fee"))}</td>'
+                f'<td class="money">{e(num(r.get("marginal_value")))}</td><td class="money">{e(r.get("capital_needed"))}</td>'
+                f'<td class="dim">{e((r.get("reason") or "")[:140])}</td></tr>')
+        out.append('</tbody></table>')
+    out.append('</div>')
+    return "".join(out)
+
+
 def _panel_now(snap: Snapshot) -> str:
     acts = now_actions(snap.oracle)
+    leads, refs, note = shared_leads(snap)
     out = ['<h2>2 · qué hacer AHORA <small>ordenado por primas en juego</small></h2>',
            '<div class="grid">']
 
-    out.append('<div class="card"><h2 style="margin-top:0">arbitraje'
-               ' <small>un equipo lo pide por debajo del suelo del dealer</small></h2>')
-    if not acts["arbitrage"]:
+    out.append('<div class="card"><h2 style="margin-top:0">referencia de precios (NO es arbitraje)'
+               ' <small>' + e(note) + '</small></h2>')
+    if not refs:
         out.append('<div class="empty">nada ahora mismo</div>')
     else:
-        out.append('<table><thead><tr><th>carta</th><th>equipo pide</th>'
-                   '<th>suelo dealer</th><th>ahorro</th><th>a quién</th></tr></thead><tbody>')
-        for a in acts["arbitrage"]:
+        out.append('<table><thead><tr><th>carta</th><th>ask de un equipo</th><th>precio del dealer</th>'
+                   '<th>diferencia</th><th>vigencia</th><th>rol</th></tr></thead><tbody>')
+        for a in refs:
+            live = a["validity"] == "VIGENTE"
+            who = ", ".join(a["holders_historical"]) or "?"
             out.append(
-                f'<tr class="row" data-q="{e(a["ref"])} {e(a.get("rarity"))}">'
-                f'<td class="ref">{e(a["ref"])}<span class="b b-{e((a.get("rarity") or "none").lower())}">'
-                f'{e(a.get("rarity") or "?")}</span></td>'
-                f'<td class="money win">{e(a["team_ask"])}</td>'
-                f'<td>{e(a["dealer_floor"])} <span class="dim">{e(a["dealer"])}</span></td>'
-                f'<td class="money win">+{e(a["saving"])}</td>'
-                f'<td class="dim">{e(", ".join(a["holders"]) or "?")}</td></tr>')
-        out.append('</tbody></table>')
+                f'<tr class="row" data-q="{e(a["ref"])}"><td class="ref">{e(a["ref"])}</td>'
+                f'<td class="money">{e(a["team_ask"])} <span class="dim">{"oferta #" + e(a["offer_id"]) if a.get("offer_id") else "sin oferta identificada"}</span></td>'
+                f'<td>{e(a["dealer_price"])} <span class="dim">{e(a["dealer"])}</span></td>'
+                f'<td class="money {"win" if live else "dim"}">{e(a["difference"])}</td>'
+                f'<td class="{"win" if live else "bad"}">{e(a["validity"])}</td>'
+                f'<td class="dim">{"vendedor confirmado" if live else "poseedor histórico: " + e(who)}</td></tr>')
+        out.append('</tbody></table><div class="dim" style="margin-top:6px">dos precios de venta no son arbitraje; '
+                   'solo la oferta VIGENTE es ejecutable y la evalúa el agente</div>')
     out.append('</div>')
 
-    out.append('<div class="card"><h2 style="margin-top:0">pagan sobreprecio'
-               ' <small>a quién venderle caro, y qué set le falta</small></h2>')
+    out.append('<div class="card"><h2 style="margin-top:0">pagaron sobreprecio (histórico)'
+               ' <small>compradores HISTÓRICOS: no hay puja viva confirmada</small></h2>')
     if not acts["premium"]:
         out.append('<div class="empty">ningún sobreprecio observado todavía</div>')
     else:
-        out.append('<table><thead><tr><th>equipo</th><th>carta</th><th>pagó</th>'
+        out.append('<table><thead><tr><th>comprador histórico</th><th>carta</th><th>pagó</th>'
                    '<th>book</th><th>×</th><th>set</th></tr></thead><tbody>')
         for r in acts["premium"]:
             out.append(
@@ -938,6 +1127,8 @@ def render_page(snap: Snapshot) -> str:
     body = [
         _panel_clock(snap, refresh),
         _panel_urgencies(snap),
+        _panel_agent(snap),
+        _panel_radio(snap),
         _panel_now(snap),
         _panel_cheatsheet(snap),
         _panel_cards(snap),

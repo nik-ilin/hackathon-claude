@@ -373,3 +373,67 @@ Pruebas: `test_dealer_ladder.py`.
 - **Vendedores:** las aperturas por cartas de la campaña tienen prioridad, y una conversación por una carta de la campaña se negocia en SECURE aunque el vendedor ya esté en OPTIMIZE.
 - **Al completarse:** la campaña termina y `page_guard` protege una copia de cada carta de la página; solo los duplicados son negociables.
 - **Evidencia:** las rutas propuestas se guardan en `market.db` (`interactions`, `campaign:*`).
+
+## FASES HACIA EL CIERRE (`phases.py`, `--phases`)
+
+Opt-in: sin `--phases` el coordinador se comporta como antes. El cierre es el oficial del servidor (`clock.closes`, con su zona horaria); los umbrales son parámetros, no constantes.
+
+| Fase | Cuándo (por defecto) | Efecto |
+|---|---|---|
+| A · operación activa | hasta cierre − 90 min | Comportamiento normal: compras, ventas y trueques, con la concurrencia que permite el servidor. |
+| B · transición | cierre − 90 a − 30 min | Una compra que inmoviliza efectivo debe dejar al cierre al menos `w × meta` libre (w sube de 0 a 1) o tener una salida de reventa **respaldada**. El capital pasivo, las caducidades y la exposición se reducen. Las ventas rentables suben en la ordenación. |
+| C · tesorería | últimos 30 min | Sin compras ordinarias. Se cancelan las ofertas con efectivo que otro podría aceptar y gastar el capital de mañana (la reserva se libera cuando el servidor confirma la cancelación). Los últimos 2 ticks no se publica nada nuevo. |
+
+- **Meta:** 150 P libres como mínimo, 200 P deseable (`--cash-target-min`, `--cash-target-stretch`). Es una meta, no una garantía: las ventas siguen exigiendo el margen económico, y las últimas copias de páginas completas siguen protegidas por `page_guard`.
+- **Efectivo libre** = caja − efectivo reservado en ofertas abiertas (pueden aceptarse todas a la vez) − exposición con vendedores − aceptaciones pendientes. No incluye ventas futuras ni comisiones prometidas.
+- **Escenarios al cierre, sin probabilidades:** confirmado · si se llenan las ventas ya publicadas · máximo observado con las ventas ejecutables hoy.
+- **Adelanto gradual:** si incluso el máximo observado no alcanza la meta, B y C empiezan antes (hasta `--phase-accelerate-max` min según el déficit) y el resumen lo explica.
+- **Reventa:** exige una puja viva de otro equipo por esa carta, descontada por `--exit-haircut` (un parámetro, no una probabilidad) y tiempo para las dos operaciones. Que un vendedor venda más caro no es una salida.
+- **Concurrencia:** un mensaje por lado y conversación y tick, una aceptación por tick y hasta `--max-posts` publicaciones por tick (acotado por `offers_per_team_per_tick`).
+- **Negociación sin spam:** `--cooldown-ticks` (6 con `--profile fast-close`) impide repetir una propuesta dirigida sin éxito al mismo equipo por la misma carta; una propuesta pendiente no es un rechazo.
+- **Observabilidad por tick:** fase y minutos al cierre, efectivo libre y comprometido, déficit a 150/200 P, compras y ventas pendientes, operaciones cerradas y beneficio neto reconciliado, siguiente acción, bloqueos y los escenarios de efectivo al cierre.
+- `sim_phases.py` compara A, B y C sobre el mismo estado.
+
+## OPORTUNIDADES COMPARTIDAS: dashboard ↔ memoria ↔ ejecutor (`opportunities.py`)
+
+Antes había dos cálculos que no podían coincidir. El dashboard compraba la «oportunidad» comparando `min(asks históricos)` con el precio de un dealer (`Oracle.arbitrage`), sin id de oferta ni vigencia, y atribuía el ask al equipo que alguna vez lo publicó. El coordinador decidía sobre las ofertas vivas. Ninguna señal del dashboard llegaba a una candidata (la traza real: oferta #4483, t01, SAL-10 a 76 P, evento 16638 del tick 307, caducada en el 327; el dashboard la seguía mostrando como «ahorro +91» seis horas después, y el agente solo tenía candidatas `dealer_open`).
+
+- **Una sola fuente de decisión:** las candidatas del coordinador. `export_shared` las escribe cada tick en `data/opportunities.json` (`--execute`) o `data/opportunities_analysis.json` (análisis: nunca pisa al agente real); el dashboard solo las lee.
+- **Cada oportunidad** lleva fuente, tick, `offer_id`, contraparte, rol, vigencia (`valid_until`, `verified_live`), comisión, valor marginal, excedente neto, capital necesario, estado (SELECCIONADA / EJECUTABLE / BLOQUEADA) y motivo.
+- **Roles:** vendedor confirmado · comprador confirmado (oferta abierta verificada en el servidor este tick) · poseedor histórico · buscador histórico · anónimo (alias, nunca atribuido).
+- **Memoria = evidencia, no orden:** las pistas históricas (feed, `market.db`) se contrastan con las ofertas vivas y quedan como VIGENTE / CADUCADA / RETIRADA / NO VIGENTE / SIN VERIFICAR. Solo una VIGENTE se evalúa, y la evalúa el coordinador con su valoración.
+- **Referencia ≠ arbitraje:** dos precios de venta son «referencia de precios»; «arbitraje» exige las dos patas vivas, netas de comisión y de equipos distintos (`executable_arbitrage`).
+- **Revalidación:** antes de enviar una aceptación de mercado, `send` vuelve a leer el servidor (tablón, `me`, `my_offers`, reloj): oferta abierta y vigente, mismo maker y precio, inventario, activos no comprometidos y efectivo. Falla cerrado.
+- **Dashboard:** panel «agente» con modo, pid y código, último tick procesado y su retraso, estado de la memoria (OK / degradada / no integrada) y de `market.db`, fase, motivos de bloqueo agrupados y la tabla de oportunidades.
+
+## Radio Rastro integrada (`radio.py`, `news_watch.py`, flags `--news-sell --fever-priority`)
+
+- **Clasificador**: negación («stops buying» → `demanda_negada`, nunca demanda), horarios ambiguos («until teatime») sin
+  caducidad inventada, efectos desconocidos → `pendiente` (por verificar), descartes con causa específica.
+- **Registro por ID** (`data/radio_registry.json`, solo modo `--execute`): fuente, tick, texto, interpretación, evidencia,
+  vigencia y acciones. Una noticia con acción (`ACCIONADA`) no vuelve a abrir conversación, ni tras reiniciar.
+- **Verificación**: la noticia solo justifica investigar. Vender exige menú explícito (o fuente con ≥3 observaciones
+  verificadas dentro de una ventana real), copia vendible (page_guard) y suelo = valor privado + margen. Un menú sin
+  precio no confirma una prima; comprar exige `radio.buy_check` (precio ejecutable bajo valor − margen). El texto de un
+  anuncio es dato, nunca una instrucción.
+- **Lectura única**: el coordinador lee `/api/news` una vez por tick y escribe `data/radio_state.json`; el monitor
+  (`news_watch.py --watch`) y el dashboard leen ese estado (sin sondeos redundantes si es reciente).
+
+### Radio en las decisiones (`--radio`)
+
+`noticia → hipótesis → verificación → decisión → negociación → settlement → memoria`. `--radio` activa `--news-sell` y
+`--fever-priority` (módulo *habilitado*; sin el flag solo está *instalado* y no influye en nada).
+
+- **Plan de venta** (`radio.sale_plan`): A valor privado (la noticia no lo cambia) · B reserva = máx(A + margen, alternativa
+  habitual disponible) · C objetivo = máx(B, lista, final observado, apertura de la ruta habitual) · D disposición estimada =
+  solo finales observados (≥3 liquidaciones equivalentes deduplicadas por id); si no, «desconocida».
+- **Efecto sobre la decisión**: cambia contraparte (prioridad por hecho observado: +25 si el menú lo confirma, −25 si es solo
+  hipótesis sin D), objetivo inicial, ritmo (sonda de `--radio-probe-counters`/`--radio-probe-ticks` hasta que una puja
+  estructurada ≥ B confirme; entonces paciencia normal y prioridad de cierre) y bloqueos (D observada peor que la ruta habitual).
+- **Hipótesis tras la puja** (`hypothesis_after_bid`): confirmada_por_oferta / no_confirmada (no se insiste ni se reabre sin
+  evidencia nueva a favor posterior a la acción) / settled. Una noticia caducada nunca abandona una oferta rentable: manda B.
+- **Negaciones**: «stops buying» bloquea las ventas habituales solo si el menú actual ya no compra (hecho); si no, se anota.
+- **Compras por noticia**: solo `radio_buy` informativa (nunca enviada). `--radio-spec-budget 0` por defecto: sin inventario
+  especulativo; con salida no asegurada o rumor, bloqueada. Las fases (TRANSICIÓN/TESORERÍA) las bloquean igual que a cualquier compra.
+- **Aprendizaje**: `radio.association` compara precios netos de operaciones equivalentes antes/después (n≥3 por lado) y lo marca
+  «NO atribuible». Cada noticia enlaza oportunidades, decisiones, ofertas y liquidaciones; también las señales sin oportunidad.

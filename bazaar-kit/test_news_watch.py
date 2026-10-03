@@ -83,18 +83,23 @@ class Calibration(unittest.TestCase):
     def test_verdicts_and_reliability_by_source(self):
         cal = self.cal()
         v = {r["id"]: r["verdict"] for r in cal["news"]}
-        self.assertEqual(v, {3: "cierta", 4: "falsa", 5: "n/a", 6: "falsa"})
+        self.assertEqual(v, {3: "cierta", 4: "sin confirmar", 5: "n/a", 6: "sin confirmar"})
         self.assertEqual(cal["sources"]["radio"]["true"], 1)
-        self.assertEqual(cal["sources"]["tablon"]["reliability"], 0.33)
+        self.assertEqual(cal["sources"]["tablon"]["n"], 0)            # ausencia de operaciones ≠ falsedad
+        self.assertEqual(cal["sources"]["tablon"]["label"], "sin datos suficientes")
+        self.assertEqual(cal["sources"]["tablon"]["ci90"], [0.0, 1.0])
+        self.assertEqual(nw.reliability(cal)["tablon"], nw.PRIORS["tablon"])   # sin muestra se conserva el a priori
         self.assertEqual(cal["sources"]["radio"]["reliability"], 0.67)
+        self.assertEqual(cal["sources"]["radio"]["n"], 1)
         self.assertIn("rare [MAL]", next(r["evidence"] for r in cal["news"] if r["id"] == 3))
         self.assertTrue(any("fiabilidad" in line for line in nw.calibration_lines(cal)))
 
-    def test_without_menu_row_demand_is_false_and_pack_gift_counts(self):
+    def test_without_menu_row_demand_is_unconfirmed_not_false_and_pack_gift_counts(self):
         cal = self.cal(with_row=False, with_gift=True)
         v = {r["id"]: r["verdict"] for r in cal["news"]}
-        self.assertEqual((v[3], v[6]), ("falsa", "cierta"))
-        self.assertEqual(nw.reliability(cal)["radio"], 0.33)
+        self.assertEqual((v[3], v[6]), ("sin confirmar", "cierta"))
+        self.assertEqual(cal["sources"]["radio"]["n"], 0)
+        self.assertEqual(nw.reliability(cal)["radio"], nw.PRIORS["radio"])
 
 
 def mal_catalog():
@@ -154,7 +159,7 @@ class Suggestions(unittest.TestCase):
         self.assertEqual(len(rep["suggestions"]), 3)
         txt = "\n".join(nw.report_lines(rep))
         self.assertIn("CONFIRMADA en el menú actual", txt)
-        self.assertIn("ACCIONES SUGERIDAS:", txt)
+        self.assertIn("ACCIONES SUGERIDAS", txt)
         json.dumps(rep)                                               # exportable con --json
 
 

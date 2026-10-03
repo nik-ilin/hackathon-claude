@@ -62,6 +62,21 @@ DEMAND = re.compile(r"\b(looking for|pays? (?:above|over|more|double)|paying|buy
 SUPPLY = re.compile(r"\b(sells? (?:cheap|below|at a discount)|discount|sale|cheap|clearing)\b")
 GIFT = re.compile(r"\b(gives?|giving|hands? out|free|gift|presents?)\b")
 WINDOW = re.compile(r"\b(half an|one|an|a|two|three|four|\d+(?:\.\d+)?)\s+hours?\b")
+# «stops buying», «no longer pays», «won't buy»: la demanda se RETIRA; no es una demanda positiva.
+NEGATION = re.compile(r"\b(stops?|stopped|stopping|no longer|no more|won'?t|will not|doesn'?t|does not|ceases?|quits?|"
+                      r"refuses?|not)\b(?:\s+\w+){0,2}?\s+(?:buy(?:ing)?|pay(?:s|ing)?|looking|wants?|hunting|collect(?:s|ing)?|"
+                      r"sell(?:s|ing)?)\b")
+# Horarios que NO son una duración medible («until teatime», «after ten», «tonight»): no se inventa una caducidad.
+AMBIGUOUS_TIME = re.compile(r"\b(until|till|after|before|by|at|around)\s+(teatime|tea time|lunch(?:time)?|noon|midnight|"
+                            r"dinner|dusk|dawn|sunset|sunrise|nightfall|closing time|siesta|"
+                            r"ten|nine|eight|seven|six|five|four|three|two|one|eleven|twelve|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b|"
+                            r"\b(today|tonight|this (?:morning|afternoon|evening)|later|soon|for a while|all day|the whole day|"
+                            r"from today|from now on)\b")
+CAUSES = (("meteorología", r"\b(degrees|sunny|sun and|rain|storm|cloud|wind|heat ?wave|snow)\b"),
+          ("deporte / ocio", r"\b(win|wins|won|beat|goal|match|league|atleti|madrid goes|football|derby|concert)\b"),
+          ("transporte", r"\b(metro|bus|line \d+|train|traffic|road|taxi|station|closed between)\b"),
+          ("vida cotidiana", r"\b(queue|shop|churro|bakery|market stall|festival|parade|fair)\b"),
+          ("emisión de la propia radio", r"\b(on the air|broadcast|radio rastro)\b"))
 
 
 # ------------------------------------------------------------------ clasificación
@@ -96,27 +111,48 @@ def window_hours(text: str) -> Optional[float]:
     return float(NUMBERS.get(w, w)) if w in NUMBERS or re.fullmatch(r"\d+(?:\.\d+)?", w) else None
 
 
+def discard_cause(text: str) -> str:
+    """Causa ESPECÍFICA de un descarte: qué tipo de noticia es y por qué no mueve el mercado."""
+    for name, rx in CAUSES:
+        if re.search(rx, text):
+            return f"{name}: sin vendedor, barrio ni rareza del mercado"
+    return "sin vendedor, barrio ni rareza reconocidos (no se identifica efecto de mercado)"
+
+
 def classify(item: dict, catalog: Optional[dict] = None) -> dict:
-    """Noticia -> {id, tick, source, headline, kind, dealer, set, rarity, item, window_hours, rumour}."""
+    """Noticia -> {id, tick, source, headline, kind, dealer, set, rarity, item, window_hours, rumour, negated,
+    time_ambiguous, time_text, reason}. `kind`: demanda / oferta / regalo (efecto afirmado), demanda_negada /
+    oferta_negada (se RETIRA), pendiente (hay vendedor/barrio/rareza pero el efecto no se reconoce: por verificar),
+    irrelevante (con `reason` específica)."""
     text = f"{item.get('headline') or ''}. {item.get('body') or ''}".lower()
     dealer = next((d for d, ws in DEALERS.items() if _has(text, ws)), None)
     set_id = next((s for s, ws in set_names(catalog).items() if _has(text, ws)), None)
     rarity = next((r for r in reversed(RARITIES) if _has(text, RARITY_WORDS[r])), None)
     thing = "pack" if _has(text, ("pack", "packs", "sobre", "sobres")) else ("card" if rarity or set_id else None)
-    if dealer and SUPPLY.search(text):
+    neg = NEGATION.search(text)
+    amb = AMBIGUOUS_TIME.search(text)
+    reason = None
+    if dealer and neg and (DEMAND.search(text) or SUPPLY.search(text) or re.search(r"\bsell", text)):
+        kind = "oferta_negada" if re.search(r"\bsell", neg.group(0)) else "demanda_negada"
+        reason = f"negación «{neg.group(0).strip()}»: no es demanda positiva"
+    elif dealer and SUPPLY.search(text):
         kind = "oferta"
     elif dealer and GIFT.search(text):
         kind = "regalo"
     elif dealer and DEMAND.search(text):
         kind = "demanda"
     elif not dealer and not set_id and not rarity:
-        kind = "irrelevante"
+        kind, reason = "irrelevante", discard_cause(text)
     else:
-        kind = "otra"
+        kind, reason = "pendiente", "efecto no reconocido: hay entidades de mercado pero ninguna acción conocida"
+    # La ventana solo vale si es una DURACIÓN («one hour»); «until teatime» no se convierte en ticks.
+    hours = window_hours(text)
     return {"id": item.get("id"), "tick": item.get("tick"), "source": item.get("source"),
             "source_name": item.get("source_name"), "headline": item.get("headline"), "kind": kind,
-            "dealer": dealer, "set": set_id, "rarity": rarity, "item": thing, "window_hours": window_hours(text),
-            "rumour": item.get("source") == "tablon"}
+            "dealer": dealer, "set": set_id, "rarity": rarity, "item": thing, "window_hours": hours,
+            "rumour": item.get("source") == "tablon", "negated": bool(neg),
+            "time_ambiguous": bool(amb) and hours is None, "time_text": amb.group(0) if amb and hours is None else None,
+            "reason": reason}
 
 
 def window_ticks(c: dict, tick_seconds: Optional[float]) -> Optional[int]:
@@ -205,7 +241,9 @@ def verify(db, c: dict, last_tick: int, tick_seconds: float = DEFAULT_TICK_SECON
     t = int(c.get("tick") or 0)
     w = window_ticks(c, tick_seconds) or int(3600 / tick_seconds)
     end = t + w
-    if c["kind"] == "irrelevante" or (c["kind"] == "otra" and not c.get("dealer")):
+    if c["kind"] in ("demanda_negada", "oferta_negada"):
+        return "n/a", "retirada de demanda/oferta: no se verifica como alza"
+    if c["kind"] == "irrelevante" or (c["kind"] in ("otra", "pendiente") and not c.get("dealer")):
         if c.get("source") == "boletin" and "on the air" in str(c.get("headline") or "").lower():
             n = db.execute("select count(*) from events where type='news.posted'").fetchone()[0]
             return "cierta", f"la radio emite: {n} noticias en el feed"
@@ -226,11 +264,16 @@ def verify(db, c: dict, last_tick: int, tick_seconds: float = DEFAULT_TICK_SECON
             if now and base and sum(now) / len(now) > 1.05 * sum(base) / len(base):
                 return "cierta", f"compras de {did}: media {sum(now) / len(now):.1f} P frente a {sum(base) / len(base):.1f} P"
             if now and base:
-                return "falsa", f"compras de {did} sin subida: {sum(now) / len(now):.1f} P frente a {sum(base) / len(base):.1f} P"
+                if len(now) >= MIN_OBS and len(base) >= MIN_OBS:  # contradicha: evidencia ACTIVA con muestra suficiente
+                    return "falsa", (f"compras de {did} sin subida con muestra suficiente ({len(now)}/{len(base)}): "
+                                     f"{sum(now) / len(now):.1f} P frente a {sum(base) / len(base):.1f} P")
+                return "sin confirmar", (f"pocas compras de {did} para concluir ({len(now)}/{len(base)} < {MIN_OBS}): "
+                                         "no prueba que fuese falsa")
         if end > last_tick:
             return "pendiente", f"la ventana acaba en t{end} (datos hasta t{last_tick})"
         if inside:
-            return "falsa", f"{len(inside)} menús de {did} en la ventana, ninguno con la fila prometida"
+            return "sin confirmar", (f"{len(inside)} menús de {did} en la ventana sin la fila prometida: ausencia de "
+                                     "operaciones visibles, no prueba de falsedad")
         return "sin datos", f"sin menús ni liquidaciones de {did} en t{t}–t{end}"
     if c["kind"] == "regalo":
         gifts = []
@@ -247,8 +290,9 @@ def verify(db, c: dict, last_tick: int, tick_seconds: float = DEFAULT_TICK_SECON
             return "cierta", f"{len(gifts)} regalos de {did} y {len(grants)} grant_all en t{t}–t{end}"
         if end > last_tick:
             return "pendiente", f"la ventana acaba en t{end} (datos hasta t{last_tick})"
-        return "falsa", f"ningún regalo de {did} ({c.get('item') or 'lo prometido'}) en t{t}–t{end}"
-    return "n/a", "tipo sin verificación"
+        return "sin confirmar", (f"ningún regalo de {did} ({c.get('item') or 'lo prometido'}) visible en t{t}–t{end}: "
+                                 "no prueba falsedad")
+    return "pendiente", "efecto desconocido: por verificar, no es un hecho confirmado"
 
 
 def calibrate(db_path: str, catalog: Optional[dict] = None) -> dict:
@@ -271,13 +315,28 @@ def calibrate(db_path: str, catalog: Optional[dict] = None) -> dict:
     return {"last_tick": last, "tick_seconds": ts, "news": rows, "sources": summarize(rows)}
 
 
+def interval(k: int, n: int) -> tuple:
+    """Intervalo de Wilson al 90 % de la proporción de noticias ciertas entre las VERIFICADAS (ciertas + contradichas).
+    Con n = 0 devuelve (0, 1): no se sabe nada; las no confirmadas no cuentan ni a favor ni en contra."""
+    if n <= 0:
+        return 0.0, 1.0
+    z, p = 1.645, k / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return round(max(0.0, c - h), 2), round(min(1.0, c + h), 2)
+
+
 def summarize(rows: list) -> dict:
     out = {}
     for src in SOURCES + tuple(sorted({r.get("source") for r in rows} - set(SOURCES) - {None})):
         mine = [r for r in rows if r.get("source") == src]
         n_true = sum(r["verdict"] == "cierta" for r in mine)
         n_false = sum(r["verdict"] == "falsa" for r in mine)
-        out[src] = {"news": len(mine), "true": n_true, "false": n_false,
+        lo, hi = interval(n_true, n_true + n_false)
+        out[src] = {"news": len(mine), "true": n_true, "false": n_false, "n": n_true + n_false, "ci90": [lo, hi],
+                    "unconfirmed": sum(r["verdict"] == "sin confirmar" for r in mine),
+                    "label": "sin datos suficientes" if n_true + n_false < MIN_OBS else "con muestra",
                     "pending": sum(r["verdict"] == "pendiente" for r in mine),
                     "irrelevant": sum(r["verdict"] in ("n/a", "sin datos") for r in mine),
                     "reliability": round((n_true + 1) / (n_true + n_false + 2), 2)}
@@ -287,8 +346,14 @@ def summarize(rows: list) -> dict:
 def reliability(calib: Optional[dict] = None) -> dict:
     rel = dict(PRIORS)
     for src, row in ((calib or {}).get("sources") or {}).items():
-        rel[src] = row["reliability"]
+        if row.get("n", row["true"] + row["false"]) > 0:  # sin observaciones verificadas se conserva el a priori
+            rel[src] = row["reliability"]
     return rel
+
+
+def observations(calib: Optional[dict] = None) -> dict:
+    """Noticias VERIFICADAS (ciertas + falsas) por fuente: con pocas, la fiabilidad de Laplace no basta para actuar."""
+    return {src: row["true"] + row["false"] for src, row in ((calib or {}).get("sources") or {}).items()}
 
 
 def calibration_lines(cal: dict) -> list:
@@ -298,10 +363,10 @@ def calibration_lines(cal: dict) -> list:
         out.append(f"{r.get('tick') or '?':>5} {r.get('source') or '?':8} {r['kind']:11} {r['verdict']:10} "
                    f"{r.get('headline')}")
         out.append(f"{'':38}↳ {r['evidence']}")
-    out.append(f"{'fuente':8} {'noticias':>8} {'ciertas':>8} {'falsas':>7} {'pend.':>6} {'irrel.':>7} {'fiabilidad':>11}")
+    out.append(f"{'fuente':8} {'noticias':>8} {'ciertas':>8} {'falsas':>7} {'pend.':>6} {'irrel.':>7} {'fiabilidad':>11}  muestra / IC90")
     for src, s in cal["sources"].items():
         out.append(f"{src:8} {s['news']:>8} {s['true']:>8} {s['false']:>7} {s['pending']:>6} {s['irrelevant']:>7} "
-                   f"{s['reliability']:>11.2f}")
+                   f"{s['reliability']:>11.2f}  n={s['n']} [{s['ci90'][0]:.2f}–{s['ci90'][1]:.2f}] {s['label']}")
     return out
 
 
@@ -405,21 +470,35 @@ def copy_loss(val: Optional[tr.Valuation], counts: Counter, asset: dict) -> floa
     return float(asset.get("your_value") or 0.0)
 
 
-def status_of(c: dict, tick: Optional[int], tick_seconds: Optional[float], rel: dict, dealer: Optional[dict]) -> dict:
-    """¿Sigue viva la noticia? Ventana (si hay tick) + fiabilidad de la fuente + confirmación en el menú actual."""
+MIN_OBS = 3  # observaciones verificadas mínimas para fiarse de una fuente sin confirmación en el menú
+
+
+def status_of(c: dict, tick: Optional[int], tick_seconds: Optional[float], rel: dict, dealer: Optional[dict],
+              obs: Optional[dict] = None) -> dict:
+    """¿Sigue viva la noticia? Ventana (solo si es una DURACIÓN) + fiabilidad de la fuente + confirmación en el menú.
+    `obs` (observaciones verificadas por fuente): con menos de MIN_OBS la fuente es «delgada» y solo vale si el menú
+    actual lo confirma. Un horario ambiguo («until teatime») no tiene caducidad: nunca está «dentro de ventana»."""
     w = window_ticks(c, tick_seconds)
     until = c["tick"] + w if c.get("tick") is not None and w is not None else None
     side = "sells" if c["kind"] == "oferta" else "buys"
-    confirmed = bool(c["kind"] in ("demanda", "oferta") and explicit_menu_row(dealer, side, c.get("set"), c.get("rarity")))
+    positive = c["kind"] in ("demanda", "oferta")
+    confirmed = bool(positive and explicit_menu_row(dealer, side, c.get("set"), c.get("rarity")))
     in_window = until is not None and tick is not None and c["tick"] <= tick <= until
     r = rel.get(c.get("source"), 0.5)
+    n_obs = None if obs is None else obs.get(c.get("source"), 0)
+    thin = n_obs is not None and n_obs < MIN_OBS
+    trusted = in_window and r >= RELIABLE and not c.get("rumour") and not thin
+    expired = until is not None and tick is not None and tick > until
     return {"until_tick": until, "in_window": in_window, "confirmed_by_menu": confirmed, "reliability": round(r, 2),
-            "actionable": confirmed or (in_window and r >= RELIABLE and not c.get("rumour"))}
+            "observations": n_obs, "thin_source": thin, "expired": expired,
+            "time_ambiguous": bool(c.get("time_ambiguous")), "time_text": c.get("time_text"),
+            "actionable": positive and (confirmed or trusted)}
 
 
 def sell_suggestions(news: list, dealers: dict, me: dict, catalog: Optional[dict], my_offers: list = (),
                      tick: Optional[int] = None, tick_seconds: Optional[float] = None, rel: Optional[dict] = None,
-                     margin: float = 2.0, ticks_by_id: Optional[dict] = None) -> list:
+                     margin: float = 2.0, ticks_by_id: Optional[dict] = None, obs: Optional[dict] = None,
+                     skip: Optional[callable] = None) -> list:
     """Ventas a un vendedor que, según una noticia de demanda viva, paga más por un barrio/rareza.
     Solo copias que page_guard deja salir (ni protegidas por página completa ni comprometidas); suelo = valor privado
     + margen; petición = máx(suelo, precio de lista al que el vendedor vende esa rareza)."""
@@ -437,8 +516,10 @@ def sell_suggestions(news: list, dealers: dict, me: dict, catalog: Optional[dict
         if c["kind"] != "demanda" or not c.get("dealer"):
             continue
         dealer = (dealers or {}).get(c["dealer"])
-        st = status_of(c, tick, tick_seconds, rel, dealer)
+        st = status_of(c, tick, tick_seconds, rel, dealer, obs)
         if not st["actionable"] or not dealer_buys(dealer, c.get("rarity"), c.get("set")):
+            continue
+        if skip is not None and skip(c):  # ya se actuó por este anuncio (registro persistente)
             continue
         for a in sorted(assets, key=lambda x: x["id"]):
             card = cards.get(a["ref"]) or {}
@@ -453,35 +534,59 @@ def sell_suggestions(news: list, dealers: dict, me: dict, catalog: Optional[dict
             ask = max(floor, dealer_list_price(dealer, rarity) or floor)
             out.append({"type": "news_sell", "news_id": c.get("id"), "source": c.get("source"),
                         "dealer": c["dealer"], "set": set_id, "rarity": rarity, "asset": a["id"], "ref": a["ref"],
-                        "value": round(loss, 2), "floor": floor, "ask": ask, **st,
-                        "text": f"{c['dealer']} compra {rarity or ''} {set_id or ''} por encima de lo habitual"
-                                f"{' hasta t' + str(st['until_tick']) if st['until_tick'] else ''}: tenemos "
+                        "value": round(loss, 2), "floor": floor, "ask": ask, "price_confirmed": False, **st,
+                        "text": f"{c['dealer']} compra {rarity or ''} {set_id or ''} (prima NO confirmada: el menú no "
+                                f"trae precio){' · vigente hasta t' + str(st['until_tick']) if st['until_tick'] else ''}: tenemos "
                                 f"{a['ref']} #{a['id']} con valor privado {loss:.1f} P → abrir venta con {c['dealer']} "
                                 f"pidiendo {ask} P (suelo {floor} P)"})
     return out
 
 
+def not_actionable_causes(c: dict, st: dict) -> list:
+    """Causa ESPECÍFICA de cada descarte (nunca un genérico «no accionable»)."""
+    out = []
+    if c.get("rumour"):
+        out.append("rumor del Tablón (fuente no fiable)")
+    if st.get("time_ambiguous"):
+        out.append(f"caducidad ambigua «{st.get('time_text')}»: no se inventa una ventana")
+    elif st.get("expired"):
+        out.append(f"caducada en t{st['until_tick']}")
+    elif st.get("until_tick") is None and not st.get("time_ambiguous"):
+        out.append("sin ventana temporal declarada")
+    if st.get("thin_source"):
+        out.append(f"fuente con pocas observaciones verificadas ({st.get('observations')} < {MIN_OBS})")
+    elif st.get("reliability", 1) < RELIABLE and not c.get("rumour"):
+        out.append(f"fiabilidad de la fuente {st['reliability']} < {RELIABLE}")
+    if not st.get("confirmed_by_menu"):
+        out.append("sin fila explícita en el menú actual del vendedor")
+    return out
+
+
 def advice(c: dict, st: dict) -> str:
     if c["kind"] == "irrelevante":
-        return "ignorar (sin efecto de mercado)"
+        return "ignorar: " + (c.get("reason") or "sin efecto de mercado")
     if c["kind"] == "regalo":
         if c.get("rumour") or st["reliability"] < RELIABLE:
             return "rumor de fuente poco fiable: ignorar, no abrir conversaciones por esto"
         return ("vigilar sobres sin abrir y abrirlos (new_levels.py --open-packs, dry run)" if c.get("item") == "pack"
                 else "vigilar gift.given; no gastar nada por esto")
+    if c["kind"] in ("demanda_negada", "oferta_negada"):
+        return "NO vender/comprar por esta noticia: la demanda se retira (evitar ofrecerle esa rareza)"
+    if c["kind"] == "pendiente":
+        return "pendiente de verificar: investigar menú y liquidaciones; no actuar sin evidencia"
     if c["kind"] == "demanda":
         if not st["actionable"]:
-            return "no accionable (fuera de ventana, fuente poco fiable o sin fila en el menú)"
+            return "no accionable: " + "; ".join(not_actionable_causes(c, st))
         return "vender a ese vendedor las copias que encajen (ver sugerencias; coordinator --news-sell)"
     if c["kind"] == "oferta":
-        return ("comprar SOLO si el precio queda bajo nuestro valor privado (coordinador)" if st["actionable"]
-                else "no accionable")
+        return ("investigar: comprar SOLO si hay precio ejecutable bajo nuestro valor privado (ruta normal del coordinador)"
+                if st["actionable"] else "no accionable: " + "; ".join(not_actionable_causes(c, st)))
     return "sin acción"
 
 
 def live_report(news_raw, dealers_raw, clock: dict, me: Optional[dict] = None, catalog: Optional[dict] = None,
                 my_offers: list = (), feed_events: Iterable[dict] = (), rel: Optional[dict] = None,
-                margin: float = 2.0, schedule=None) -> dict:
+                margin: float = 2.0, schedule=None, obs: Optional[dict] = None) -> dict:
     rel = rel or dict(PRIORS)
     tick, ts = clock.get("tick"), clock.get("tick_seconds") or DEFAULT_TICK_SECONDS
     dealers = dealer_map(dealers_raw)
@@ -491,9 +596,9 @@ def live_report(news_raw, dealers_raw, clock: dict, me: Optional[dict] = None, c
         c = classify(item, catalog)
         if c.get("tick") is None and c.get("id") in ticks:
             c["tick"] = ticks[c["id"]]
-        st = status_of(c, tick, ts, rel, dealers.get(c.get("dealer")))
+        st = status_of(c, tick, ts, rel, dealers.get(c.get("dealer")), obs)
         rows.append(dict(c, **st, advice=advice(c, st)))
-    sugg = sell_suggestions(rows, dealers, me, catalog, my_offers, tick, ts, rel, margin) if me else []
+    sugg = sell_suggestions(rows, dealers, me, catalog, my_offers, tick, ts, rel, margin, None, obs) if me else []
     now_h = schedule_now(schedule, clock)
     fv = [fever_state(f, now_h, tick) for f in fevers(schedule, catalog)] if schedule is not None else []
     if me:
@@ -516,8 +621,22 @@ def report_lines(rep: dict) -> list:
     for f in rep.get("fevers") or []:
         out.append(f"  FIEBRE {f['state']}: {f['dealer']} +{f['pct']:g} % por {f['set']} · t~{f['start_tick']}–"
                    f"t~{f['end_tick']} · {f['note']}")
-    out.append("ACCIONES SUGERIDAS:" if rep["suggestions"] else "ACCIONES SUGERIDAS: ninguna")
+    out.append("ACCIONES SUGERIDAS (INFORMATIVAS: el agente solo las recibe si arranca con --radio):"
+               if rep["suggestions"] else "ACCIONES SUGERIDAS: ninguna")
     out += [f"  - {s['text']}" for s in rep["suggestions"]]
+    return out
+
+
+def shared_lines(st: dict) -> list:
+    """Vista del estado que escribe el agente (data/radio_state.json): sin sondeos redundantes a /api/news."""
+    p = st.get("poll") or {}
+    out = [f"RADIO RASTRO · estado del AGENTE · sondeo t{p.get('tick')} ({p.get('n_items')} noticias, nuevas: "
+           f"{p.get('new_ids') or 'ninguna'}) · {st.get('counts')}"]
+    for r in st.get("recent") or []:
+        out.append(f"  #{r['id']} t{r.get('tick')} [{r.get('source')}] {r.get('kind')} → {r.get('status')}: "
+                   f"{r.get('headline')}" + (f"\n      ↳ {'; '.join(r['causes'])}" if r.get("causes") else ""))
+    d = st.get("decision") or {}
+    out.append(f"DECISIÓN DEL AGENTE (noticia #{d.get('news_id')}, t{d.get('tick')}): {d.get('action')}")
     return out
 
 
@@ -540,17 +659,29 @@ def main(argv: Optional[list] = None) -> int:
             _dump(cal, a.json)
         return 0
 
+    import radio
     from bazaar_sdk import Bazaar
     key = os.environ.get("BAZAAR_KEY")
     api = Bazaar(DEFAULT_URL, key or "")
     while True:
+        # Lectura única: si el agente (--news-sell) escribió su estado hace poco, se muestra ESE y no se sondea la API.
+        st = radio.fresh_state(max(90.0, 3 * (a.watch or 30)))
+        if st is not None:
+            print("\n".join(shared_lines(st)))
+            if a.json:
+                _dump(st, a.json)
+            if not a.watch:
+                return 0
+            time.sleep(a.watch)
+            continue
         me = catalog = None
         offers: list = []
         if key:
             me, catalog = api.me(), api.catalog()
             offers = (api.my_offers() or {}).get("offers", [])
         rep = live_report(api.call("GET", "/api/news"), api.dealers(), api.clock(), me, catalog, offers,
-                          (api.feed(400) or {}).get("events", []), reliability(cal), a.margin, api.schedule())
+                          (api.feed(400) or {}).get("events", []), reliability(cal), a.margin, api.schedule(),
+                          observations(cal))
         print("\n".join(report_lines(rep)))
         if a.json:
             _dump(rep, a.json)

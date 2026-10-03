@@ -27,12 +27,17 @@ import time
 from collections import Counter
 from pathlib import Path
 
+import accounting as acct
+import bank_dealer as bank
 import campaigns as cp
 import capital as ca
 import market_agent as ma
 import market_intel as mi
 import negotiation as neg
+import opportunities as opps
+import fast_sales as fs
 import news_watch as nw
+import radio
 import intelligence as intel_mod
 import ladder_calibrated as lcal
 import page_campaign as pc
@@ -40,7 +45,9 @@ import ladder_plus as lplus
 import v10_commission as v10c
 import page_guard as pg
 import performance as perf
+import phases as ph_mod
 import team_sale as ts
+import third_party as tp
 import trading as tr
 from bazaar_sdk import Bazaar, BazaarError
 
@@ -142,7 +149,9 @@ def snapshot(reader, cache=None):
                 s["boards"][v["venue"]] = {"offers": []}
     ids = set(s["me"].get("unlocked") or [])
     for lv in (s.get("levels") or {}).get("levels", []):
-        if lv.get("kind") == "persona" and lv.get("open_to_all"):
+        # un vendedor ACTIVO se consulta aunque aún no esté abierto a todos: si estamos desbloqueados (acceso
+        # anticipado) el coordinador negocia con él en cuanto exista; si no, la candidata sale bloqueada y explicada
+        if lv.get("kind") == "persona" and (lv.get("open_to_all") or lv.get("state") == "active"):
             ids.add(lv["id"])
     s["dealers"] = {}
     for d in sorted(ids | {"chato"}):
@@ -151,6 +160,32 @@ def snapshot(reader, cache=None):
         except BazaarError:
             pass
     return s
+
+
+def dealer_notices(s, led):
+    """Avisa UNA vez de un vendedor nuevo (o de que su menú cambió) y de las filas de su menú que la lógica actual no
+    sabe negociar, para que no queden ignoradas en silencio. Solo informa: no envía nada."""
+    seen = led.setdefault("dealers_seen", {})
+    out = []
+    levels = {lv.get("id"): lv for lv in (s.get("levels") or {}).get("levels", []) if lv.get("kind") == "persona"}
+    for did, d in sorted((s.get("dealers") or {}).items()):
+        menu = d.get("menu") or {}
+        sig = json.dumps(menu, sort_keys=True)
+        unsupported = [r for r in menu.get("sells", []) if "rarity" not in r and "pack" not in r]
+        if seen.get(did) == sig:
+            continue
+        first = did not in seen
+        seen[did] = sig
+        unlocked = did in (s["me"].get("unlocked") or []) or d.get("open_to_all")
+        out.append(f"{'NUEVO VENDEDOR' if first else 'MENÚ CAMBIADO'} {did} ({d.get('name') or levels.get(did, {}).get('name')}) "
+                   f"· {'ACCESIBLE: se negocia desde este tick' if unlocked else 'aún no accesible para nosotros'} · "
+                   f"vende {menu.get('sells')} · compra {menu.get('buys')}"
+                   + (f" · FILAS NO SOPORTADAS (revisar a mano): {unsupported}" if unsupported else ""))
+    for did, lv in levels.items():
+        if lv.get("state") == "announced" and seen.get(f"announced:{did}") is None:
+            seen[f"announced:{did}"] = "1"
+            out.append(f"ANUNCIADO {did} ({lv.get('name')}): {lv.get('teaser')} · aún sin menú; se vigila cada tick")
+    return out
 
 
 def other_processes():
@@ -173,7 +208,7 @@ def reconcile(led, s, journal, reader=None, args=None):
     if reader is not None and getattr(args, "v10_commission", False) and team == "t15":
         try:
             official = reader.api.thread(v10c.THREAD_ID)
-            imported = v10c.sync_approval(vstate, official, team)
+            imported = v10c.sync_approval(vstate, official, team) + v10c.sync_structured(vstate, official, team)
             if imported:
                 v10_changed.extend(imported)
                 print(f"   V10 aprobación importada: {', '.join(imported)}")
@@ -191,7 +226,8 @@ def reconcile(led, s, journal, reader=None, args=None):
               f"{vs['commission_due_p']} P confirmadas para el cierre")
     sets = tr.settlements_for(s["feed"].get("events", []), team)
     market = [a for a in led["actions"] if a["type"] in ("accept", "list", "bid", "team_accept", "swap_list")]
-    view = {"actions": market, "spent_confirmed": led["spent_confirmed"], "cash_received": led["cash_received"]}
+    view = {"actions": market, "spent_confirmed": led["spent_confirmed"], "cash_received": led["cash_received"],
+            "counted": acct.counted(led)}
     before = {id(a): a["status"] for a in led["actions"]}
     ma.reconcile_v2(view, s, sets)
     led["spent_confirmed"], led["cash_received"] = view["spent_confirmed"], view["cash_received"]
@@ -207,28 +243,27 @@ def reconcile(led, s, journal, reader=None, args=None):
             t = threads.get(a["thread"])
             if t and t.get("status") == "deal":
                 paid = neg.settled_price(t, a["dealer"])
-                # un hilo solo liquida UNA compra: el dealer_open del mismo hilo (marcado settled al abrir) no cuenta
-                if paid is not None and not any(x.get("thread") == a["thread"] and x["status"] == "settled"
-                                                and x["type"] in ("dealer_accept", "dealer_counter")
-                                                for x in led["actions"] if x is not a):
-                    a.update(status="settled", paid=paid, settled_tick=tick)
-                    led["spent_confirmed"] += paid
-                    journal.append("outcome", {"dealer": a["dealer"], "item": a["item"], "thread": a["thread"],
-                                               "status": "deal", "close_price": paid, "settled": True,
-                                               "context": "normal", "opening": a.get("opening"),
-                                               "note": f"coordinador {VERSION}"})
-                elif a["type"] == "dealer_accept" and tick > a["tick"] + 3:
+                bkey = acct.key_dealer_buy(a["thread"])  # UNA compra por hilo (contraoferta y aceptación = un pago)
+                if paid is None and a["type"] == "dealer_accept" and tick > a["tick"] + 3:
                     # hilo en "deal" sin oferta marcada settled: la carta en el inventario es la evidencia
                     ref = (a.get("item") or "")[5:] if str(a.get("item") or "").startswith("card:") else None
-                    held = ref and any(x.get("ref") == ref for x in s["me"]["assets"])
-                    if held:
-                        a.update(status="settled", paid=a.get("price"), settled_tick=tick,
-                                 note="liquidada por inventario (hilo deal sin oferta settled)")
-                        led["spent_confirmed"] += int(a.get("price") or 0)
+                    if ref and any(x.get("ref") == ref for x in s["me"]["assets"]):
+                        paid = int(a.get("price") or 0)
+                        a["note"] = "liquidada por inventario (hilo deal sin oferta settled)"
+                if paid is not None:
+                    new = acct.count(led, bkey, "spend", paid, tick, a["type"])
+                    a.update(status="settled", paid=paid, settled_tick=tick)
+                    if not new:
+                        a["duplicate_of"] = bkey  # misma compra ya contada: no suma gasto, ni resultado, ni métricas
                     else:
-                        a["status"] = "released"
+                        journal.append("outcome", {"dealer": a["dealer"], "item": a["item"], "thread": a["thread"],
+                                                   "status": "deal", "close_price": paid, "settled": True,
+                                                   "context": "normal", "opening": a.get("opening"),
+                                                   "note": f"coordinador {VERSION}"})
+                elif a["type"] == "dealer_accept" and tick <= a["tick"] + 3:
+                    pass  # aún puede liquidarse
                 else:
-                    a["status"] = "released" if a["type"] == "dealer_counter" else a["status"]
+                    a["status"] = "released" if a["type"] == "dealer_counter" else "released"
             elif t is None or t.get("status") != "open":
                 a["status"] = "released"  # conversación terminada sin trato
             elif a["type"] == "dealer_counter" and tick > a["tick"] + 1:
@@ -238,15 +273,16 @@ def reconcile(led, s, journal, reader=None, args=None):
             t = threads.get(a["thread"])  # VENTA a un vendedor (--dealer-sell-dups): cobramos su give.cash
             if t and t.get("status") == "deal":
                 got = neg.settled_sell_price(t, a["dealer"])
-                if got is not None and not any(x.get("thread") == a["thread"] and x["status"] == "settled"
-                                               and x["type"] in ("dealer_sell_accept", "dealer_sell_counter")
-                                               for x in led["actions"] if x is not a):
+                if got is not None:
+                    new = acct.count(led, acct.key_dealer_sell(a["thread"]), "income", got, tick, a["type"])
                     a.update(status="settled", price=got, received=got, settled_tick=tick)
-                    led["cash_received"] += got
-                    journal.append("outcome", {"dealer": a["dealer"], "item": a["item"], "thread": a["thread"],
-                                               "status": "deal", "side": "sell", "close_price": got, "settled": True,
-                                               "context": "normal", "opening": a.get("opening"),
-                                               "note": f"coordinador {VERSION}"})
+                    if not new:
+                        a["duplicate_of"] = acct.key_dealer_sell(a["thread"])
+                    else:
+                        journal.append("outcome", {"dealer": a["dealer"], "item": a["item"], "thread": a["thread"],
+                                                   "status": "deal", "side": "sell", "close_price": got, "settled": True,
+                                                   "context": "normal", "opening": a.get("opening"),
+                                                   "note": f"coordinador {VERSION}"})
                 else:
                     a["status"] = "released" if a["type"] == "dealer_sell_counter" else a["status"]
             elif t is None or t.get("status") != "open":
@@ -272,6 +308,158 @@ def dealer_exposure(s, dealers_mine):
 
 NEWS_CAL: dict = {}  # --news-db: calibración de fuentes (news_watch.calibrate), una vez por proceso
 INTEL_STATE = {"intel": None}  # la capa de inteligencia la abre el ciclo; nunca ejecuta operaciones
+
+
+OPPS_FILES = {True: "opportunities.json",            # escrito SOLO por un coordinador con --execute
+              False: "opportunities_analysis.json"}  # análisis/dry-run: nunca pisa el estado del agente real
+MEMORY_STATUS = {"integrated": False}               # lo rellena memory_coordinator.py si envuelve este módulo
+RUNTIME = DATA / "coordinator_runtime.json"
+CODE_FILES = ("coordinator.py", "market_intel.py", "trading.py", "negotiation.py", "capital.py", "accounting.py",
+              "page_campaign.py", "page_guard.py", "performance.py", "market_agent.py", "v10_commission.py",
+              "third_party.py", "campaigns.py", "intelligence.py", "bank_dealer.py")
+
+
+def code_fingerprint():
+    """Huella del código que un proceso CARGA al arrancar. Un fichero editado después no cambia lo que ya corre."""
+    import hashlib
+    h = hashlib.sha256()
+    for f in CODE_FILES:
+        p_ = HERE / f
+        h.update(f.encode() + (p_.read_bytes() if p_.exists() else b"-"))
+    return h.hexdigest()[:12]
+
+
+def write_runtime(args):
+    DATA.mkdir(exist_ok=True)
+    RUNTIME.write_text(json.dumps({"pid": os.getpid(), "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                   "fingerprint": code_fingerprint(), "argv": sys.argv[1:],
+                                   "execute": bool(args.execute)}, indent=1))
+
+
+def runtime_status():
+    """Qué código/configuración corre AHORA: compara la huella registrada al arrancar con la de los ficheros."""
+    if not RUNTIME.exists():
+        return "Sin registro de arranque (proceso lanzado con una versión anterior o nunca): comparar a mano con `ps`."
+    r = json.loads(RUNTIME.read_text())
+    try:
+        os.kill(r["pid"], 0)
+        alive = True
+    except OSError:
+        alive = False
+    now = code_fingerprint()
+    return (f"pid {r['pid']} {'EN MARCHA' if alive else 'no está en marcha'} desde {r['started']} · huella al arrancar "
+            f"{r['fingerprint']} · huella de los ficheros ahora {now} → "
+            f"{'MISMO código' if r['fingerprint'] == now else 'EL PROCESO EJECUTA CÓDIGO ANTIGUO: reiniciar para aplicar'}"
+            f" · argumentos: {' '.join(r['argv'])}")
+
+
+def export_shared(s, cands, chosen, pl, led, args, execute, ingested):
+    """Escribe el estado que ve el dashboard: oportunidades (ejecutables/bloqueadas, con rol, vigencia, comisiones, valor
+    marginal y capital), pistas históricas contrastadas con las ofertas vivas, motivos de bloqueo y estado del agente."""
+    try:
+        live = opps.live_index(s)
+        chosen_keys = {(c["type"], c.get("offer"), c.get("ref"), c.get("thread"), c.get("to")) for c in chosen}
+        rows = [opps.from_candidate(c, s, live, chosen_keys, ph_mod.purchase_cost)
+                for c in cands if c["type"] not in ("info", "cancel", "team_cancel", "dealer_close", "team_close")
+                and not any("sustituida por" in b for b in c.get("blockers") or [])]  # la ruta que la sustituye ya figura
+        rank = {"SELECCIONADA": 0, "EJECUTABLE": 1, "BLOQUEADA": 2}
+        rows.sort(key=lambda r: (rank[r["status"]], -(r.get("score") or 0)))
+        refs = {r["ref"] for r in rows if r.get("ref")}
+        refs |= set(((pl.get("page_campaign") or {}).get("state") or {}).get("missing") or [])
+        tick = s["clock"]["tick"]
+        leads = opps.historical_leads(s["feed"].get("events", []), tick, live, refs or None, s["me"]["id"])
+        intel = INTEL_STATE.get("intel")
+        db_last = None
+        try:
+            db_last = intel.meta("last_tick") if intel is not None else None
+        except Exception:
+            pass
+        ph = pl.get("phase") or {}
+        payload = {
+            "generated": time.time(), "tick": tick, "mode": "execute" if execute else "analysis", "pid": os.getpid(),
+            "fingerprint": code_fingerprint(), "argv": sys.argv[1:], "version": VERSION,
+            "server_tick_seconds": s["clock"].get("tick_seconds"),
+            "phase": {k: ph.get(k) for k in ("phase", "minutes_to_close", "w", "accelerated_min", "reason")} if ph else None,
+            "memory": {**MEMORY_STATUS, "intel_ingested": ingested, "market_db_last_tick": db_last,
+                       "market_db_lag_ticks": (tick - int(db_last)) if db_last not in (None, "None") else None},
+            "budget": pl.get("budget"), "capital": pl.get("capital"),
+            "blockers": opps.blockers_histogram(cands),
+            "selected": [r for r in rows if r["status"] == "SELECCIONADA"],
+            "opportunities": rows[:80], "leads": leads,
+            "arbitrage_two_legs": opps.executable_arbitrage(s, lambda v, p: mi.venues_from(s)[v].fee(p, 1) if v in mi.venues_from(s) else 0),
+            "live_offer_ids": sorted(live)[:5000]}
+        opps.write_json(DATA / OPPS_FILES[bool(execute)], payload)  # DATA en cada llamada (las pruebas lo redirigen)
+        return payload
+    except Exception as e:  # el panel nunca puede detener al coordinador
+        print(f"   EXPORT dashboard no disponible ({type(e).__name__}: {e})")
+        return None
+
+
+def revalidate_live(reader, c, s):
+    """Antes de enviar una aceptación de mercado, contrasta con el SERVIDOR (no con la instantánea del tick): oferta
+    abierta y vigente, mismo precio y maker, inventario, activos no comprometidos y efectivo. Falla cerrado."""
+    try:
+        venue = c.get("venue") or "rastro"
+        board = reader.call("board", venue).get("offers", []) if venue else []
+        fresh_me = reader.call("me")
+        mine = reader.call("my_offers").get("offers", [])
+        tick = reader.call("clock").get("tick", s["clock"]["tick"])
+    except (BazaarError, KeyError, AttributeError) as e:
+        return [f"no se pudo revalidar contra el servidor ({getattr(e, 'code', type(e).__name__)}): no se envía"]
+    return opps.revalidate_accept(c, fresh_board=board, my_offers=mine, me=fresh_me, tick=tick, team=s["me"]["id"])
+
+
+def phase_cfg(args):
+    return ph_mod.PhaseConfig(enabled=bool(getattr(args, "phases", False)),
+                              transition_min=getattr(args, "phase_transition_min", 90),
+                              treasury_min=getattr(args, "phase_treasury_min", 30),
+                              target_min=getattr(args, "cash_target_min", 150),
+                              target_stretch=getattr(args, "cash_target_stretch", 200),
+                              accelerate_max=getattr(args, "phase_accelerate_max", 60),
+                              final_ticks=getattr(args, "phase_final_ticks", 2),
+                              exit_haircut=getattr(args, "exit_haircut", 0.25),
+                              allow_campaign_in_transition=bool(getattr(args, "treasury_allow_campaign", False)))
+
+
+def open_sell_net(s, team):
+    """Precio neto de nuestras ventas publicadas (como maker no pagamos comisión): lo que cobraríamos si se llenaran."""
+    total = 0
+    for o in s["offers"].get("offers", []):
+        if o.get("maker") == team and o.get("status") == "open" and not o.get("thread"):
+            c = mi.classify(o)
+            if c and c[0] == "ask":
+                total += int(c[2])
+    return total
+
+
+def apply_cooldowns(cands, led, tick, n):
+    """Tras una propuesta nuestra SIN éxito (caducó, se retiró o fue rechazada) a un equipo por una carta, no se repite
+    durante `n` ticks: ni spam, ni silencio interpretado como rechazo definitivo (solo se espera antes de reintentar)."""
+    if n <= 0:
+        return
+    last = {}
+    for a in led.get("actions", []):
+        who = a.get("to") or a.get("team")
+        if who and a["type"] in ("bid", "list", "swap_list", "team_open", "team_propose") and \
+                a.get("status") in ("released", "rejected"):
+            key = (who, (a.get("ref") or "").removeprefix("card:"))
+            last[key] = max(last.get(key, -10 ** 9), a.get("tick") or 0)
+    for c in cands:
+        who = c.get("to") or c.get("team")
+        if who and c["type"] in ("bid", "list", "swap_list", "team_open"):
+            t0 = last.get((who, (c.get("ref") or "").removeprefix("card:")))
+            if t0 is not None and tick - t0 < n:
+                c["blockers"] = list(c.get("blockers") or []) + [
+                    f"cooldown: propuesta anterior a {who} por {c.get('ref')} sin éxito en el tick {t0}; "
+                    f"se espera hasta el tick {t0 + n}"]
+
+
+def campaign_missing(args, val, counts):
+    """Cartas que faltan de la página objetivo fijada (con `auto` se decide en el paso de campaña: no se asume)."""
+    sid = getattr(args, "page_campaign", "none")
+    if sid in (None, "none", "auto") or sid not in val.pages:
+        return []
+    return [r for r in val.pages[sid] if not counts.get(r)]
 
 
 def capital_cfg(args):
@@ -371,6 +559,7 @@ def candidates(s, led, args, journal):
     lc = ladder_cfg(args)
     if getattr(args, "news_sell", False):  # sell_thread_candidates sigue las ventas abiertas por una noticia
         s["news_floors"] = led.get("news_floor") or {}
+        s["radio_plans"] = led.get("radio_plans") or {}
     s["mirror_dealers"] = mirror_dealers(s, led, args)
     pend_actions = [a for a in led["actions"]
                     if a["type"] in ("accept", "dealer_accept", "team_accept") and a["status"] in ("intent", "ambiguous", "submitted")]
@@ -388,14 +577,24 @@ def candidates(s, led, args, journal):
     elif ccfg.dealer_cash_buffer_mode == "fixed":
         target = ccfg.dealer_idle_liquidity
     else:
-        target = ca.dealer_liquidity_target([a["econ"] for a in active], min(ccfg.dealer_idle_liquidity, viable))
+        # La liquidez «ociosa» para vendedores (sin conversación activa) NO se reserva a la vez que la campaña de página:
+        # comprar la carta de la campaña a un vendedor ES esa oportunidad de vendedor (mismo dinero, un solo uso).
+        # Las conversaciones ACTIVAS sí reservan su máximo real.
+        idle = 0 if campaign_missing(args, val, counts) else min(ccfg.dealer_idle_liquidity, viable)
+        target = ca.dealer_liquidity_target([a["econ"] for a in active], idle)
     if fill:  # --ladder-fill: la caja del siguiente trato de cada escalera incompleta va antes que las pujas pasivas
         target = max(target, ladder_fill_need(s, led, args, lc, val, counts, ladder, active))
     dealer_need = max(0, target - exposure)
     market_reserve = args.reserve + dealer_need
     # Capital ANTES de planificar: las pujas abiertas cuentan enteras (obligaciones reales, nunca × P(ejecución)).
     res0 = tr.resources(s["offers"].get("offers", []), team, pend)
-    budget0 = args.max_spend - led["spent_confirmed"]
+    pcfg = phase_cfg(args)
+    free0 = me["cash"] - max(0, res0.reserved_cash - thread_cash) - exposure - max(0, res0.pending_cash - max(0, exposure - thread_cash))
+    ph0 = ph_mod.state(s["clock"], pcfg, ph_mod.scenarios(free0, open_sell_net(s, team), 0))
+    if pcfg.enabled and ph0["phase"] != "A":
+        ccfg.max_passive_cash_fraction *= (1.0 - ph0["w"])  # menos capital pasivo cuanto más cerca del cierre
+    bst = acct.budget_state(led, args.max_spend, getattr(args, "budget_mode", "gross"))
+    budget0 = bst["remaining"]
     view = ca.capital_view(me["cash"], args.reserve, max(0, res0.reserved_cash - thread_cash), exposure,
                            max(0, res0.pending_cash - max(0, exposure - thread_cash)), target, budget0,
                            ccfg.tactical_cash_buffer, ccfg.max_passive_cash_fraction)
@@ -409,13 +608,14 @@ def candidates(s, led, args, journal):
                               duende_venue=args.duende_venue, duende_expiry_ticks=args.duende_expiry,
                               target_expiry_ticks=args.listing_ticks, history_window_ticks=args.history_window)
         ratio, _ = tr.expiry_ratio(led["expiry_obs"] + EXPIRY_EVIDENCE, s["clock"].get("tick_seconds") or 60.0)
+        s["_expiry_ratio"] = ratio
         hist = mi.History(str(DATA / "market_history.jsonl"), args.history_window).load(s["clock"]["tick"])
-        pl = mi.plan(s, icfg, pendings=pend, spent=led["spent_confirmed"], actions=led["actions"], history=hist,
+        pl = mi.plan(s, icfg, pendings=pend, spent=bst["used"], actions=led["actions"], history=hist,
                      expiry_ratio=ratio, passive_cap=view.free_market_cash)
         books, _ = mi.build_books(s, mi.venues_from(s))
         hist.record(s["clock"]["tick"], books, mi.public_settlements(s["feed"].get("events", [])), time.time())
     else:
-        pl = tr.plan(s, cfg, pendings=pend, spent=led["spent_confirmed"])
+        pl = tr.plan(s, cfg, pendings=pend, spent=bst["used"])
     scored = ca.score_open_bids(s, pl["states"], icfg, led["actions"]) if icfg and pl.get("states") else []
     used = set()  # pujas ya asignadas a una cancelación de rebalanceo en este tick
     out = []
@@ -434,7 +634,8 @@ def candidates(s, led, args, journal):
             out.append(dict(c, module="seguridad"))
     protected_offers = {c["offer"] for c in out}
     # 1. Seguridad: publicaciones propias que venden la última copia o con ΔU < 0 (evaluador canónico).
-    for c in tr.unsafe_own_offers(s["offers"].get("offers", []), team, val, counts):
+    allow_last = frozenset(x.strip() for x in (getattr(args, "allow_last_copy", "") or "").split(",") if x.strip())
+    for c in tr.unsafe_own_offers(s["offers"].get("offers", []), team, val, counts, allow_last):
         if c["offer"] in protected_offers:
             continue
         c.update(module="seguridad", du=0.0, score=10 ** 6, blockers=[] if args.cancel_unsafe else
@@ -464,7 +665,11 @@ def candidates(s, led, args, journal):
             out.append({"type": "info", "module": "vendedores", "kind": "conversación ajena", "thread": t["id"],
                         "ref": str(t.get("topic")), "du": 0, "score": -1, "blockers": ["no es nuestra: no se toca"]})
         elif "sell" in (t.get("topic") or {}):
-            out += news_floor_guard(sell_thread_candidates(s, t, args, lc, val, counts), led, args)
+            if t.get("with") == bank.DEALER_ID and getattr(args, "dealer_banco", False):
+                out.append(bank.thread_candidate(s, t, val, counts, margin=args.margin,
+                                                 alternatives=out + pl["opportunities"], led=led))
+            else:
+                out += news_floor_guard(sell_thread_candidates(s, t, args, lc, val, counts), led, args)
     for a in active:
         t, item, value = a["thread"], a["item"], a["value"]
         did = t["with"]
@@ -540,6 +745,10 @@ def candidates(s, led, args, journal):
         mode = neg.ladder_mode(n_q)
         bonus = (5000 if n_q == neg.LADDER_SLOTS - 1 else 2000) if mode == "SECURE" else 0  # prioridad, no valor
         camp_set = getattr(args, "page_campaign", "none")
+        if did == bank.DEALER_ID and getattr(args, "dealer_banco", False):
+            # Banco se enruta por el evaluador dedicado: el menú de venta no es una oferta firme ni autoriza
+            # abrir compras o reservar efectivo para cartas/sobres sin salida ejecutable.
+            continue
         for row in sells:
             if "rarity" not in row:
                 continue
@@ -667,14 +876,21 @@ def candidates(s, led, args, journal):
     # 7. Venta táctica de duplicados a una contraparte real (p. ej. LAT-10 ~86 P).
     pl["tactical_sales"] = tactical_sales(s, led, args, val, pl, out)
     # 8. Compras dirigidas ordenadas por un humano.
+    fast_sales_step(s, led, args, val, counts, pl, out)
     out += directed_buys(s, led, args, val, counts, view)
+    pl["budget"] = bst  # antes de la campaña: el informe de financiación cita el límite del operador
+    apply_cooldowns(out, led, tick, getattr(args, "cooldown_ticks", 0))
     # 9. Escalera opt-in: vender duplicados comunes a un vendedor y no pujar por lo que ya negociamos con uno.
     if getattr(args, "dealer_sell_dups", False) and not cal:
         out += sell_open_candidates(s, led, args, lc, val, counts, busy, open_count)
     if cal:  # --ladder-calibrated: ventas planificadas a la Abuela y al Chato (Pilar va por pilar_candidates)
         out += calibrated_sell_opens(s, led, cal_plan, busy, open_count)
+    if getattr(args, "ernesto", False):  # --ernesto (opt-in): acceso, menú y ventas a Don Ernesto
+        out += ernesto_candidates(s, led, args, lc, val, counts, busy, open_count)
     if getattr(args, "news_sell", False):  # --news-sell (opt-in): vender a un vendedor con demanda viva en las noticias
-        out += news_sell_candidates(s, led, args, busy, open_count)
+        out += news_sell_candidates(s, led, args, busy, open_count, out)
+        radio_negations(out, s, args)
+        radio_buy_info(s, args, out)
     if getattr(args, "dedupe_bids", False):
         out += dealer_bid_cancels(s, out, open_dealer, mine_threads)
     # 10. Campaña de completar página (objetivo actual: Malasaña).
@@ -688,12 +904,41 @@ def candidates(s, led, args, journal):
     if getattr(args, "fever_priority", False):  # --fever-priority (opt-in): ventas del barrio en fiebre, primero
         fever_priority(pilar, s, args)
     out += pilar
+    if getattr(args, "dealer_banco", False):
+        committed = committed_ids(s, led)
+        market_values = {r: st.market.value for r, st in (pl.get("states") or {}).items()
+                         if getattr(st, "market", None) and getattr(st.market, "value", None)}
+        bank_cands, bank_report = bank.plan(
+            s, led, val, counts, margin=args.margin, free_cash=view.free_dealer_cash,
+            budget_left=bst["remaining"], open_count=open_count, committed=committed,
+            alternatives=out + pl["opportunities"], market_values=market_values)
+        out += bank_cands
+        pl["bank"] = bank_report
     if getattr(args, "v10_commission", False):
         rows = (s.get("leaderboard") or {}).get("teams", [])
         top_teams = {str(x.get("team") or x.get("id") or "").lower() for x in rows[:6]}
-        out += v10c.listing_candidates(led.get("v10_commission") or {}, me,
-                                       s["clock"].get("tick_seconds"), top_teams or None,
-                                       unavailable_assets=committed_ids(s, led))
+        v10_list = v10c.listing_candidates(led.get("v10_commission") or {}, me,
+                                           s["clock"].get("tick_seconds"), top_teams or None,
+                                           unavailable_assets=committed_ids(s, led))
+        for c in v10_list:  # el acuerdo autoriza el VENUE y el comprador, no regala la copia: ΔU con la valoración
+            ref = c["ref"].removeprefix("card:")
+            if counts.get(ref):
+                loss = -val.delta(counts, Counter(), Counter({ref: 1}))[0]
+                c["du"] = round(c["price"] - loss, 2)
+                if c["du"] < args.margin:
+                    c["blockers"] = list(c.get("blockers") or []) + [
+                        f"venta aprobada con ΔU {c['du']} P < margen {args.margin} P (pérdida de valor {loss:.1f} P)"]
+        out += v10_list
+    fast_sales_supersede(out, args, pl)
+    free_cash = view.cash - view.market_reserved_cash - view.dealer_exposure - view.pending_cash
+    exec_sales = sum(int(c.get("cash") or c.get("price") or 0) for c in out
+                     if ph_mod.is_sale(c) and not c.get("blockers") and c["type"] != "list")
+    ph = ph_mod.state(s["clock"], pcfg, ph_mod.scenarios(free_cash, open_sell_net(s, team), exec_sales))
+    pl["phase_notes"] = ph_mod.apply(out, ph, pcfg, free_cash=free_cash, states=pl.get("states") or {},
+                                     tick_seconds=s["clock"].get("tick_seconds") or 30.0,
+                                     expiry_ratio=s.get("_expiry_ratio") or 1.0, margin=args.margin,
+                                     open_cash_offers=ph_mod.open_cash_offers(s["offers"].get("offers", []), team))
+    pl["phase"], pl["phase_committed"] = ph, view.market_reserved_cash + view.dealer_exposure + view.pending_cash
     out = dedupe_cancels(out)
     pl["capital"], pl["dealer_diag"], pl["open_bids"] = view.as_dict(), diag, scored
     pl["ladder"] = {d: len(x) for d, x in ladder.items()}
@@ -791,9 +1036,65 @@ def sell_open_candidates(s, led, args, lc, val, counts, busy, open_count):
             out.append({"type": "dealer_sell_open", "module": "vendedores", "kind": f"vender a {did}", "dealer": did,
                         "ref": f"card:{ref}", "asset": ids[-1], "price": lc.sell_open, "floor": floor,
                         "du": round(got - loss, 2), "score": 500 + got - loss, "blockers": blockers,
+                        "expected": got, "value_lost": round(loss, 2),
                         "notes": [f"duplicado {rarity} ({n} copias), pierde {loss:.2f} P, suelo {floor} P",
                                   f"final observado de {did}: {expected} P" if expected else "sin final observado",
                                   "cuenta para la escalera si cerramos por encima de su apertura"]})
+    return out
+
+
+def ernesto_access(s):
+    """Acceso y menú de Don Ernesto (`banco`): (disponible, motivo, compra[rarezas], vende[filas])."""
+    d = (s.get("dealers") or {}).get("banco")
+    if d is None:
+        return False, "no figura en /api/dealers", [], []
+    ok = dealer_available(s, "banco") and d.get("enabled", True) and d.get("status", "active") == "active"
+    menu = d.get("menu") or {}
+    return ok, ("acceso OK" if ok else "sin acceso (ni desbloqueado ni abierto a todos)"), \
+        sorted({r["rarity"] for r in menu.get("buys", []) if r.get("rarity")}), menu.get("sells", [])
+
+
+def ernesto_candidates(s, led, args, lc, val, counts, busy, open_count):
+    """--ernesto: vender a Don Ernesto DUPLICADOS de las rarezas que compra (epic/legendary). Nunca la última copia ni una
+    carta de página completa (page_guard); suelo = valor privado perdido + margen. Compras: las cubre la lógica genérica
+    de vendedores con su máximo económico (hoy 585 P/legendaria y 420 P/sobre oro quedan fuera del capital)."""
+    ok, why, buys, sells = ernesto_access(s)
+    tick, me = s["clock"]["tick"], s["me"]
+    held = sorted((r, n) for r, n in counts.items() if (val.cards.get(r) or {}).get("rarity") in buys)
+    info = {"type": "info", "module": "ernesto", "kind": "Ernesto (banco)", "dealer": "banco", "ref": "menú", "du": 0,
+            "score": -1, "blockers": [] if ok and held else [why if not ok else
+                                                              f"no tenemos {'/'.join(buys) or 'cartas que compre'}"],
+            "notes": [f"{why} · compra {'/'.join(buys) or '—'} · vende " + ", ".join(
+                f"{x.get('name') or x.get('rarity')} {x.get('list_price')} P" for x in sells) + " · cuota "
+                f"{(s['dealers']['banco'].get('menu') or {}).get('deals_per_team_per_hour', '?')}/h"] if ok else [why]}
+    out = [info]
+    if not ok:
+        return out
+    committed = committed_ids(s, led)
+    committed_refs = pg.refs_of_assets(committed, me["assets"])
+    selling = {a for t in s["threads"]["open"] if t.get("kind") == "persona" for a in neg.sell_assets_of(t.get("topic"))}
+    allow_last = {x.strip() for x in (getattr(args, "allow_last_copy", "") or "").split(",") if x.strip()}
+    for ref, n in held:
+        if (n < 2 and ref not in allow_last) or val.unit(ref) is None or \
+                pg.tradeable_surplus(ref, counts, s["catalog"], committed_refs) < 1:
+            continue
+        ids = [a["id"] for a in sorted(me["assets"], key=lambda a: a["id"]) if a.get("ref") == ref
+               and a["id"] not in committed and a["id"] not in selling]
+        if not ids:
+            continue
+        loss, floor = sell_floor(val, counts, ref, lc)
+        blockers = []
+        if "banco" in busy:
+            blockers.append("ya hay una conversación abierta con banco")
+        if led["blocked"].get("banco", 0) > tick:
+            blockers.append(f"banco bloqueado hasta el tick {led['blocked']['banco']} (cupo o enfriamiento)")
+        if open_count >= s["clock"]["limits"].get("max_open_threads_per_team", 6):
+            blockers.append("sin conversaciones libres")
+        out.append({"type": "dealer_sell_open", "module": "ernesto", "kind": "vender a banco", "dealer": "banco",
+                    "ref": f"card:{ref}", "asset": ids[-1], "price": floor, "floor": floor, "du": round(floor - loss, 2),
+                    "score": 600 + floor - loss, "blockers": blockers,
+                    "notes": [f"duplicado {val.cards[ref]['rarity']} ({n} copias), pierde {loss:.2f} P, suelo {floor} P",
+                              "Ernesto puja primero; 1 propuesta + hasta 2 contraofertas y se reevalúa"]})
     return out
 
 
@@ -806,7 +1107,9 @@ def sell_thread_candidates(s, t, args, lc, val, counts):
     cal = calibrated_on(args) and (pilar or did in lcal.LADDER_DEALERS)
     news = getattr(args, "news_sell", False) and str(next(iter(neg.sell_assets_of(t.get("topic"))), "")) in \
         (s.get("news_floors") or {})
-    if not pilar and not cal and not news and not getattr(args, "dealer_sell_dups", False):
+    plan = (s.get("radio_plans") or {}).get(str(next(iter(neg.sell_assets_of(t.get("topic"))), ""))) if news else None
+    ernesto = did == "banco" and getattr(args, "ernesto", False)
+    if not pilar and not cal and not news and not ernesto and not getattr(args, "dealer_sell_dups", False):
         return [dict(base, type="info", kind=f"{did}: venta", ref=str(t.get("topic")), du=0, score=-1,
                      blockers=["conversación de venta: requiere --dealer-sell-dups"])]
     ids = neg.sell_assets_of(t.get("topic"))
@@ -826,6 +1129,23 @@ def sell_thread_candidates(s, t, args, lc, val, counts):
         loss, floor = pilar_floor(val, counts, ref)
         d = lplus.decide_sell(st, floor, lplus.first_ask(floor, pc), pc,
                               pc.max_ticks - neg.conversation_ticks_used(t, tick))
+    elif ernesto:  # Don Ernesto: política de VENTA por rasgos (pocas rondas), suelo = valor perdido + margen
+        loss, floor = sell_floor(val, counts, ref, lc)
+        pol = neg.dealer_policy("banco", args.mode)
+        d = neg.decide_dealer_sell(st, pol, floor, pol.max_ticks - neg.conversation_ticks_used(t, tick))
+    elif plan is not None and plan.get("dealer") == did:
+        # Venta abierta por una noticia: la RESERVA B y el ritmo vienen del plan, no de la noticia. Sonda corta mientras
+        # ninguna puja confirme la hipótesis; si se confirma, paciencia normal. La noticia puede haber caducado: la
+        # oferta vigente se evalúa por sus propios términos (reserva), nunca se abandona solo por eso.
+        import dataclasses
+        loss, floor = sell_floor(val, counts, ref, lc)
+        floor = max(floor, int(plan["B_reserve"]))
+        confirmed = plan.get("state") == "confirmada_por_oferta"
+        lc2 = dataclasses.replace(lc, sell_open=int(plan["C_target"]),
+                                  sell_counters=lc.sell_counters if confirmed else min(lc.sell_counters, plan["probe_counters"]))
+        left = (lc.sell_ticks if confirmed else min(lc.sell_ticks, int(plan["deadline_tick"]) - int(plan.get("opened_tick") or tick))) \
+            - neg.conversation_ticks_used(t, tick)
+        d = neg.decide_ladder_sell(st, lc2, floor, left, args.mode)
     else:
         loss, floor = sell_floor(val, counts, ref, lc)
         d = neg.decide_ladder_sell(st, lc, floor, lc.sell_ticks - neg.conversation_ticks_used(t, tick), args.mode)
@@ -835,6 +1155,11 @@ def sell_thread_candidates(s, t, args, lc, val, counts):
     c = dict(base, type=kind, kind=f"{did}: venta {d.action}", item=f"card:{ref}", ref=f"card:{ref}", price=d.price,
              offer=d.offer_id, opening=st.opening, floor=floor, du=round((d.price or 0) - loss, 2), score=10 ** 5,
              reason=d.reason, turns=st.turns, side="sell", notes=[f"venta escalera, suelo {floor} P"])
+    if plan is not None and plan.get("dealer") == did:
+        c["notes"] = [f"radio #{plan['news_id']}: {plan['why']} · hipótesis {plan.get('state')}"
+                      + (f" ({plan.get('state_why')})" if plan.get("state_why") else "")]
+        if kind == "dealer_sell_accept" and plan.get("state") == "confirmada_por_oferta":
+            c["score"] = 3 * 10 ** 5  # la oferta estructurada confirma la mejora: prioridad de cierre
     if cal:
         c["notes"] = [f"--ladder-calibrated {key}: suelo = valor privado {loss:.1f} P → {floor} P; objetivo "
                       f"{cp_.target_price(st.opening, 'sell') if st.opening else '?'} P; {cp_.obs}"]
@@ -977,23 +1302,153 @@ def is_mirror(s, args, t, did):
     return did in (s.get("mirror_dealers") or ()) or (mode == "auto" and lcal.mirror_said(t, did))
 
 
-def news_sell_candidates(s, led, args, busy, open_count):
-    """--news-sell: una noticia de demanda viva (fuente fiable dentro de su ventana, o fila explícita en el menú actual
-    del vendedor) abre una venta a ese vendedor de una copia que page_guard deja salir; suelo = valor privado +
-    --news-margin (news_watch.sell_suggestions). Una conversación por vendedor; sin el flag no se llama."""
+def radio_ingest(s, execute):
+    """Clasifica y persiste las noticias de este tick (registro por ID). Las del registro anterior se conservan: una
+    noticia ya vista no vuelve a ser «nueva» ni a disparar acciones. Solo el modo --execute escribe el registro."""
+    try:
+        reg = radio.read("registry")
+        reg = reg if reg.get("items") is not None else radio.new_registry()
+        cal = NEWS_CAL.get("cal")
+        tick = s["clock"]["tick"]
+        new = radio.ingest(reg, s.get("news") or [], tick, s["clock"].get("tick_seconds"), s["catalog"],
+                           nw.news_ticks(s["feed"].get("events", [])), nw.reliability(cal), nw.observations(cal),
+                           s.get("dealers") or {}, source="agent")
+        reg["poll"] = {"tick": tick, "ts": round(time.time()), "n_items": len(s.get("news") or []),
+                       "new_ids": [e["id"] for e in new]}
+        s["radio"] = {"reg": reg, "new": [e["id"] for e in new]}
+        for e in new:
+            v = e["verification"]
+            print(f"   RADIO nueva #{e['id']} [{e['source']}] {e['interpretation']['kind']} → {v['status']}: "
+                  f"{e['headline']}" + (f" · {'; '.join(v['causes'])}" if v["causes"] else ""))
+    except Exception as ex:  # la radio nunca detiene al coordinador
+        s["radio"] = None
+        print(f"   RADIO no disponible ({type(ex).__name__}: {ex})")
+
+
+def radio_decision(s, cands, chosen, execute, led=None, args=None):
+    """Registra la decisión del agente sobre cada noticia (oportunidad, decisión, plan A/B/C/D, cambio frente a «sin
+    noticia») y escribe radio_state*.json: la MISMA información que evalúa el ejecutor, no una recomendación aparte."""
+    rd = s.get("radio")
+    if not rd:
+        return None
+    reg, tick = rd["reg"], s["clock"]["tick"]
+    plans = (led or {}).get("radio_plans") or {}
+    events = s["feed"].get("events", [])
+    mine = [c for c in cands if c.get("module") == "noticias" and c.get("news_id") is not None]
+    picked = [c for c in chosen if c.get("module") == "noticias"]
+    opps = []
+    for c in mine:
+        pl = c.get("radio_plan") or {}
+        chosen_now = c in picked
+        radio.link(reg, c["news_id"], "opportunities", {"tick": tick, "dealer": c.get("dealer"), "asset": c.get("asset"),
+                                                        "type": c["type"]}, f"opp:{c['type']}:{c.get('dealer')}:{c.get('asset')}")
+        if chosen_now:
+            radio.link(reg, c["news_id"], "decisions", {"tick": tick, "what": c["kind"], "price": c.get("price"),
+                                                        "executed": bool(execute)}, f"dec:{c.get('dealer')}:{c.get('asset')}:{tick}")
+        status = ("negociar" if chosen_now else "bloqueada" if c.get("blockers") else "investigar") \
+            if c["type"] != "radio_buy" else ("bloqueada" if c.get("blockers") else "investigar")
+        opps.append({"news_id": c["news_id"], "type": c["type"], "status": status, "dealer": c.get("dealer"),
+                     "asset": c.get("asset"), "ref": c.get("ref"), "blockers": c.get("blockers") or [],
+                     "plan": {k: pl.get(k) for k in ("A_value", "B_reserve", "C_target", "D_wtp", "mode", "why", "delta")}
+                     if pl else None, "score": c.get("score"), "delivered_to_agent": True})
+    for key, pl in plans.items():  # conversaciones ya abiertas por una noticia
+        opps.append({"news_id": pl.get("news_id"), "type": "dealer_sell_thread", "dealer": pl.get("dealer"), "asset": key,
+                     "ref": pl.get("ref"), "status": "settled" if pl["state"] == "settled" else
+                     ("negociar" if pl["state"] in ("sin_probar", "confirmada_por_oferta") else "cerrada"),
+                     "blockers": [], "hypothesis": pl["state"], "why": pl.get("state_why"),
+                     "plan": {k: pl.get(k) for k in ("A_value", "B_reserve", "C_target", "D_wtp", "mode", "why", "delta")},
+                     "delivered_to_agent": True})
+    items = sorted(reg["items"].values(), key=lambda e: e.get("tick") or 0, reverse=True)
+    with_opp = {o["news_id"] for o in opps}
+    no_opp = [{"news_id": e["id"], "status": e["verification"]["base_status"],
+               "reason": "; ".join(e["verification"].get("causes") or []) or "sin copia vendible / sin candidata"}
+              for e in items if e["id"] not in with_opp][:12]
+    for e in items[:12]:
+        it = e.get("interpretation") or {}
+        e["association"] = radio.association(e, events, s["catalog"]) if it.get("kind") in ("demanda", "demanda_negada") else None
+    if picked:
+        c = picked[0]
+        dec = {"news_id": c.get("news_id"), "action": f"abrir venta a {c['dealer']} de {c['ref']} #{c['asset']} pidiendo "
+               f"{c['price']} P (reserva {c['floor']} P)", "executed": bool(execute), "tick": tick,
+               "delta": (c.get("radio_plan") or {}).get("delta")}
+    elif mine:
+        c = mine[0]
+        dec = {"news_id": c.get("news_id"), "action": "sin acción: " + "; ".join(c.get("blockers") or ["no seleccionada"]),
+               "executed": False, "tick": tick}
+    else:
+        e = items[0] if items else None
+        why = "; ".join((e["verification"].get("causes") or [])) if e else ""
+        dec = {"news_id": e["id"] if e else None, "tick": tick, "executed": False,
+               "action": f"sin acción: {e['verification']['status'] if e else 'sin noticias'}" + (f" · {why}" if why else "")}
+    reg["decision"] = dec
+    out = radio.summary(reg, tick, dec, "agent" if execute else "analysis", reg["poll"].get("n_items", 0),
+                        reg["poll"].get("new_ids", []))
+    out.update({"enabled": bool(getattr(args, "radio", False) or getattr(args, "news_sell", False)),
+                "flags": {"radio": bool(getattr(args, "radio", False)), "news_sell": bool(getattr(args, "news_sell", False)),
+                          "fever_priority": bool(getattr(args, "fever_priority", False)),
+                          "spec_budget": getattr(args, "radio_spec_budget", 0)},
+                "opportunities": opps[:40], "no_opportunity": no_opp, "reactions": radio.reaction(reg),
+                "sources": {k: v for k, v in ((NEWS_CAL.get("cal") or {}).get("sources") or {}).items()}})
+    by_id = {e["id"]: e for e in items}
+    for r in out["recent"]:
+        e = by_id.get(r["id"]) or {}
+        r.update({"epistemic": (e.get("verification") or {}).get("epistemic"), "direction":
+                  (e.get("interpretation") or {}).get("direction"), "window": e.get("window"),
+                  "evidence": e.get("evidence"), "related": e.get("related"), "association": e.get("association")})
+    if execute:  # el análisis no ensucia el registro real
+        radio.write("registry", reg)
+        radio.write("state", out)
+    else:
+        radio.write("state_analysis", out)
+    return dec
+
+
+def radio_cfg(args):
+    return radio.PlanConfig(probe_counters=getattr(args, "radio_probe_counters", 2),
+                            probe_ticks=getattr(args, "radio_probe_ticks", 6), spec_budget=getattr(args, "radio_spec_budget", 0),
+                            margin=getattr(args, "news_margin", 2.0))
+
+
+def radio_baseline(base_cands, ref, asset):
+    """Qué haría el agente SIN la noticia con esta copia: la mejor candidata de venta habitual para esa carta."""
+    mine = [c for c in base_cands if c.get("type") == "dealer_sell_open" and c.get("module") != "noticias"
+            and (c.get("ref") == f"card:{ref}" or c.get("asset") == asset)]
+    if not mine:
+        return None
+    b = max(mine, key=lambda c: c.get("score", 0))
+    return {"dealer": b["dealer"], "expected": b.get("expected"), "open": b.get("price"), "available": not b.get("blockers"),
+            "blockers": list(b.get("blockers") or []), "score": b.get("score")}
+
+
+def news_sell_candidates(s, led, args, busy, open_count, base_cands=()):
+    """--news-sell / --radio: una noticia de demanda (fuente fiable en ventana, o fila explícita en el menú actual) PUEDE
+    abrir una venta a ese vendedor. El plan separa A valor privado · B reserva (incluye la alternativa habitual) ·
+    C objetivo · D disposición estimada (solo observada). La noticia cambia la contraparte, el objetivo inicial, el ritmo
+    (sonda corta si no está confirmada por una oferta) y la prioridad; no cambia A ni garantiza D. Una noticia es
+    DATO: jamás aumenta límites ni salta page_guard (las sugerencias ya excluyen copias protegidas o comprometidas)."""
     tick = s["clock"]["tick"]
     committed = committed_ids(s, led)
     selling = {a for t in s["threads"]["open"] if t.get("kind") == "persona" for a in neg.sell_assets_of(t.get("topic"))}
     offers = [o for o in s["offers"].get("offers", [])] + [{"maker": s["me"]["id"], "status": "open",
                                                             "give": {"assets": sorted(committed | selling)}}]
     rel = nw.reliability(NEWS_CAL.get("cal"))
+    reg = (s.get("radio") or {}).get("reg") or {}
+    cfg, lc = radio_cfg(args), ladder_cfg(args)
+    events = s["feed"].get("events", [])
     sugg = nw.sell_suggestions(s.get("news") or [], s.get("dealers") or {}, s["me"], s["catalog"], offers, tick,
                                s["clock"].get("tick_seconds"), rel, getattr(args, "news_margin", 2.0),
-                               nw.news_ticks(s["feed"].get("events", [])))
+                               nw.news_ticks(events), nw.observations(NEWS_CAL.get("cal")))
     out, opened = [], set()
     for g in sugg:
         did = g["dealer"]
-        blockers = []
+        card = next((c for st_ in s["catalog"].get("sets", []) for c in st_.get("cards", []) if c["id"] == g["ref"]), {})
+        rarity = g.get("rarity") or card.get("rarity")
+        prices = radio.dealer_buy_prices(events, did, s["catalog"], g.get("set"), rarity)
+        observed = lc.sell_expected.get(did, {}).get(rarity)
+        if observed is None and len(prices) >= 3:  # D solo con muestra: mediana de ≥3 compras equivalentes observadas
+            observed = sorted(p["price"] for p in prices)[len(prices) // 2]
+        plan = radio.sale_plan(g, radio_baseline(base_cands, g["ref"], g["asset"]), observed, cfg, tick)
+        blockers = list(plan["blockers"])
         if not dealer_available(s, did):
             blockers.append(f"{did} no disponible")
         if did in busy or did in opened:
@@ -1004,15 +1459,113 @@ def news_sell_candidates(s, led, args, busy, open_count):
             blockers.append("sin conversaciones libres")
         if tick - int((led.get("pilar_sell") or {}).get(str(g["asset"]), -10 ** 9)) < 30:
             blockers.append("esa copia ya se ofreció hace menos de 30 ticks")
+        if radio.acted(reg, g.get("news_id"), did):
+            blockers.append(f"ya se actuó por la noticia #{g.get('news_id')} con {did} y no hay evidencia nueva a favor")
+        prev = (led.get("radio_plans") or {}).get(str(g["asset"]))
+        if prev and prev.get("dealer") == did and prev.get("state") == "no_confirmada":
+            blockers.append(f"hipótesis ya no confirmada con {did} (#{prev.get('news_id')}): no se repite sin evidencia nueva")
         if not blockers:
             opened.add(did)
+        base = plan["baseline"]
+        expected = (plan["D_wtp"] or {}).get("value") or (base or {}).get("expected") or plan["B_reserve"]
+        score = 500 + expected - plan["A_value"] + (25 if g["confirmed_by_menu"] else (0 if plan["D_wtp"] else -25))
+        delta = (f"sin noticia: {('vender a ' + base['dealer'] + ' (≈' + str(base.get('expected')) + ' P)') if base else 'no se habría ofrecido esta copia'}"
+                 f" → con noticia: abrir venta a {did} pidiendo {plan['C_target']} P ({plan['mode']})")
+        plan["delta"] = delta
         out.append({"type": "dealer_sell_open", "module": "noticias", "kind": f"vender a {did} [noticia]",
-                    "dealer": did, "ref": f"card:{g['ref']}", "asset": g["asset"], "price": g["ask"],
-                    "floor": g["floor"], "news_floor": g["floor"], "du": round(g["ask"] - g["value"], 2),
-                    "score": 10 ** 3 + 1500 + g["ask"] - g["value"], "blockers": blockers,
-                    "notes": [g["text"], f"noticia #{g['news_id']} [{g['source']}] fiabilidad {g['reliability']}"
-                              + (" · confirmada en el menú" if g["confirmed_by_menu"] else "")]})
+                    "dealer": did, "ref": f"card:{g['ref']}", "asset": g["asset"], "price": plan["C_target"],
+                    "floor": plan["B_reserve"], "news_floor": plan["B_reserve"], "news_id": g.get("news_id"),
+                    "du": round(plan["C_target"] - plan["A_value"], 2), "score": score, "blockers": blockers,
+                    "radio_plan": plan, "expected": expected, "value_lost": plan["A_value"],
+                    "notes": [g["text"], plan["why"], delta,
+                              f"noticia #{g['news_id']} [{g['source']}] fiabilidad {g['reliability']}"
+                              + (" · confirmada en el menú (hecho observado)" if g["confirmed_by_menu"] else " · anuncio sin confirmar")]})
     return out
+
+
+def radio_negations(cands, s, args):
+    """Una noticia de «deja de comprar» NO produce demanda. Si además el menú ACTUAL ya no compra esa rareza/barrio
+    (hecho del servidor), las ventas habituales a ese vendedor se bloquean; si el menú aún compra, solo se anota."""
+    reg = (s.get("radio") or {}).get("reg") or {}
+    cards = {c["id"]: (st_["id"], c.get("rarity")) for st_ in s["catalog"].get("sets", []) for c in st_.get("cards", [])}
+    for e in reg.get("items", {}).values():
+        it = e.get("interpretation") or {}
+        if it.get("kind") != "demanda_negada" or not it.get("dealer"):
+            continue
+        dealer = (s.get("dealers") or {}).get(it["dealer"])
+        for c in cands:
+            if c.get("type") != "dealer_sell_open" or c.get("dealer") != it["dealer"] or c.get("module") == "noticias":
+                continue
+            set_id, rar = cards.get(str(c.get("ref") or "")[5:], (None, None))
+            if (it.get("rarity") and rar != it["rarity"]) or (it.get("set") and set_id != it["set"]):
+                continue
+            if not nw.dealer_buys(dealer, rar, set_id):
+                c["blockers"] = list(c.get("blockers") or []) + [
+                    f"noticia #{e['id']} («{e.get('headline')}») y el menú actual de {it['dealer']} ya no compra {rar}"]
+                radio.link(reg, e["id"], "decisions", {"tick": s["clock"]["tick"], "what": f"bloquea {c.get('ref')}"},
+                           f"neg:{c.get('ref')}:{s['clock']['tick']}")
+            else:
+                c["notes"] = list(c.get("notes") or []) + [
+                    f"noticia #{e['id']} dice que {it['dealer']} deja de comprar, pero su menú aún compra {rar}: sin cambio"]
+
+
+def radio_buy_info(s, args, cands):
+    """Noticias de descuento: SOLO informativas. Una compra para revender exige entrada, salida, comisiones y riesgo; con
+    `--radio-spec-budget 0` (por defecto) no se compra inventario por una noticia. Tipo `radio_buy`: nunca se envía."""
+    reg = (s.get("radio") or {}).get("reg") or {}
+    for e in reg.get("items", {}).values():
+        it = e.get("interpretation") or {}
+        v = e.get("verification") or {}
+        if it.get("kind") != "oferta" or not it.get("dealer") or v.get("base_status") in ("CADUCADA", "DESCARTADA"):
+            continue
+        dealer = (s.get("dealers") or {}).get(it["dealer"])
+        row = next((r for r in ((dealer or {}).get("menu") or {}).get("sells", [])
+                    if it.get("rarity") is None or r.get("rarity") == it["rarity"]), None)
+        price = (row or {}).get("list_price")
+        case = radio.resale_case(price if price is not None else 0, None, False, source_rumour=bool(it.get("rumour")),
+                                 signal_confirmed=bool(v.get("confirmed_by_menu")))
+        cands.append({"type": "radio_buy", "module": "noticias", "kind": f"compra por noticia #{e['id']} (informativa)",
+                      "dealer": it["dealer"], "ref": f"{it.get('set') or '?'}/{it.get('rarity') or '?'}", "price": price or 0,
+                      "du": 0, "score": -1, "news_id": e["id"],
+                      "blockers": radio.resale_gate(case, getattr(args, "radio_spec_budget", 0)) +
+                                  ([] if price is not None else ["menú sin precio: la rebaja anunciada no está verificada"]),
+                      "notes": [e.get("headline"), "no es arbitraje: sin salida viva comparar precios no basta"]})
+
+
+def radio_learn_threads(s, led, args):
+    """Cada tick: contrasta la hipótesis de cada plan con la PUJA estructurada del vendedor (no con el texto de la
+    noticia), enlaza liquidaciones y registra evidencia. Una noticia caducada no cierra una conversación rentable."""
+    plans, rd = led.get("radio_plans") or {}, s.get("radio")
+    if not plans or not rd:
+        return
+    reg, tick, team = rd["reg"], s["clock"]["tick"], s["me"]["id"]
+    sets = tr.settlements_for(s["feed"].get("events", []), team)
+    for key, plan in list(plans.items()):
+        asset = int(key) if str(key).isdigit() else key
+        th = next((t for t in s["threads"]["open"] if t.get("kind") == "persona" and asset in neg.sell_assets_of(t.get("topic"))), None)
+        done = next((x for x in sets if x["persona"] == plan["dealer"] and any(i[2] == asset for i in x["out"])), None)
+        if done and plan["state"] != "settled":
+            plan.update(state="settled", settled_tick=done["tick"], settled_price=done["price"],
+                        state_why=f"liquidada a {done['price']} P")
+            radio.link(reg, plan["news_id"], "settlements", {"settlement": done["settlement"], "price": done["price"],
+                                                            "tick": done["tick"]}, f"settlement:{done['settlement']}")
+            radio.add_evidence(reg, plan["news_id"], "for" if done["price"] >= plan["B_reserve"] else "against",
+                               f"liquidación {done['settlement']} a {done['price']} P (reserva {plan['B_reserve']} P)",
+                               tick, f"settlement:{done['settlement']}")
+        elif th is not None and plan["state"] in ("sin_probar", "confirmada_por_oferta"):
+            st = neg.state_from_thread(th, plan["dealer"], tick, neg.Config(), side="sell")
+            new, why = radio.hypothesis_after_bid(plan, st.ref_ask, st.turns)
+            if new != plan["state"]:
+                plan.update(state=new, state_why=why)
+                radio.add_evidence(reg, plan["news_id"], "for" if new == "confirmada_por_oferta" else "against", why, tick,
+                                   f"bid:{plan['dealer']}:{key}:{new}")
+        elif th is None and plan["state"] == "sin_probar" and plan.get("opened_tick") is not None and \
+                tick > plan["opened_tick"] + 1:
+            plan.update(state="cerrada", state_why="conversación cerrada sin puja que alcance la reserva")
+            radio.add_evidence(reg, plan["news_id"], "against", plan["state_why"], tick, f"closed:{key}")
+        if plan["state"] in ("settled", "cerrada", "no_confirmada") and th is None and \
+                tick - int(plan.get("opened_tick") or tick) > 300:
+            plans.pop(key, None)
 
 
 def fever_priority(cands, s, args):
@@ -1244,6 +1797,117 @@ def tactical_sales(s, led, args, val, pl, out):
     return reports
 
 
+def fast_sales_step(s, led, args, val, counts, pl, out):
+    """--fast-sales REF,REF…: campaña de ventas rápidas (ver fast_sales.py). Sin el flag no hace nada."""
+    refs = fs.parse_refs(getattr(args, "fast_sales", ""))
+    if not refs:
+        return None
+    cfg = fs.Config(refs=refs, ticks=getattr(args, "fast_sales_ticks", 6), counters=getattr(args, "fast_sales_counters", 2),
+                    margin=max(2.0, float(getattr(args, "margin", 2.0))), denied=deny_cfg(args)[0],
+                    allow_last=frozenset(x.strip() for x in (getattr(args, "allow_last_copy", "") or "").split(",") if x.strip()))
+    tick, team = s["clock"]["tick"], s["me"]["id"]
+    committed = committed_ids(s, led)
+    venues = mi.venues_from(s)
+    reps = fs.revalidate(s, committed, cfg, val, counts)
+    pcfg = phase_cfg(args)
+    minutes = ph_mod.minutes_to_close(s["clock"])
+    urgent = bool(pcfg.enabled and minutes is not None and minutes <= pcfg.transition_min)
+    ratio = s.get("_expiry_ratio") or 1.0
+    pref = getattr(args, "duende_venue", "rastro")
+    venue = pref if pref in venues and getattr(venues[pref], "open", True) else "rastro"
+    own = {o["id"]: o for o in s["offers"].get("offers", []) if o.get("maker") == team and o.get("status") == "open"}
+    mine_ids = {a.get("offer") for a in led.get("actions", []) if a.get("module") == fs.MODULE and a["type"] == "list"
+                and a.get("status") in ("submitted", "settled")}
+    cards = {c["id"]: c for st_ in s["catalog"].get("sets", []) for c in st_.get("cards", [])}
+    report, used_bids = [], set()
+    for ref, rep in reps.items():
+        ev = fs.evidence(s, ref, cfg, venues, INTEL_STATE.get("intel"))
+        ok_bids = []
+        for b in ev["bids"]:   # restricciones del operador: --no-rival-venues no se salta por una buena puja
+            why = rival_venue_blocker({"type": "accept", "venue": b["venue"]}, s) if not getattr(args, "rival_venue_allow_funding", False) \
+                else None
+            (ev["rejected_bids"].append(dict(b, problems=[why])) if why else ok_bids.append(b))
+        ev["bids"] = ok_bids
+        st_ = (pl.get("states") or {}).get(ref)
+        mk = {"value": st_.market.value, "confidence": st_.market.confidence} if st_ is not None else None
+        pr = fs.three_prices(rep, ev, cfg, (cards.get(ref) or {}).get("book"), mk)
+        row = {"ref": ref, "copies": rep["copies"], "free": rep["free"], "locked": rep["locked"], "loss": rep["loss"],
+               "authorized": rep["authorized"], "reasons": list(rep["reasons"]), "prices": pr,
+               "evidence": {"bids": ev["bids"], "rejected_bids": ev["rejected_bids"], "asks": ev["asks"][:3],
+                            "closes": len(ev["closes"]), "recent_buyers": ev["recent_buyers"]},
+               "pages_after": rep["pages_after"], "assets": []}
+        report.append(row)
+        if not rep["authorized"]:
+            continue
+        mine_locked = {a: i for a, i in rep["locked"].items() if i["offer"] in mine_ids and i["offer"] in own}
+        out += fs.lock_cancels(dict(rep, locked={a: i for a, i in rep["locked"].items() if a not in mine_locked}), s, led)
+        for a, i in rep["locked"].items():
+            if a not in mine_locked and i["thread"] is not None:
+                row["assets"].append({"asset": a, "action": "wait", "reason": f"negociación en curso con {i['dealer']} "
+                                      f"(hilo {i['thread']}): esa ruta sigue hasta cerrar; no se duplica la salida"})
+        for asset in sorted(rep["free"] + list(mine_locked)):
+            st = fs.stage(led, asset, tick, cfg)
+            ev_a = dict(ev, bids=[b for b in ev["bids"] if b["offer"] not in used_bids])
+            offer = own.get(mine_locked[asset]["offer"]) if asset in mine_locked else None
+            d = fs.decide(rep, asset, ev_a, pr, st, offer, cfg, tick, urgent, venue, ratio)
+            if d["action"] == "accept":
+                used_bids.add(d["bid"]["offer"])
+                out.append(fs.accept_candidate(rep, asset, d["bid"], pr, d["reason"]))
+            elif d["action"] == "list":
+                out.append(fs.list_candidate(rep, asset, d, pr))
+            elif d["action"] == "cancel":
+                out.append(fs.cancel_candidate(rep, asset, offer, d))
+            row["assets"].append({"asset": asset, "action": d["action"], "reason": d["reason"], "price": d.get("price"),
+                                  "stage": st})
+    pl["fast_sales_report"] = {"tick": tick, "urgent": urgent, "venue": venue, "refs": report, "buyers": fs.buyer_log(led)}
+    return report
+
+
+def fast_sales_supersede(out, args, pl=None):
+    """Una sola oferta de salida por activo de la campaña: las publicaciones/trueques/ventas genéricas de esas cartas
+    quedan sustituidas (las conversaciones con vendedores ya abiertas siguen su curso). Una venta v10 con aprobación
+    VIGENTE compite como una ruta más: se bloquea si otra ruta ejecutable da claramente más o si no llega al mínimo;
+    el incentivo de 1 P de Team 5 es adicional y pendiente (no entra en el mínimo)."""
+    refs = set(fs.parse_refs(getattr(args, "fast_sales", "")))
+    if not refs:
+        return
+    rows = {r["ref"]: r for r in ((pl or {}).get("fast_sales_report") or {}).get("refs", [])}
+    for c in out:
+        if c.get("module") == fs.MODULE or c["type"] not in ("list", "swap_list", "dealer_sell_open", "accept"):
+            continue
+        hit = _cards_of(c) & refs
+        if not hit:
+            continue
+        if c.get("v10_approval"):
+            r = rows.get(sorted(hit)[0]) or {}
+            p = r.get("prices") or {}
+            bid = p.get("quick_close")
+            if p and (c.get("price") or 0) < p["minimum"]:
+                c["blockers"] = list(c.get("blockers") or []) + [
+                    f"venta v10 a {c.get('price')} P bajo el mínimo {p['minimum']} P (el incentivo de Team 5 no cuenta hasta cobrarse)"]
+            elif bid is not None and bid > (c.get("price") or 0) + 1:
+                c["blockers"] = list(c.get("blockers") or []) + [
+                    f"otra ruta ejecutable da {bid} P netos frente a {c.get('price')} P + 1 P de incentivo pendiente"]
+            else:
+                c.setdefault("notes", []).append(f"ruta v10: {c.get('price')} P + 1 P de incentivo PENDIENTE (no es ingreso hasta cobrarse)")
+            continue
+        if not (c["type"] == "accept" and not (c.get("deliver") or {})):
+            c["blockers"] = list(c.get("blockers") or []) + ["sustituida por la campaña de ventas rápidas (una sola salida por activo)"]
+
+
+def fast_sales_lines(rp):
+    out = [f"VENTAS RÁPIDAS · tick {rp['tick']} · venue {rp['venue']}{' · CIERRE CERCANO' if rp['urgent'] else ''}"]
+    for r in rp["refs"]:
+        p = r["prices"]
+        out.append(f"  {r['ref']}: copias {r['copies']} libres {r['free']} comprometidas {sorted(r['locked'])} · "
+                   f"pérdida {r['loss']} P · MÍNIMO {p['minimum']} · CIERRE RÁPIDO {p['quick_close'] if p['quick_close'] is not None else '—'}"
+                   f" · OBJETIVO {p['objective']} ({'; '.join(p['basis'])})" if r["authorized"] else
+                   f"  {r['ref']}: NO autorizada — {'; '.join(r['reasons'])}")
+        for a in r["assets"]:
+            out.append(f"      #{a['asset']}: {a['action'].upper()} — {a['reason']}")
+    return out
+
+
 def parse_directed_buys(specs):
     """REF@EQUIPO=PRECIO → [(ref, team, price)]."""
     out = []
@@ -1375,7 +2039,7 @@ def page_campaign_step(s, led, args, val, counts, pl, view, scored, ccfg, used, 
         st = (pl.get("states") or {}).get(ref)
         market = {"value": st.market.value, "best_ask": st.best_ask.price if st.best_ask else None} if st else {}
         plan = pc.plan_target(ref, g["gain"], g["completes_page"], state["level"], s, val, cfg, venues, intel,
-                              assets, market)
+                              assets, market, afford=max(0, view.free_tactical_cash))
         rep["plans"].append(plan)
         best = plan.get("best")
         c = dict(best["candidate"]) if best and best.get("candidate") else None
@@ -1441,7 +2105,77 @@ def page_campaign_step(s, led, args, val, counts, pl, view, scored, ccfg, used, 
             rep["next_action"] = ("sin ruta rentable: ningún ask por debajo del techo ni dueño identificable con "
                                   "evidencia; seguir observando tablones, feed y vendedores")
     rep["sequencing"] = sequencing_note(val, counts, state)
+    rep["funding"] = campaign_funding(rep, view, args, led, out, assets, bst_of(pl), s)
+    if rep["funding"]:
+        pl["funding"] = rep["funding"]
+        if not rep["plans"] or not any(p.get("best") for p in rep["plans"]):
+            f = rep["funding"]
+            rep["next_action"] = (f"{f['ref']}: SIN FINANCIACIÓN — faltan {f['deficit']} P (necesita {f['need']} P, libre "
+                                  f"{f['free']} P; limita: {f['binding']}). "
+                                  + ("Financiación ejecutable: " + "; ".join(x["text"] for x in f["options"][:3]) if f["options"]
+                                     else "Sin financiación ejecutable identificada")
+                                  + f". Cambio necesario (no aplicado): {f['config']}")
     return rep
+
+
+def bst_of(pl):
+    return pl.get("budget") or {}
+
+
+def campaign_funding(rep, view, args, led, out, assets, bst, s=None):
+    """Si la carta objetivo más valiosa no cabe en los límites: DÉFICIT exacto, restricción que bloquea, financiación
+    EJECUTABLE identificada (ventas de activos libres) y el cambio de configuración necesario. Una venta futura o una
+    comisión prometida NO es efectivo disponible: se lista como medio de financiar, nunca se suma a lo libre."""
+    needs = []
+    for p in rep["plans"]:
+        for r in p.get("unfunded_routes") or []:
+            needs.append((r["need"], p["ref"], r))
+    # compras bloqueadas por capital en otros módulos (dealer_open de la campaña, aceptaciones)
+    for x in out:
+        if x["type"] == "dealer_open" and x.get("ref", "")[5:] in {p["ref"] for p in rep["plans"]} and x.get("price"):
+            if any("máximo" in b for b in x.get("blockers") or []):
+                needs.append((int(x["price"]), x["ref"][5:], {"route": f"vendedor {x['dealer']}", "via": x["dealer"]}))
+    if not needs:
+        return None
+    need, ref, r = min(needs, key=lambda t: t[0])
+    cash_room = view.cash - view.hard_reserve - view.pending_cash - view.market_reserved_cash - view.dealer_exposure
+    budget_room = view.budget_left
+    free = max(0, min(cash_room, budget_room))
+    deficit = max(0, need - free)
+    binding = ("efectivo (caja − reserva dura − compromisos reales)" if cash_room <= budget_room
+               else f"presupuesto del operador (--max-spend, restante {budget_room} P)")
+    options = []
+    for x in out:
+        cash = x.get("cash") if x["type"] == "accept" and (x.get("cash") or 0) > 0 else None
+        if x["type"] in ("list", "dealer_sell_open", "accept", "dealer_sell_accept") and (x.get("du") or 0) >= args.margin:
+            exp = cash if cash is not None else x.get("price") or 0
+            if exp and not x.get("receive"):
+                blockers = list(x.get("blockers") or [])
+                rival = rival_venue_blocker(x, s) if (s is not None and getattr(args, "no_rival_venues", False)) else None
+                if rival and not (getattr(args, "rival_venue_allow_funding", False) and funds_priority_purchase(x, args)):
+                    blockers.append(rival + " (permitir con --rival-venue-allow-funding)")
+                tag = "ejecutable" if not blockers else "bloqueada: " + "; ".join(blockers)[:110]
+                name = x.get("ref") or ",".join((x.get("deliver") or {}).keys())
+                only_rival = bool(rival) and not x.get("blockers")
+                options.append({"text": f"{x['type']} {name} ≈{exp} P ({x.get('venue') or 'vendedor'}, {tag})",
+                                "cash": exp, "executable": not blockers, "only_rival_blocked": only_rival})
+    options.sort(key=lambda o: (not o["executable"], -o["cash"]))
+    got = potential = 0
+    for o in options:
+        if o["executable"]:
+            got += o["cash"]
+        if o["executable"] or o["only_rival_blocked"]:
+            potential += o["cash"]  # lo que daría si el operador permitiera la excepción de venue rival
+    cfg_note = []
+    if budget_room < need:
+        cfg_note.append(f"--max-spend ≥ {bst.get('used', 0) + need} (hoy {bst.get('limit')})")
+    if cash_room < need:
+        cfg_note.append(f"liberar {max(0, need - cash_room)} P: vender activos libres o bajar --reserve (hoy {view.hard_reserve} P)"
+                        " — decisión del operador")
+    return {"ref": ref, "route": r.get("route"), "need": need, "free": free, "deficit": deficit, "binding": binding,
+            "cash_room": cash_room, "budget_room": budget_room, "options": options[:5], "executable_funding": got,
+            "covers": got >= deficit, "potential_funding": potential, "covers_potential": potential >= deficit,
+            "config": "; ".join(cfg_note) or "ninguno: cabe"}
 
 
 def sequencing_note(val, counts, state):
@@ -1531,7 +2265,7 @@ PROFILES = {
     # sigue bloqueando TODO si no cuadra: el margen no sustituye al colchón de incertidumbre); 2 propuestas y 4
     # ticks por conversación; colchones ajustados al trabajo activo y capital pasivo limitado.
     "fast-close": {"margin": 1.0, "max_proposals": 2, "negotiation_ticks": 4, "tactical_buffer": 15,
-                   "max_passive_frac": 0.3, "page_campaign": "auto"},
+                   "max_passive_frac": 0.3, "page_campaign": "auto", "cooldown_ticks": 6},
 }
 
 
@@ -1600,8 +2334,11 @@ def campaign_candidates(s, led, args, pl, execute):
                 if n.get("settled_maker") == team:  # aceptaron NUESTRA propuesta: ellos pagan la comisión
                     paid = int((n.get("settled_give") or {}).get("cash") or 0)
                     got = int((n.get("settled_want") or {}).get("cash") or 0)
-                    led["spent_confirmed"] += paid
-                    led["cash_received"] += got
+                    okey = acct.key_offer(n.get("settled_offer"))
+                    if paid:
+                        acct.count(led, okey + ":pay", "spend", paid, tick, "campaña")
+                    if got:
+                        acct.count(led, okey + ":get", "income", got, tick, "campaña")
                     camp["spent"] += paid
                     camp["received"] += got
                 lines.append(f"LIQUIDADA  [campaña] {n['kind']} con {n['team']} · oferta #{n.get('settled_offer')} · "
@@ -1718,6 +2455,36 @@ def _cards_of(c):
     return out
 
 
+def apply_rival_policy(cands, s, args, pl):
+    """--no-rival-venues sigue prohibiendo; la ÚNICA excepción (opt-in) es una venta rentable que, junto con el resto de
+    financiación identificada, cubre el déficit de una compra prioritaria concreta."""
+    f = pl.get("funding") or {}
+    deficit = f.get("deficit", 0)
+    allow = getattr(args, "rival_venue_allow_funding", False) and deficit > 0 and f.get("covers_potential", False)
+    for c in cands:
+        why = rival_venue_blocker(c, s)
+        if not why:
+            continue
+        if allow and funds_priority_purchase(c, args):
+            c["rival_venue_override"] = why
+            c.setdefault("notes", []).append(
+                f"EXCEPCIÓN --rival-venue-allow-funding: {why}; financia el déficit de {deficit} P de {f['ref']}. "
+                "Coste para el rival NO cuantificado (sin fórmula verificada)")
+            continue
+        hint = ("; permitir con --rival-venue-allow-funding si financia una compra prioritaria"
+                if not getattr(args, "rival_venue_allow_funding", False) else
+                "; la excepción exige un déficit concreto que esta venta ayude a cubrir")
+        c["blockers"] = list(c.get("blockers") or []) + [why + hint]
+    return cands
+
+
+def funds_priority_purchase(c, args):
+    """Venta pura (entrega una carta, no recibe cartas) con excedente ≥ margen y efectivo positivo."""
+    cash = c.get("cash") if c["type"] == "accept" else c.get("price")
+    return (c["type"] in ("accept", "list") and not c.get("receive") and (cash or 0) > 0
+            and (c.get("du") or 0) >= args.margin)
+
+
 def rival_venue_blocker(c, s):
     """Bloqueo si la candidata publicaría o aceptaría en el venue de otro equipo: el market-making puntúa el valor
     creado entre otros equipos en tu venue, así que cada trato nuestro allí suma puntos a un rival (--no-rival-venues).
@@ -1798,6 +2565,11 @@ def send(reader, led, s, c, args, journal):
     if twice:
         print(f"   ASSET_EXPOSURE_BLOCK {describe(c)} · {twice} · NO SE ENVÍA")
         return None
+    if c["type"] == "accept" and c.get("offer") is not None:
+        stale = revalidate_live(reader, c, s)
+        if stale:
+            print(f"   REVALIDACIÓN {describe(c)} · {'; '.join(stale)} · NO SE ENVÍA")
+            return None
     rec = {"key": key, "type": c["type"], "module": c["module"], "kind": c["kind"], "tick": tick, "status": "intent",
            "offer": c.get("offer"), "asset": c.get("asset"), "assets": c.get("assets") or ([c["asset"]] if c.get("asset") else []),
            "ref": c.get("ref"), "price": c.get("price"), "cost": max(0, -(c.get("cash") or 0)) or (c.get("price") or 0
@@ -1875,6 +2647,16 @@ def send(reader, led, s, c, args, journal):
             led.setdefault("pilar_sell", {})[str(c["asset"])] = tick  # no reabrir la misma copia enseguida
             if c.get("news_floor") is not None:  # --news-sell: el suelo (valor privado + margen) acompaña a la copia
                 led.setdefault("news_floor", {})[str(c["asset"])] = c["news_floor"]
+            if c.get("radio_plan"):
+                led.setdefault("radio_plans", {})[str(c["asset"])] = dict(c["radio_plan"], opened_tick=tick,
+                                                                          thread=rec.get("thread"))
+            if c.get("news_id") is not None:  # la noticia queda ACCIONADA: no se repite ni tras reiniciar
+                rg = radio.read("registry")
+                if radio.record_action(rg, c["news_id"], {"type": "dealer_sell_open", "dealer": c["dealer"],
+                                                          "asset": c["asset"], "tick": tick, "thread": rec.get("thread")}):
+                    radio.link(rg, c["news_id"], "offers", {"thread": rec.get("thread"), "asset": c["asset"], "tick": tick},
+                               f"thread:{rec.get('thread')}")
+                    radio.write("registry", rg)
         elif c["type"] in ("dealer_sell_counter", "dealer_sell_accept"):
             if c["type"] == "dealer_sell_counter":
                 resp = reader.api.say(c["thread"], neg.ladder_message(c["dealer"], c.get("turns", 0), c["price"],
@@ -2001,6 +2783,8 @@ def cycle(reader, args, led, journal, execute, cache=None):
         except BazaarError as e:
             s["news"] = []
             print(f"   NOTICIAS: /api/news no disponible ({e}); --news-sell sin efecto este tick")
+        radio_ingest(s, execute)  # registro por ID: UNA lectura por tick que alimenta agente, dashboard y monitor
+        radio_learn_threads(s, led, args)
     if getattr(args, "fever_priority", False):  # --fever-priority: GET /api/schedule (persona_patch de fiebres)
         try:
             s["schedule"] = reader.call("schedule")
@@ -2025,6 +2809,8 @@ def cycle(reader, args, led, journal, execute, cache=None):
               f"{a.get('paid', a.get('price'))} P · "
               f"tick {a.get('settled_tick', tick)}")
         print(f"   RESULTADO OBSERVADO {observed(a, s, flags)}")
+    for line in dealer_notices(s, led):
+        print(f"   {line}")
     cands, pl, exposure = candidates(s, led, args, journal)
     camp_cands, camp_lines = campaign_candidates(s, led, args, pl, execute)
     cands += camp_cands
@@ -2051,6 +2837,13 @@ def cycle(reader, args, led, journal, execute, cache=None):
     if ingested:
         print(f"   INTELIGENCIA market.db: +{ingested['offers']} ofertas nuevas, +{ingested['settlements']} liquidaciones, "
               f"+{ingested['evidence']} evidencias · {ingested['teams']} equipos perfilados")
+    if pl.get("budget"):
+        b_ = pl["budget"]
+        aud = acct.audit(led)
+        print(f"   PRESUPUESTO ({b_['mode']}): {b_['explain']} → restante {b_['remaining']} P"
+              + (f" · AVISO CONTABILIDAD: {aud['double_counted_spend']} P de gasto y {aud['double_counted_income']} P "
+                 f"de ingreso contados dos veces en el registro; corrige con --repair-accounting" if
+                 aud["double_counted_spend"] or aud["double_counted_income"] else ""))
     if pl.get("capital"):
         print("   " + ca.CapitalView(**pl["capital"]).line())
         if getattr(args, "capital_report", False) or getattr(args, "show", 0):
@@ -2077,10 +2870,39 @@ def cycle(reader, args, led, journal, execute, cache=None):
             print(f"   Secuencia: ganancia de completar todo {camp['sequencing']['total_gain_all']} P · valor de cada "
                   f"carta si es la ÚLTIMA {camp['sequencing']['gain_if_last']} (conviene dejar para el final la más "
                   "disponible)")
+    if getattr(args, "v15_scan", False):
+        own = (s["me"].get("venue") or {}).get("venue") or "v15"
+        fees = {v["venue"]: v.get("fee_bps", 0) for v in (s.get("venues") or {}).get("venues", [])}
+        st15 = led.setdefault("v15", {})
+        for k, old, new in tp.update(st15, s, own, team, tick, fees):
+            print(f"   V15 {k}: {old or '—'} → {new}")
+        for line in tp.report(st15, own):
+            print(f"   {line}")
+        if execute:  # el análisis nunca escribe el registro del proceso en marcha
+            save(led)
+    f_ = pl.get("funding")
+    if f_:
+        print(f"   FINANCIACIÓN {f_['ref']}: necesita {f_['need']} P · libre {f_['free']} P (caja−reserva−compromisos "
+              f"{f_['cash_room']} P; presupuesto restante {f_['budget_room']} P) → DÉFICIT {f_['deficit']} P · limita: "
+              f"{f_['binding']}")
+        for o_ in f_["options"]:
+            print(f"      medio de financiar: {o_['text']}")
+        print(f"      cambio necesario (NO aplicado): {f_['config']}")
     for rep_ in pl.get("tactical_sales") or []:
         print("   " + ts.report_block(rep_).replace("\n", "\n   "))
     for line in dealer_lines(pl.get("dealer_diag") or {}):
         print(f"   {line}")
+    if pl.get("bank"):
+        bnk = pl["bank"]
+        q = bnk["quota"]
+        print(f"   BANCO · {bnk['status']} · tick {bnk['tick']} · elegibles {bnk['eligible_assets']} · "
+              f"cuota conservadora {q['used']}/{q['limit']} usada, quedan {q['remaining']} · "
+              f"capital de compra utilizable {bnk['cash_room']} P")
+        if bnk.get("sell_menu"):
+            print("      Vende: " + "; ".join(bnk["sell_menu"]))
+        for why in bnk.get("reasons", []):
+            print(f"      {why}")
+        print(f"      {bnk['silver_pack']}")
     if pl.get("pilar"):
         print("   " + pilar_line(pl["pilar"]))
     if pl.get("ladder_cal"):
@@ -2090,15 +2912,28 @@ def cycle(reader, args, led, journal, execute, cache=None):
                                 sum(1 for o in s["offers"].get("offers", []) if o.get("maker") == team
                                     and o.get("status") == "open"))
     print("   " + perf.line(performance))
+    if pl.get("phase") and pl["phase"]["enabled"]:
+        top = sorted((c for c in cands if not c.get("blockers") and c["type"] != "info"), key=lambda c: -c.get("score", 0))
+        blk = list(dict.fromkeys(b for c in cands for b in (c.get("blockers") or []) if "TESORER" in b or "TRANSICI" in b
+                                 or "cooldown" in b or "ticks antes del cierre" in b))
+        nxt = (f"{top[0]['type']} {top[0].get('kind') or ''} {top[0].get('ref') or ''}".strip() if top
+               else "sin acción ejecutable ahora (se sigue observando)")
+        for line in ph_mod.summary_lines(pl["phase"], committed=pl.get("phase_committed", 0),
+                                         pending_buys=sum(1 for a in led["actions"] if a["type"] in ("accept", "dealer_accept", "team_accept") and a["status"] in ("intent", "submitted", "ambiguous")),
+                                         pending_sells=sum(1 for o in s["offers"].get("offers", []) if o.get("maker") == team and o.get("status") == "open" and not (o.get("give") or {}).get("cash")),
+                                         closed=performance["settlement_count"], net_realized=performance["realized_surplus"],
+                                         next_action=nxt, blockers=blk):
+            print(f"   {line}")
+        for n_ in pl.get("phase_notes") or []:
+            print(f"   FASE · {n_}")
+    for line in fast_sales_lines(pl["fast_sales_report"]) if pl.get("fast_sales_report") else ():
+        print("   " + line)
     if flags:
         print("   AVISO actividad no registrada por este ordenador: " + "; ".join(flags))
     for line in camp_lines:
         print(f"   {line}")
     if getattr(args, "no_rival_venues", False):
-        for c in cands:
-            why = rival_venue_blocker(c, s)
-            if why:
-                c["blockers"] = list(c.get("blockers") or []) + [why]
+        apply_rival_policy(cands, s, args, pl)
     shown = sorted(cands, key=lambda c: (bool(c.get("blockers")), -c.get("score", 0)))
     for c in shown[:args.show]:
         tag = "CANDIDATA " if not c.get("blockers") else "descartada"
@@ -2115,6 +2950,8 @@ def cycle(reader, args, led, journal, execute, cache=None):
         print(mi.intel_report(pl, limit=args.intel))
     max_posts = min(getattr(args, "max_posts", 1), s["clock"].get("limits", {}).get("offers_per_team_per_tick", 1))
     chosen = select(cands, led, tick, max_posts)
+    radio_decision(s, cands, chosen, execute, led, args)
+    shared = export_shared(s, cands, chosen, pl, led, args, execute, ingested)
     for c in cands:
         c.pop("opp", None) if c.get("type") != "team_open" else None
     if ambiguous:
@@ -2253,6 +3090,38 @@ def main():
     p.add_argument("--override-value", action="store_true",
                    help="permite que --directed-buy tenga ΔU < margen (solo esa regla; reserva y presupuesto siguen)")
     p.add_argument("--directed-expiry", type=int, default=20, help="ticks de vida pedidos para la compra dirigida")
+    g = p.add_argument_group("fases hacia el cierre (opt-in con --phases; sin ello nada cambia)")
+    g.add_argument("--phases", action="store_true",
+                   help="A operación activa → B transición → C tesorería, según el cierre OFICIAL del servidor (clock.closes)")
+    g.add_argument("--phase-transition-min", type=int, default=90, help="minutos antes del cierre en que empieza B (90)")
+    g.add_argument("--phase-treasury-min", type=int, default=30, help="minutos antes del cierre en que empieza C (30)")
+    g.add_argument("--cash-target-min", type=int, default=150, help="meta mínima de efectivo libre al cierre (150 P)")
+    g.add_argument("--cash-target-stretch", type=int, default=200, help="meta deseable de efectivo libre (200 P)")
+    g.add_argument("--phase-accelerate-max", type=int, default=60,
+                   help="adelanto máximo (min) de B y C si la meta es inalcanzable con la liquidez observada")
+    g.add_argument("--phase-final-ticks", type=int, default=2, help="últimos ticks sin publicaciones nuevas")
+    g.add_argument("--exit-haircut", type=float, default=0.25,
+                   help="descuento de PARÁMETRO sobre la salida de una reventa (comprador que desaparece); no es una probabilidad")
+    g.add_argument("--treasury-allow-campaign", action="store_true",
+                   help="en B (nunca en C) la campaña de página puede comprar aunque deje menos efectivo que la meta")
+    g.add_argument("--cooldown-ticks", type=int, default=0,
+                   help="no repetir una propuesta dirigida sin éxito al mismo equipo por la misma carta durante N ticks")
+    p.add_argument("--rival-venue-allow-funding", action="store_true",
+                   help="con --no-rival-venues: permite UNA venta rentable (ΔU ≥ margen) en un venue rival solo si "
+                        "financia el déficit de una compra prioritaria de la campaña; sin esto la prohibición no cambia")
+    p.add_argument("--v15-scan", action="store_true",
+                   help="solo lectura: detecta y rastrea oportunidades entre terceros para nuestro venue (market making); "
+                        "no envía mensajes ni compra/vende")
+    p.add_argument("--runtime-status", action="store_true",
+                   help="solo lectura: qué código y argumentos tiene el proceso en marcha frente a los ficheros actuales")
+    p.add_argument("--budget-mode", choices=["gross", "net"], default="gross",
+                   help="gross (por defecto): --max-spend limita el gasto bruto acumulado; net: gasto bruto − ingresos "
+                        "confirmados (las comisiones por cobrar NO cuentan)")
+    p.add_argument("--accounting-report", action="store_true",
+                   help="solo lectura del registro: gasto/ingresos, doble conteo y presupuesto; no usa la red")
+    p.add_argument("--repair-accounting", action="store_true",
+                   help="resta del registro el doble conteo EXACTO de vendedores (copia de seguridad previa); explícito, "
+                        "no cambia límites")
     p.add_argument("--profile", choices=sorted(PROFILES), default=None,
                    help="perfil de estrategia: fast-close = cierre rápido + colección (margen 1 P, 2 propuestas, 4 ticks)")
     p.add_argument("--page-campaign", default="MAL",
@@ -2280,6 +3149,9 @@ def main():
                    help="vender a cualquier vendedor que anuncie esa rareza en su menú (dealer['menu']['buys']): "
                         "suelo = valor privado + margen; se añade a --dealer-sell-dups/--pilar-sell/"
                         "--ladder-calibrated (no los sustituye, así que puede competir con sus propias aperturas)")
+    g.add_argument("--dealer-banco", action="store_true",
+                   help="integra Don Ernesto (banco): capacidades dinámicas, ventas con suelo marginal completo, cuotas, "
+                        "ofertas estructuradas y negociación acotada; análisis por defecto, no abre sobres ni ejecuta")
     g.add_argument("--dedupe-bids", action="store_true",
                    help="no pujar (y cancelar la puja abierta) por una carta que ya negociamos con un vendedor")
     g.add_argument("--ladder-new-open", dest="ladder_new_open", type=float, default=None,
@@ -2338,9 +3210,28 @@ def main():
                         "esperarlas si empiezan pronto")
     g.add_argument("--fever-wait", type=float, default=1.0,
                    help="con --fever-priority: horas de juego antes de la fiebre en que se esperan esas ventas")
+    g.add_argument("--fast-sales", default="", metavar="REF,REF",
+                   help="campaña de ventas rápidas: SOLO estas cartas, SOLO copias excedentes revalidadas (nunca páginas completas); "
+                        "ejemplo LAT-07,MAL-04,MAL-07,SAL-03,SAL-04; sin compras")
+    g.add_argument("--fast-sales-ticks", type=int, default=6, help="presupuesto de ticks desde la primera propuesta")
+    g.add_argument("--fast-sales-counters", type=int, default=2, help="reprecios/contraofertas máximos por activo")
+    g.add_argument("--ernesto", action="store_true",
+                   help="Don Ernesto (banco): reconoce acceso y menú, vende duplicados epic/legendary con 1 propuesta + "
+                        "hasta 2 contraofertas; las compras siguen la lógica genérica y su máximo económico")
+    g.add_argument("--radio", action="store_true",
+                   help="Radio Rastro INTEGRADA en las decisiones: implica --news-sell y --fever-priority; registro por noticia, "
+                        "plan de venta (A valor · B reserva · C objetivo · D estimada) y aprendizaje; sin él la radio no actúa")
+    g.add_argument("--radio-probe-counters", type=int, default=2,
+                   help="con --radio: contraofertas máximas de una venta cuya hipótesis aún no confirmó una oferta")
+    g.add_argument("--radio-probe-ticks", type=int, default=6,
+                   help="con --radio: plazo (ticks) de esa sonda; confirmada por una oferta, paciencia normal")
+    g.add_argument("--radio-spec-budget", type=int, default=0,
+                   help="con --radio: límite (P) de exposición en inventario comprado por una noticia; 0 = no se compra")
     g.add_argument("--news-db", default=None, metavar="market.db",
                    help="con --news-sell: calibrar la fiabilidad por fuente con este market.db (solo lectura)")
     args = p.parse_args()
+    if args.radio:  # --radio activa el módulo completo (instalado ≠ habilitado)
+        args.news_sell = args.fever_priority = True
     if args.ladder_fill:
         args.dealer_ladder = True
     if not 1 <= args.ticks <= 120:
@@ -2352,6 +3243,22 @@ def main():
     except (ValueError, OSError) as e:
         p.error(str(e))
     DATA.mkdir(exist_ok=True)
+    if args.runtime_status:
+        print(runtime_status())
+        raise SystemExit(0)
+    if args.accounting_report or args.repair_accounting:
+        led0 = ma.load_json(LEDGER)
+        if not led0:
+            raise SystemExit("No hay registro del coordinador")
+        led0.setdefault("spent_confirmed", 0)
+        led0.setdefault("cash_received", 0)
+        rep0 = acct.repair(led0, LEDGER) if args.repair_accounting else acct.audit(led0)
+        if args.repair_accounting and rep0.get("repaired"):
+            save(led0)
+        print(acct.to_json({k: v for k, v in rep0.items() if k != "duplicates"}))
+        print("DUPLICADOS:", acct.to_json(rep0["duplicates"]))
+        print("PRESUPUESTO:", acct.to_json(acct.budget_state(led0, args.max_spend, args.budget_mode)))
+        raise SystemExit(0)
     if args.news_sell and args.news_db:
         NEWS_CAL["cal"] = nw.calibrate(args.news_db)
     # retries=3: el SDK solo reintenta lo seguro (rate_limited = rechazada sin ejecutar; fallos de red en LECTURAS).
@@ -2370,6 +3277,8 @@ def main():
         holder = lock.acquire()
         if holder:
             raise SystemExit(f"Bloqueo ocupado por pid {holder.get('pid')} ({holder.get('version')})")
+        write_runtime(args)
+        print(f"CÓDIGO {code_fingerprint()} · pid {os.getpid()} · argumentos {' '.join(sys.argv[1:])}")
     if args.sale_target is None:
         args.sale_target = ["LAT-10=86"]
     applied = apply_profile(args)

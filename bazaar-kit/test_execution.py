@@ -352,12 +352,12 @@ class Performance(unittest.TestCase):
         actions = [
             {"type": "list", "venue": "v02", "status": "settled", "price": 10, "du": 6.0, "tick": 100, "settled_tick": 104},
             {"type": "dealer_accept", "status": "settled", "price": 14, "paid": 14, "dv": 22.75, "du": 8.75,
-             "tick": 101, "settled_tick": 102},
+             "tick": 101, "settled_tick": 102, "thread": 1},
             {"type": "list", "venue": "v02", "status": "released", "price": 9, "du": 4.0, "tick": 90},
             {"type": "bid", "venue": "v02", "status": "submitted", "price": 12, "du": 9.0, "expected_du": 1.7,
              "tick": 103},
-            {"type": "dealer_open", "status": "settled"}, {"type": "dealer_open", "status": "settled"},
-            {"type": "dealer_close", "status": "settled"}]
+            {"type": "dealer_open", "status": "settled", "thread": 1}, {"type": "dealer_open", "status": "settled", "thread": 2},
+            {"type": "dealer_close", "status": "settled", "thread": 2}]
         p = perf.realized(actions, {"abuela": [1, 2]}, open_offers=1)
         self.assertEqual(p["realized_surplus"], round(6.0 + (-14 + 22.75), 2))
         self.assertEqual(p["settlement_count"], 2)
