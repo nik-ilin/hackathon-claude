@@ -98,6 +98,10 @@ class Memory:
                 self.db.execute('INSERT OR IGNORE INTO events VALUES (?,?,?)',
                                 (e['id'], e['tick'], json.dumps(clean(e), ensure_ascii=False)))
             fresh = self.db.total_changes - before
+            import learning  # momento en que NOSOTROS vimos cada evento: replay sin fuga temporal
+            learning.mark_seen(self.db, [e for e in snapshot.get('feed', {}).get('events', [])
+                                         if isinstance(e, dict) and isinstance(e.get('tick'), int) and e['tick'] <= tick],
+                               tick, source)
             for a in actions:
                 if not a.get('key'):
                     continue

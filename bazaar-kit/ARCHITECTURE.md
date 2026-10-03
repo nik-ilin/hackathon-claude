@@ -1,5 +1,7 @@
 # Team 15 · Arquitectura del agente
 
+> **Fuente estratégica del evento:** aplicar las precisiones de [`PAYDAY_LEARNINGS.md`](PAYDAY_LEARNINGS.md) junto con las reglas actuales de [`RULES.md`](RULES.md). En particular, puntúa el valor generado por cada trato y el canal que lo produjo; el inventario y el efectivo por sí solos no puntúan. Los horarios/asignaciones de la presentación son históricos y siempre se vuelven a consultar en el servidor.
+
 Un único coordinador (`coordinator.py`) observa el juego una vez por tick, reconcilia lo enviado con la evidencia del servidor, genera candidatas de todos los módulos y envía como mucho una acción por clase de límite. Es la única autoridad que escribe y comparte un solo presupuesto.
 
 ```
@@ -437,3 +439,36 @@ Antes había dos cálculos que no podían coincidir. El dashboard compraba la «
   especulativo; con salida no asegurada o rumor, bloqueada. Las fases (TRANSICIÓN/TESORERÍA) las bloquean igual que a cualquier compra.
 - **Aprendizaje**: `radio.association` compara precios netos de operaciones equivalentes antes/después (n≥3 por lado) y lo marca
   «NO atribuible». Cada noticia enlaza oportunidades, decisiones, ofertas y liquidaciones; también las señales sin oportunidad.
+
+## Decisión bajo información incompleta (`decision.py`, `shadow.py`)
+
+- **Cerrar ahora frente a esperar**: `decision.compare` evalúa A aceptar · B contraofertar/proponer · C otra contraparte · D mantener,
+  como RANGOS de excedente económico con confianza baja/media/alta; sin probabilidades inventadas. Una oferta ejecutable válida
+  no se penaliza por una alternativa hipotética: solo esperan las alternativas con evidencia (puja vigente, o ≥3 cierres comparables
+  con cota inferior > oferta + `min_step`) y con tiempo; urgencia de caja (w), plazo agotado o caducidad inminente cierran.
+- **Alternativas por activo** (`decision.alternatives`, informe de ventas rápidas): pujas vigentes, rango de cierres comparables,
+  compradores con puja reciente, antigüedad y siguiente alternativa. Una sola oferta de salida por `asset_id`.
+- **Concesiones**: sin reprecio por menos de `min_step` (2 P) ni por silencio, cancelación o caducidad.
+- **Selector** (`--selector economic`, opt-in): nivel 0 seguridad · 1 compromisos y vencimientos · 2 oportunidades por valor económico
+  (la urgencia de caja de las fases es un campo explícito, `cash_urgent`; los bonos de `score` quedan solo como desempate).
+- **Exclusión estratégica** (`--deny-soft`, `--deny-soft-cost`): evalúa nuestro excedente sacrificado y las alternativas visibles del rival;
+  `--deny-teams` (acuerdos expresos) sigue siendo duro.
+- **Tesorería**: si faltan fondos y las ventas observadas son lentas, la fase B dura al menos la mediana de llenado (adelanto gradual,
+  tope `accelerate_max`); los escenarios siguen sin probabilidades y no se gasta contra ingresos hipotéticos.
+- **Team 5**: el resumen v10 separa comisión debida, cobrada confirmada y pendiente (1 P prometido no es efectivo).
+- **Sombra**: `python3 shadow.py` compara política anterior y propuesta sin enviar nada.
+
+- **Ventanas de publicación** (`fast_sales.stage`/`revised_price`): las propuestas se agrupan en ventanas de `--fast-sales-ticks`.
+  La caducidad natural abre otra ventana sin enfriamiento (el enfriamiento queda para liberaciones explícitas). Una ventana
+  sin respuesta no es un rechazo; `--fast-sales-dry-windows` (2) ventanas secas seguidas al MISMO precio sí son evidencia:
+  se baja un paso = máx(2 P, 25 % de la distancia al mínimo), nunca bajo el mínimo; tras rebajar, la racha empieza de cero.
+
+## Aprendizaje desde evidencia pública (`learning.py`, `lab.py`)
+
+fuentes (feed público vía instantánea del coordinador y `feed_history.jsonl`) → almacenamiento (`agent_memory.sqlite3`
+`events`, ahora con `event_seen`: tick en que lo vimos; `market.db` de `intelligence`) → características (experiencias
+normalizadas, ciclos de vida de ofertas con liquidación INFERIDA, precios comparables con decaimiento, perfiles por
+publicador y lado) → modelos (tasas con IC90 y agrupación si n_eff < 3, mediana ponderada, detección de cambio) →
+decisiones (solo vía una versión de política acotada: plazo, ventanas secas, paso mínimo, ajuste de objetivo ±10 %, orden
+de contacto, uso del precio aprendido). Nunca toca límites, protección de activos, contabilidad ni validación.
+`python3 lab.py replay|eval|sim|shadow|propose`; `--policy-version vN` aplica una versión (sin él, configuración actual).

@@ -71,4 +71,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    coordinator._graceful_signals()  # kill -INT/-TERM paran limpio también lanzado con nohup en segundo plano
+    try:
+        main()
+    except KeyboardInterrupt:
+        raise SystemExit("\nParado. Lo enviado está anotado en data/coordinator_ledger.json y se reconcilia al relanzar.")

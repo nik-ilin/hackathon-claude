@@ -199,14 +199,18 @@ class History:
     def load(self, tick: int) -> "History":
         self.rows = []
         if self.path and os.path.exists(self.path):
-            with open(self.path, encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        r = json.loads(line)
-                    except ValueError:
-                        continue
-                    if r.get("tick", 0) >= tick - self.window:
-                        self.rows.append(r)
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            r = json.loads(line)
+                        except ValueError:
+                            continue
+                        if r.get("tick", 0) >= tick - self.window:
+                            self.rows.append(r)
+            except OSError as e:  # p. ej. lectura caducada en una carpeta sincronizada: el ciclo sigue sin historial
+                print(f"   HISTORIAL no disponible ({type(e).__name__}: {e}); este tick se valora sin historial")
+                self.rows = []
         return self
 
     def known_settlements(self) -> set:

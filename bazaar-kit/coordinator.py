@@ -36,6 +36,8 @@ import market_intel as mi
 import negotiation as neg
 import opportunities as opps
 import fast_sales as fs
+import learning as lrn
+import liquidity as liq
 import news_watch as nw
 import radio
 import intelligence as intel_mod
@@ -933,12 +935,16 @@ def candidates(s, led, args, journal):
     free_cash = view.cash - view.market_reserved_cash - view.dealer_exposure - view.pending_cash
     exec_sales = sum(int(c.get("cash") or c.get("price") or 0) for c in out
                      if ph_mod.is_sale(c) and not c.get("blockers") and c["type"] != "list")
-    ph = ph_mod.state(s["clock"], pcfg, ph_mod.scenarios(free_cash, open_sell_net(s, team), exec_sales))
+    fill = perf.realized(led.get("actions", [])).get("median_ticks_to_fill")
+    fill_min = (fill * (s["clock"].get("tick_seconds") or 30.0) / 60.0) if fill else None
+    ph = ph_mod.state(s["clock"], pcfg, ph_mod.scenarios(free_cash, open_sell_net(s, team), exec_sales), fill_min=fill_min)
     pl["phase_notes"] = ph_mod.apply(out, ph, pcfg, free_cash=free_cash, states=pl.get("states") or {},
                                      tick_seconds=s["clock"].get("tick_seconds") or 30.0,
                                      expiry_ratio=s.get("_expiry_ratio") or 1.0, margin=args.margin,
                                      open_cash_offers=ph_mod.open_cash_offers(s["offers"].get("offers", []), team))
     pl["phase"], pl["phase_committed"] = ph, view.market_reserved_cash + view.dealer_exposure + view.pending_cash
+    if getattr(args, "liquidity_report", False):
+        pl["liquidity"] = liquidity_step(s, led, args, val, counts, view, free_cash, pl, out)
     out = dedupe_cancels(out)
     pl["capital"], pl["dealer_diag"], pl["open_bids"] = view.as_dict(), diag, scored
     pl["ladder"] = {d: len(x) for d, x in ladder.items()}
@@ -1802,8 +1808,15 @@ def fast_sales_step(s, led, args, val, counts, pl, out):
     refs = fs.parse_refs(getattr(args, "fast_sales", ""))
     if not refs:
         return None
-    cfg = fs.Config(refs=refs, ticks=getattr(args, "fast_sales_ticks", 6), counters=getattr(args, "fast_sales_counters", 2),
+    pol, pol_note = (lrn.params_for(DATA, args.policy_version) if getattr(args, "policy_version", None)
+                     else (None, "sin versión de política: configuración actual"))
+    cfg = fs.Config(refs=refs, ticks=(pol or {}).get("ticks") or getattr(args, "fast_sales_ticks", 6),
+                    counters=getattr(args, "fast_sales_counters", 2),
+                    dry_windows=(pol or {}).get("dry_windows") or getattr(args, "fast_sales_dry_windows", 2),
+                    min_step=(pol or {}).get("min_step") or 2,
                     margin=max(2.0, float(getattr(args, "margin", 2.0))), denied=deny_cfg(args)[0],
+                    soft_denied=lplus.parse_deny_teams(getattr(args, "deny_soft", "")),
+                    soft_cost=float(getattr(args, "deny_soft_cost", 5.0)),
                     allow_last=frozenset(x.strip() for x in (getattr(args, "allow_last_copy", "") or "").split(",") if x.strip()))
     tick, team = s["clock"]["tick"], s["me"]["id"]
     committed = committed_ids(s, led)
@@ -1812,16 +1825,20 @@ def fast_sales_step(s, led, args, val, counts, pl, out):
     pcfg = phase_cfg(args)
     minutes = ph_mod.minutes_to_close(s["clock"])
     urgent = bool(pcfg.enabled and minutes is not None and minutes <= pcfg.transition_min)
+    # urgencia de caja continua (0 en fase A, 1 en tesorería) con los mismos umbrales que las fases
+    w_cash = (min(1.0, max(0.0, (pcfg.transition_min - minutes) / max(1, pcfg.transition_min - pcfg.treasury_min)))
+              if pcfg.enabled and minutes is not None else 0.0)
     ratio = s.get("_expiry_ratio") or 1.0
     pref = getattr(args, "duende_venue", "rastro")
     venue = pref if pref in venues and getattr(venues[pref], "open", True) else "rastro"
     own = {o["id"]: o for o in s["offers"].get("offers", []) if o.get("maker") == team and o.get("status") == "open"}
-    mine_ids = {a.get("offer") for a in led.get("actions", []) if a.get("module") == fs.MODULE and a["type"] == "list"
-                and a.get("status") in ("submitted", "settled")}
+    # el id de una publicación propia queda en `offer_id` (respuesta del servidor); `offer` es para aceptaciones
+    mine_ids = {a.get("offer_id") or a.get("offer") for a in led.get("actions", []) if a.get("module") == fs.MODULE
+                and a["type"] == "list" and a.get("status") in ("submitted", "settled")} - {None}
     cards = {c["id"]: c for st_ in s["catalog"].get("sets", []) for c in st_.get("cards", [])}
     report, used_bids = [], set()
     for ref, rep in reps.items():
-        ev = fs.evidence(s, ref, cfg, venues, INTEL_STATE.get("intel"))
+        ev = fs.evidence(s, ref, cfg, venues, INTEL_STATE.get("intel"), rep["loss"])
         ok_bids = []
         for b in ev["bids"]:   # restricciones del operador: --no-rival-venues no se salta por una buena puja
             why = rival_venue_blocker({"type": "accept", "venue": b["venue"]}, s) if not getattr(args, "rival_venue_allow_funding", False) \
@@ -1830,7 +1847,14 @@ def fast_sales_step(s, led, args, val, counts, pl, out):
         ev["bids"] = ok_bids
         st_ = (pl.get("states") or {}).get(ref)
         mk = {"value": st_.market.value, "confidence": st_.market.confidence} if st_ is not None else None
-        pr = fs.three_prices(rep, ev, cfg, (cards.get(ref) or {}).get("book"), mk)
+        learned = None
+        if pol and pol.get("use_learned_price"):
+            learned = lrn.price_estimate(learned_rows(s), ref, tick, {c2["id"]: (st2["id"], c2.get("rarity"))
+                                                                       for st2 in s["catalog"].get("sets", []) for c2 in st2.get("cards", [])})
+        pr = fs.three_prices(rep, ev, cfg, (cards.get(ref) or {}).get("book"), mk, learned, (pol or {}).get("target_adj", 0.0))
+        if pol and pol.get("contact_order") == "fill_rate" and ev["recent_buyers"]:
+            prof = lrn.counterparty_profiles(lrn.lifecycles(learned_rows(s)), tick)
+            ev["recent_buyers"].sort(key=lambda b: -((prof.get(f"{b['team']}:bid") or {}).get("fill") or {}).get("rate", 0) or 0)
         row = {"ref": ref, "copies": rep["copies"], "free": rep["free"], "locked": rep["locked"], "loss": rep["loss"],
                "authorized": rep["authorized"], "reasons": list(rep["reasons"]), "prices": pr,
                "evidence": {"bids": ev["bids"], "rejected_bids": ev["rejected_bids"], "asks": ev["asks"][:3],
@@ -1849,7 +1873,7 @@ def fast_sales_step(s, led, args, val, counts, pl, out):
             st = fs.stage(led, asset, tick, cfg)
             ev_a = dict(ev, bids=[b for b in ev["bids"] if b["offer"] not in used_bids])
             offer = own.get(mine_locked[asset]["offer"]) if asset in mine_locked else None
-            d = fs.decide(rep, asset, ev_a, pr, st, offer, cfg, tick, urgent, venue, ratio)
+            d = fs.decide(rep, asset, ev_a, pr, st, offer, cfg, tick, urgent, venue, ratio, w_cash)
             if d["action"] == "accept":
                 used_bids.add(d["bid"]["offer"])
                 out.append(fs.accept_candidate(rep, asset, d["bid"], pr, d["reason"]))
@@ -1857,10 +1881,64 @@ def fast_sales_step(s, led, args, val, counts, pl, out):
                 out.append(fs.list_candidate(rep, asset, d, pr))
             elif d["action"] == "cancel":
                 out.append(fs.cancel_candidate(rep, asset, offer, d))
+            alts = d.get("alternatives") or fs.dec.alternatives(ev_a, None, tick)
             row["assets"].append({"asset": asset, "action": d["action"], "reason": d["reason"], "price": d.get("price"),
-                                  "stage": st})
-    pl["fast_sales_report"] = {"tick": tick, "urgent": urgent, "venue": venue, "refs": report, "buyers": fs.buyer_log(led)}
+                                  "stage": st, "alternatives": alts,
+                                  "next_alternative": next((x for x in sorted(alts, key=lambda x: -(x.get("net_hi") or 0))
+                                                            if x.get("net_hi") is not None), None),
+                                  "compare": (d.get("compare") or {}).get("options")})
+    pl["fast_sales_report"] = {"tick": tick, "urgent": urgent, "venue": venue, "refs": report, "buyers": fs.buyer_log(led),
+                               "policy": {"version": getattr(args, "policy_version", None), "params": pol, "note": pol_note}}
     return report
+
+
+LEARN_CACHE: dict = {}
+
+
+def learned_rows(s):
+    """Experiencias públicas de la memoria (agent_memory.sqlite3) hasta este tick, una vez por tick; si la memoria no
+    está disponible, las del feed de la instantánea. Nunca eventos futuros."""
+    tick = s["clock"]["tick"]
+    if LEARN_CACHE.get("tick") != tick:
+        try:
+            import agent_memory
+            ev = lrn.load_events(agent_memory.DEFAULT, tick)
+        except Exception:  # noqa: BLE001 — la memoria es opcional
+            ev = []
+        ev = ev or [e for e in s["feed"].get("events", []) if (e.get("tick") or 0) <= tick]
+        LEARN_CACHE.update(tick=tick, rows=lrn.experiences(ev))
+    return LEARN_CACHE["rows"]
+
+
+def liquidity_step(s, led, args, val, counts, view, free_cash, pl, out):
+    """--liquidity-report: reconciliación, escenarios y ofertas excepcionales (estas, solo como información)."""
+    try:
+        team = s["me"]["id"]
+        committed = committed_ids(s, led)
+        venues = mi.venues_from(s)
+        inv = liq.inventory(s["me"], s["catalog"], committed)
+        rows = ((pl.get("fast_sales_report") or {}).get("refs")) or []
+        sc = liq.scenarios(free_cash, rows)
+        pcfg = phase_cfg(args)
+        v10 = v10c.summary(led.get("v10_commission") or {})
+        exc = liq.exceptional_offers(s, val, counts, venues, args.margin, deny_cfg(args)[0])
+        for e in exc:   # visibles en el informe; tipo info: el selector nunca los envía
+            out.append({"type": "info", "module": "excepcional", "kind": f"oferta excepcional por página {e['page']}",
+                        "ref": ",".join(e["refs"]), "du": e["surplus"], "score": -1,
+                        "blockers": ["carta protegida de página completa: requiere autorización expresa del operador"],
+                        "notes": [f"neto {e['net']} P · pérdida del lote {e['loss_lot']} P · {e['note']}"]})
+        arb = opps.executable_arbitrage(s, lambda v, p: venues[v].fee(p, 1) if v in venues else 0)
+        watch = [f"{a['ref']}: comprar #{a['buy_offer']} a {a['buy_cost']} P → vender #{a['sell_offer']} por {a['sell_net']} P netos "
+                 f"(bruto {a['gross']} P; dos operaciones NO atómicas, la salida puede desaparecer; sin presupuesto de reventa)"
+                 for a in arb[:3]]
+        return {"tick": s["clock"]["tick"], "inventory": inv,
+                "capital": {"cash": s["me"].get("cash"), "free": free_cash, "committed": (s["me"].get("cash") or 0) - free_cash,
+                            "income_confirmed": led.get("cash_received", 0), "published_sales": open_sell_net(s, team),
+                            "incentive_pending": v10.get("commission_pending_p", 0), "incentive_paid": v10.get("commission_paid_confirmed_p", 0)},
+                "scenarios": sc, "viability": liq.viability(sc, pcfg.target_min, pcfg.target_stretch),
+                "exceptional": exc, "resale_watch": watch}
+    except Exception as e:  # el informe nunca detiene al coordinador
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 def fast_sales_supersede(out, args, pl=None):
@@ -2500,13 +2578,47 @@ def rival_venue_blocker(c, s):
     return None
 
 
-def select(cands, led, tick, max_posts=1):
+SAFETY_MODULES = {"seguridad"}
+COMMIT_TYPES = {"dealer_accept", "dealer_sell_accept", "team_accept", "dealer_counter", "dealer_sell_counter", "team_propose",
+                "dealer_close", "team_close", "team_cancel", "cancel"}
+
+
+def priority_tier(c):
+    """--selector economic. 0 SEGURIDAD (nunca romper una página, retirar lo inseguro) · 1 COMPROMISOS Y VENCIMIENTOS
+    (cerrar lo ya negociado, responder en hilos abiertos, retirar ofertas, aprobaciones con plazo) · 2 OPORTUNIDADES
+    COMERCIALES compatibles, que compiten por su valor ECONÓMICO. Las constantes de `score` (10**5, 3·10**5, 10**7…) son
+    ordenación heredada, no beneficio: dentro del nivel 2 no se mezclan con ΔU."""
+    if c.get("module") in SAFETY_MODULES or c.get("protected_page_cancel"):
+        return 0
+    if c["type"] in COMMIT_TYPES or c.get("v10_approval") or c.get("capital_cancel"):
+        return 1
+    return 2
+
+
+def economic_value(c):
+    """Beneficio económico esperado en P sin bonos de prioridad: oferta ejecutable → ΔU; publicación/puja sin probabilidad
+    verificada → expected_du si existe, si no 0 (no se inventa una probabilidad)."""
+    if c["type"] in ("list", "bid", "swap_list", "dealer_open", "dealer_sell_open", "team_open"):
+        v = c.get("expected_du")
+        return float(v) if v is not None else 0.0
+    v = c.get("expected_du") if c.get("expected_du") is not None else c.get("du")
+    return float(v) if v is not None else 0.0
+
+
+def select_key(c, selector="legacy"):
+    if selector != "economic":
+        return (-c.get("score", 0),)
+    return (priority_tier(c), -(c.get("cash_urgent") or 0.0), -economic_value(c), -c.get("score", 0))
+
+
+def select(cands, led, tick, max_posts=1, selector="legacy"):
     """Como mucho una acción por clase de límite y tick (publicar: hasta `max_posts`, acotado por el servidor);
-    dentro de cada clase, la de mayor puntuación."""
+    dentro de cada clase, la de mayor puntuación (`legacy`) o, con `--selector economic`, primero seguridad, compromisos y
+    vencimientos y después el valor económico de las oportunidades compatibles."""
     chosen, used, posts = [], set(), 0
     done = led.get("class_count", {})
     for c in sorted((c for c in cands if not c.get("blockers") and c["type"] in CLASSES),
-                    key=lambda c: -c.get("score", 0)):
+                    key=lambda c: select_key(c, selector)):
         cls = CLASSES[c["type"]]
         if cls == "mensaje":  # el límite es un mensaje por conversación y tick
             cls = f"mensaje:{c.get('thread')}"
@@ -2928,6 +3040,9 @@ def cycle(reader, args, led, journal, execute, cache=None):
             print(f"   FASE · {n_}")
     for line in fast_sales_lines(pl["fast_sales_report"]) if pl.get("fast_sales_report") else ():
         print("   " + line)
+    if pl.get("liquidity"):
+        for line in (liq.lines(pl["liquidity"]) if "error" not in pl["liquidity"] else [f"LIQUIDEZ no disponible: {pl['liquidity']['error']}"]):
+            print("   " + line)
     if flags:
         print("   AVISO actividad no registrada por este ordenador: " + "; ".join(flags))
     for line in camp_lines:
@@ -2949,7 +3064,7 @@ def cycle(reader, args, led, journal, execute, cache=None):
     if pl.get("states") is not None and getattr(args, "intel", 0):
         print(mi.intel_report(pl, limit=args.intel))
     max_posts = min(getattr(args, "max_posts", 1), s["clock"].get("limits", {}).get("offers_per_team_per_tick", 1))
-    chosen = select(cands, led, tick, max_posts)
+    chosen = select(cands, led, tick, max_posts, getattr(args, "selector", "legacy"))
     radio_decision(s, cands, chosen, execute, led, args)
     shared = export_shared(s, cands, chosen, pl, led, args, execute, ingested)
     for c in cands:
@@ -3213,7 +3328,22 @@ def main():
     g.add_argument("--fast-sales", default="", metavar="REF,REF",
                    help="campaña de ventas rápidas: SOLO estas cartas, SOLO copias excedentes revalidadas (nunca páginas completas); "
                         "ejemplo LAT-07,MAL-04,MAL-07,SAL-03,SAL-04; sin compras")
+    g.add_argument("--selector", choices=["legacy", "economic"], default="legacy",
+                   help="selector de acciones: legacy (por score, como siempre) o economic (seguridad → compromisos → valor "
+                        "económico); activarlo tras compararlo en sombra con shadow.py")
+    g.add_argument("--deny-soft", default="", metavar="tN,tM",
+                   help="exclusión ESTRATÉGICA evaluable (no un acuerdo): se deniega a ese equipo solo si no hay alternativa visible "
+                        "para él y nuestro excedente sacrificado es ≤ --deny-soft-cost; --deny-teams sigue siendo duro")
+    g.add_argument("--deny-soft-cost", type=float, default=5.0, help="excedente máximo (P) que aceptamos sacrificar por --deny-soft")
     g.add_argument("--fast-sales-ticks", type=int, default=6, help="presupuesto de ticks desde la primera propuesta")
+    g.add_argument("--liquidity-report", action="store_true",
+                   help="informe de liquidez: inventario (físicas/distintas/excedentes), caja libre y comprometida, escenarios al "
+                        "cierre, déficit hasta 150/200 P y ofertas excepcionales por cartas protegidas (solo información)")
+    g.add_argument("--policy-version", default=None, metavar="vN",
+                   help="aplica los parámetros ACOTADOS de una versión de data/policy_versions.json (lab.py); sin él, la "
+                        "configuración actual. Nunca toca límites, protección, contabilidad ni validación")
+    g.add_argument("--fast-sales-dry-windows", type=int, default=2,
+                   help="ventanas públicas seguidas sin comprador al mismo precio antes de revisarlo a la baja (1 con urgencia de caja)")
     g.add_argument("--fast-sales-counters", type=int, default=2, help="reprecios/contraofertas máximos por activo")
     g.add_argument("--ernesto", action="store_true",
                    help="Don Ernesto (banco): reconoce acceso y menú, vende duplicados epic/legendary con 1 propuesta + "

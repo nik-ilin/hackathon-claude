@@ -70,7 +70,8 @@ def scenarios(free_cash: int, open_sell_net: int, executable_sales: int) -> dict
             "with_executable_sales": free_cash + open_sell_net + executable_sales}
 
 
-def state(clock: dict, cfg: PhaseConfig, scen: dict, at: Optional[datetime] = None) -> dict:
+def state(clock: dict, cfg: PhaseConfig, scen: dict, at: Optional[datetime] = None,
+          fill_min: Optional[float] = None) -> dict:
     m = minutes_to_close(clock, at)
     out = {"enabled": cfg.enabled, "minutes_to_close": None if m is None else round(m, 1), "phase": "A", "w": 0.0,
            "b_start": cfg.transition_min, "c_start": cfg.treasury_min, "accelerated_min": 0, "reason": "",
@@ -94,6 +95,18 @@ def state(clock: dict, cfg: PhaseConfig, scen: dict, at: Optional[datetime] = No
         out["reason"] = (f"OBJETIVO DE {cfg.target_min} P NO ALCANZABLE con la liquidez observada (máximo "
                          f"{scen['with_executable_sales']} P): faltan {short} P; la transición se adelanta {extra} min y la "
                          f"tesorería {extra // 2} min para dar tiempo a vender sin liquidar con pérdida")
+    if short > 0 and fill_min:
+        # Ventas lentas: la fase B debe durar al menos lo que tarda en llenarse una venta (mediana observada); el adelanto
+        # es gradual y nunca supera `accelerate_max`. No sube límites ni toca el gasto histórico.
+        need = int(math.ceil(out["c_start"] + fill_min))
+        if out["b_start"] < need:
+            new_b = min(need, cfg.transition_min + cfg.accelerate_max)
+            if new_b > out["b_start"]:
+                out["accelerated_min"] += new_b - out["b_start"]
+                out["b_start"] = new_b
+                out["reason"] += (f"; ventas lentas (mediana {fill_min:.0f} min hasta llenarse): la transición dura al menos "
+                                  f"ese tiempo (empieza {new_b} min antes del cierre)")
+    out["fill_min"] = fill_min
     b, c = out["b_start"], out["c_start"]
     if m > b:
         out["phase"], out["w"] = "A", 0.0
@@ -181,6 +194,7 @@ def apply(cands: list, ph: dict, cfg: PhaseConfig, *, free_cash: int, states: di
                 elif backed:
                     c.setdefault("notes", []).append(f"compra para reventa respaldada: {why}")
         if is_sale(c) and not bl:
+            c["cash_urgent"] = w  # urgencia de caja EXPLÍCITA (la usa --selector economic); el bono de score es solo legado
             c["score"] = c.get("score", 0) + 1e5 * w  # prioridad de ORDENACIÓN (no son puntos ni dinero)
             c.setdefault("notes", []).append(f"fase {phase}: venta que libera liquidez (+{1e5 * w:.0f} de ordenación)")
         if c["type"] in ("list", "bid", "swap_list") and phase in ("B", "C"):

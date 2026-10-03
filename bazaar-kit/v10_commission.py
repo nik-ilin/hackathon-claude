@@ -281,6 +281,13 @@ def summary(state: dict) -> dict:
     approvals = list(state.get("approvals", {}).values())
     settled = {str(a.get("settlement_id")) for a in approvals
                if a.get("status") == "settled" and a.get("settlement_id") is not None}
+    paid = sum(int(a.get("commission_paid_p") or 0) for a in approvals if a.get("status") == "settled")
     return {"approved": sum(a.get("status") in ("approved", "posting", "posted", "settled") for a in approvals),
             "posted": sum(a.get("status") in ("posted", "settled") for a in approvals),
-            "settled_sales": len(settled), "commission_due_p": len(settled)}
+            "settled_sales": len(settled), "commission_due_p": len(settled),
+            # 1 P prometido NO es efectivo: pendiente = debido − cobrado confirmado; solo cuenta lo que el servidor liquida
+            "commission_paid_confirmed_p": paid, "commission_pending_p": max(0, len(settled) - paid),
+            "commission_counts_as_cash": False,
+            # operaciones realmente aportadas por Team 5 (ventas nuestras liquidadas por su venue/compradores aprobados)
+            "reciprocal_sales_contributed": len(settled),
+            "expired_unused": sum(a.get("status") == "approved" and not _live(a) for a in approvals)}

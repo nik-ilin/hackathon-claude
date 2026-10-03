@@ -18,6 +18,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
+import decision as dec
 import page_guard as pg
 import team_sale as ts
 import trading as tr
@@ -32,9 +33,13 @@ class Config:
     counters: int = 2           # reprecios / contraofertas por activo
     margin: float = 2.0         # margen económico mínimo (el del operador manda si es mayor)
     stale: int = 3              # ticks sin interés antes de revisar precio
+    min_step: int = 2           # no se reprecia ni se prolonga por menos de esto sin evidencia (= margen económico mínimo)
+    dry_windows: int = 2        # ventanas públicas seguidas sin comprador antes de revisar el precio a la baja
     cooldown: int = 6           # ticks sin volver a proponer tras liberar
     comparable_age: int = 300   # antigüedad máxima de un cierre comparable
     denied: frozenset = field(default_factory=frozenset)
+    soft_denied: frozenset = field(default_factory=frozenset)  # --deny-soft: exclusión estratégica EVALUABLE (no pactada)
+    soft_cost: float = 5.0
     allow_last: frozenset = field(default_factory=frozenset)   # --allow-last-copy: única forma de vender la última copia
 
 
@@ -51,24 +56,52 @@ def history(led: dict, asset) -> list:
 
 
 def stage(led: dict, asset, tick: int, cfg: Config) -> dict:
-    """Estado derivado del registro (sobrevive a reinicios): primera propuesta vigente, reprecios y enfriamiento."""
+    """Estado derivado del registro (sobrevive a reinicios). Las propuestas se agrupan en VENTANAS de `ticks`: una ventana
+    empieza con la primera propuesta que cae fuera de la anterior. Dentro de una ventana, las cancelaciones para repreciar o
+    aceptar no abren otra. Una LIBERACIÓN explícita (prefijo «LIBERA») abre `cooldown` ticks de enfriamiento; la caducidad
+    natural de una publicación pública no lo hace (seguiría fuera del mercado sin motivo), pero cuenta como ventana SECA."""
     h = history(led, asset)
-    # Solo una LIBERACIÓN real (prefijo «LIBERA») reinicia el presupuesto y abre el enfriamiento; los cancelaciones para
-    # repreciar o aceptar una puja no cuentan como contraofertas nuevas ni dan una segunda ventana.
     last_cancel = max([a["tick"] for a in h if a["type"] == "cancel" and str(a.get("reason") or "").startswith("LIBERA")
                        and a.get("status") in ("submitted", "settled", "released")], default=None)
-    lists = [a for a in h if a["type"] == "list" and a.get("status") in ("submitted", "settled", "released", "intent")
-             and (last_cancel is None or a["tick"] > last_cancel)]
-    first = min((a["tick"] for a in lists), default=None)
-    asks = [a.get("price") for a in sorted(lists, key=lambda a: a["tick"])]
-    last_ask = max((a["tick"] for a in lists), default=None)
+    lists = sorted((a for a in h if a["type"] == "list" and a.get("status") in ("submitted", "settled", "released", "intent")),
+                   key=lambda a: a["tick"])
+    windows = []
+    for a in lists:
+        if not windows or a["tick"] >= windows[-1]["start"] + cfg.ticks or \
+                (last_cancel is not None and windows[-1]["start"] <= last_cancel < a["tick"]):
+            windows.append({"start": a["tick"], "asks": [], "filled": False})
+        windows[-1]["asks"].append(a.get("price"))
+        windows[-1]["filled"] |= a.get("status") == "settled"
     cooling = (last_cancel + cfg.cooldown) if last_cancel is not None else None
-    if first is not None and tick - first >= cfg.ticks + cfg.cooldown:
-        first, asks, last_ask = None, [], None          # ventana agotada y enfriada: nueva ventana con el precio revisado
-    elif first is not None and tick - first >= cfg.ticks:  # la oferta caducó sin cancelación: equivale a liberar
-        cooling = max(cooling or 0, first + cfg.ticks + cfg.cooldown)
-    return {"first_tick": first, "asks": asks, "last_ask_tick": last_ask, "cooling_until": cooling,
-            "age": (tick - first) if first is not None else 0}
+    cur = windows[-1] if windows else None
+    ended = cur is not None and (tick - cur["start"] >= cfg.ticks or (last_cancel is not None and last_cancel >= cur["start"]))
+    closed = windows if ended else windows[:-1]         # una ventana terminada: la próxima propuesta abre otra
+    dry, last_price = 0, None
+    for w in reversed(closed):                          # ventanas SECAS seguidas al MISMO precio final (tras una rebaja,
+        price = w["asks"][-1] if w["asks"] else None    # la racha empieza de cero: una concesión por cada racha, no por ventana)
+        if w["filled"] or (last_price is not None and price != last_price):
+            break
+        dry += 1
+        last_price = price
+    first = cur["start"] if cur else None
+    return {"first_tick": first, "asks": list(cur["asks"]) if cur else [], "ended": ended,
+            "last_ask_tick": max((a["tick"] for a in lists if cur and a["tick"] >= cur["start"]), default=None),
+            "cooling_until": cooling, "age": (tick - first) if first is not None else 0,
+            "dry_windows": dry, "last_window_price": last_price, "windows": len(windows)}
+
+
+def revised_price(objective: int, minimum: int, st: dict, cfg: Config, urgent: bool) -> tuple:
+    """Precio de la próxima ventana. Una ventana sin respuesta NO es un rechazo; varias seguidas a un precio público sí son
+    evidencia de que ese precio no encuentra comprador ahora. Tras `dry_windows` ventanas secas (1 con urgencia de caja) se
+    baja un paso = máx(min_step, 25 % de la distancia al mínimo), sin bajar del mínimo y sin subir sobre la última."""
+    last = st.get("last_window_price")
+    need = 1 if urgent else cfg.dry_windows
+    if last is None or st.get("dry_windows", 0) < need:
+        return objective, None
+    step = max(cfg.min_step, math.ceil(0.25 * max(0, last - minimum)))
+    p = max(minimum, min(objective, last - step))
+    return p, (f"{st['dry_windows']} ventana(s) sin comprador a {last} P: se revisa a {p} P "
+               f"(paso {step} P; mínimo {minimum} P)" if p < last else None)
 
 
 # ------------------------------------------------------------------ inventario revalidado y evidencia
@@ -129,25 +162,7 @@ def comparable_closes(events: list, ref: str, tick: int, max_age: int) -> list:
     return out
 
 
-def evidence(s: dict, ref: str, cfg: Config, venues: dict, intel=None) -> dict:
-    """Ofertas ejecutables de compra (estructura validada), cierres comparables, competidores vivos y compradores con
-    evidencia RECIENTE. Una puja dirigida a otro equipo no es ejecutable para nosotros."""
-    tick, team = s["clock"]["tick"], s["me"]["id"]
-    bids, rejected = [], []
-    for x in ts.directed_interest(s, ref):
-        if x["kind"] != "cash":
-            continue
-        problems = ts.validate_sale_offer(x["offer"], team=team, ref=ref, buyer=x["team"], tick=tick, venues=venues)
-        if x["team"] in cfg.denied:
-            problems.append(f"{x['team']} está en --deny-teams")
-        if x["expires"] is not None and x["expires"] - tick < 1:
-            problems.append("caduca en este tick")
-        v = venues.get(x["venue"])
-        fee = v.fee(x["price"], 1) if v else 0
-        row = {"offer": x["id"], "team": x["team"], "venue": x["venue"], "price": x["price"], "fee": fee,
-               "net": x["price"] - fee, "expires": x["expires"], "directed": x["directed"]}
-        (rejected if problems else bids).append(dict(row, problems=problems) if problems else row)
-    bids.sort(key=lambda b: (-b["net"], b["offer"]))
+def _visible_asks(s: dict, ref: str, team: str) -> list:
     pool = list(s["offers"].get("offers", [])) + [o for b in (s.get("boards") or {}).values() for o in (b or {}).get("offers", [])]
     asks, seen = [], set()
     for o in pool:
@@ -158,6 +173,49 @@ def evidence(s: dict, ref: str, cfg: Config, venues: dict, intel=None) -> dict:
         if w.get("cash") and not w.get("assets") and not g.get("cash") and any(
                 isinstance(a, dict) and a.get("ref") == ref for a in g.get("assets") or []):
             asks.append({"offer": o["id"], "team": o["maker"], "price": int(w["cash"]), "venue": o.get("venue")})
+    return asks
+
+
+def soft_deny_eval(team: str, net: float, loss: Optional[float], other_asks: list, cfg: Config) -> dict:
+    """Exclusión estratégica configurable. No se supone que negarnos impida al rival comprar a otro ni se estima su beneficio
+    (sus valores son privados). Se pondera lo observable: nuestro excedente sacrificado y las alternativas VISIBLES del rival.
+    Se deniega solo si no tiene alternativa visible y sacrificamos ≤ `soft_cost` P; en otro caso, vender."""
+    ours = round(net - (loss or 0.0), 2)
+    alt = len(other_asks)
+    deny = alt == 0 and ours <= cfg.soft_cost
+    return {"team": team, "our_surplus": ours, "rival_visible_alternatives": alt, "deny": deny,
+            "note": (f"sin alternativa visible para {team} y sacrificamos {ours} P ≤ {cfg.soft_cost:g} P" if deny else
+                     f"{alt} alternativa(s) visible(s) para {team} (negarnos no impide que compre a otro) o el sacrificio "
+                     f"({ours} P) supera {cfg.soft_cost:g} P: se evalúa como una venta normal"),
+            "limits": "no se conoce su beneficio ni si compraría a otro vendedor"}
+
+
+def evidence(s: dict, ref: str, cfg: Config, venues: dict, intel=None, loss: Optional[float] = None) -> dict:
+    """Ofertas ejecutables de compra (estructura validada), cierres comparables, competidores vivos y compradores con
+    evidencia RECIENTE. Una puja dirigida a otro equipo no es ejecutable para nosotros."""
+    tick, team = s["clock"]["tick"], s["me"]["id"]
+    bids, rejected = [], []
+    visible_asks = _visible_asks(s, ref, team)
+    for x in ts.directed_interest(s, ref):
+        if x["kind"] != "cash":
+            continue
+        problems = ts.validate_sale_offer(x["offer"], team=team, ref=ref, buyer=x["team"], tick=tick, venues=venues)
+        if x["team"] in cfg.denied:
+            problems.append(f"{x['team']} está en --deny-teams")
+        if x["expires"] is not None and x["expires"] - tick < 1:
+            problems.append("caduca en este tick")
+        v = venues.get(x["venue"])
+        fee = v.fee(x["price"], 1) if v else 0
+        soft = None
+        if x["team"] in cfg.soft_denied:
+            soft = soft_deny_eval(x["team"], x["price"] - fee, loss, [a for a in visible_asks if a["team"] != x["team"]], cfg)
+            if soft["deny"]:
+                problems.append("--deny-soft: " + soft["note"])
+        row = {"soft_deny": soft, "offer": x["id"], "team": x["team"], "venue": x["venue"], "price": x["price"], "fee": fee,
+               "net": x["price"] - fee, "expires": x["expires"], "directed": x["directed"]}
+        (rejected if problems else bids).append(dict(row, problems=problems) if problems else row)
+    bids.sort(key=lambda b: (-b["net"], b["offer"]))
+    asks = visible_asks
     closes = comparable_closes(s["feed"].get("events", []), ref, tick, cfg.comparable_age)
     buyers = []
     if intel is not None:
@@ -172,7 +230,8 @@ def evidence(s: dict, ref: str, cfg: Config, venues: dict, intel=None) -> dict:
             "recent_buyers": buyers}
 
 
-def three_prices(rep: dict, ev: dict, cfg: Config, book: Optional[float] = None, market: Optional[dict] = None) -> dict:
+def three_prices(rep: dict, ev: dict, cfg: Config, book: Optional[float] = None, market: Optional[dict] = None,
+                 learned: Optional[dict] = None, target_adj: float = 0.0) -> dict:
     loss = rep["loss"] or 0.0
     floor = min_net(loss, cfg.margin)
     closes = sorted(c["price"] for c in ev["closes"])
@@ -180,6 +239,10 @@ def three_prices(rep: dict, ev: dict, cfg: Config, book: Optional[float] = None,
     if len(closes) >= 2:
         base = closes[len(closes) // 2]
         basis.append(f"mediana de {len(closes)} cierres comparables recientes = {base} P")
+    if base is None and learned and learned.get("value") is not None and learned.get("confidence") in ("media", "alta"):
+        base = learned["value"]  # memoria pública con decaimiento (learning.price_estimate); solo con muestra suficiente
+        basis.append(f"memoria pública: mediana ponderada {learned['value']:g} P (n_eff {learned['n_eff']}, "
+                     f"rango {learned['range']}, confianza {learned['confidence']})")
     if base is None and market and market.get("value") and str(market.get("confidence")).upper() in ("MEDIUM", "HIGH"):
         base = market["value"]   # estimación del módulo de mercado sobre precios ejecutados (confianza media/alta)
         basis.append(f"estimación de mercado {market['value']:g} P sobre precios ejecutados (confianza {market['confidence']})")
@@ -195,6 +258,9 @@ def three_prices(rep: dict, ev: dict, cfg: Config, book: Optional[float] = None,
     if base is None and book:
         base = book
         basis.append(f"sin evidencia de mercado: referencia de catálogo {book:g} P (no es un valor de mercado)")
+    if base is not None and target_adj:
+        basis.append(f"ajuste de política {target_adj:+.0%} (acotado; versión de política)")
+        base = base * (1 + target_adj)
     objective = max(floor, int(math.ceil(base))) if base is not None else floor
     quick = ev["bids"][0]["net"] if ev["bids"] else None
     return {"minimum": floor, "quick_close": quick, "objective": objective, "basis": basis or ["sin evidencia: se propone el mínimo"],
@@ -206,12 +272,12 @@ def expiry_for(ticks: int, ratio: float) -> int:
 
 
 def decide(rep: dict, asset: int, ev: dict, pr: dict, st: dict, own_offer: Optional[dict], cfg: Config, tick: int,
-           urgent: bool, venue: str, ratio: float = 1.0) -> dict:
+           urgent: bool, venue: str, ratio: float = 1.0, w: Optional[float] = None) -> dict:
     """Una decisión por activo: accept / list / cancel / wait, con motivo. Máximo una oferta de salida por asset_id."""
     ref, mn, obj = rep["ref"], pr["minimum"], pr["objective"]
     valid = [b for b in ev["bids"] if b["net"] >= mn]
     best = valid[0] if valid else None
-    deadline = st["first_tick"] is not None and st["age"] >= cfg.ticks
+    deadline = st["first_tick"] is not None and (st["age"] >= cfg.ticks or st.get("ended", False))
     if own_offer is not None:                                   # ya hay una oferta de salida nuestra para este activo
         if best is not None and (best["net"] >= obj or urgent or deadline):
             return {"action": "cancel", "offer": own_offer["id"],
@@ -221,28 +287,29 @@ def decide(rep: dict, asset: int, ev: dict, pr: dict, st: dict, own_offer: Optio
             return {"action": "cancel", "offer": own_offer["id"], "reason": f"LIBERA: presupuesto de {cfg.ticks} ticks agotado sin oferta válida"}
         last = st["asks"][-1] if st["asks"] else None
         reprices = max(0, len(st["asks"]) - 1)
-        if last is not None and tick - (st["last_ask_tick"] or tick) >= cfg.stale and reprices < cfg.counters and obj < last:
+        if last is not None and tick - (st["last_ask_tick"] or tick) >= cfg.stale and reprices < cfg.counters and obj <= last - cfg.min_step:
             return {"action": "cancel", "offer": own_offer["id"], "reprice": obj,
                     "reason": f"REPRECIO: {tick - st['last_ask_tick']} ticks sin interés y la evidencia justifica {obj} P < {last} P"}
         return {"action": "wait", "reason": f"oferta {own_offer['id']} en pie ({st['age']}/{cfg.ticks} ticks); sin mensajes repetidos"}
-    if best is not None:
-        if best["net"] >= obj:
-            return {"action": "accept", "bid": best, "reason": f"puja de {best['price']} P ({best['net']} netos) ≥ objetivo {obj} P: cerrar sin esperar"}
-        if urgent or deadline:
-            return {"action": "accept", "bid": best, "reason": f"{best['net']} netos entre mínimo {mn} P y objetivo {obj} P y "
-                                                                f"{'cierre cercano' if urgent else 'presupuesto agotado'}: se cierra"}
-        better = len(ev["closes"]) >= 2 and pr["objective"] > best["net"] + 1
-        if not better:
-            return {"action": "accept", "bid": best, "reason": f"{best['net']} netos ≥ mínimo {mn} P y sin evidencia de mejora probable "
-                                                                f"(no se prolonga por {obj - best['net']} P)"}
+    w = (1.0 if urgent else 0.0) if w is None else w
+    left = (cfg.ticks - st["age"]) if st["first_tick"] is not None else cfg.ticks
+    alts = dec.alternatives(ev, best["offer"] if best else None, tick)
+    cmp_ = dec.compare(loss=rep["loss"] or 0.0, minimum=mn, objective=obj,
+                       best=({"net": best["net"], "expires_in": (best["expires"] - tick) if best["expires"] is not None else None}
+                             if best else None), alts=alts, ticks_left=left, w=w, deadline=deadline, own_offer=False,
+                       min_step=cfg.min_step)
+    if best is not None and cmp_["action"] == "accept":
+        return {"action": "accept", "bid": best, "reason": cmp_["reason"], "compare": cmp_}
     if st["cooling_until"] is not None and tick < st["cooling_until"]:
         return {"action": "wait", "reason": f"liberada hace poco: enfriamiento hasta el tick {st['cooling_until']}"}
-    if deadline and st["asks"]:
+    if deadline and st["asks"] and not st.get("ended", True):
         return {"action": "wait", "reason": "presupuesto agotado"}
-    price = max(obj, mn)
+    price, revision = revised_price(max(obj, mn), mn, st, cfg, urgent or (w or 0) > 0)
     buyer = ev["recent_buyers"][0]["team"] if ev["recent_buyers"] else None
     return {"action": "list", "price": price, "to": buyer, "venue": venue, "expires_in": expiry_for(cfg.ticks, ratio),
-            "reason": f"propuesta al objetivo {price} P" + (f" dirigida a {buyer} (puja reciente)" if buyer else " (pública)")
+            "compare": cmp_, "alternatives": alts,
+            "reason": (cmp_["reason"] + " · " if cmp_["action"] == "wait_list" else "") + (revision + " · " if revision else "")
+                      + f"propuesta al objetivo {price} P" + (f" dirigida a {buyer} (puja reciente)" if buyer else " (pública)")
                       + f" · mínimo {mn} P"}
 
 

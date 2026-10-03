@@ -177,7 +177,7 @@ class Routes(unittest.TestCase):
 class Budget(unittest.TestCase):
     def listed(self, tick_first, price=30):
         a = {"key": "k1", "type": "list", "module": fs.MODULE, "asset": 2, "tick": tick_first, "status": "submitted",
-             "price": price, "offer": 88}
+             "price": price, "offer": None, "offer_id": 88}            # como lo guarda send(): id en offer_id
         return dict(led0(), actions=[a])
 
     def test_restart_does_not_duplicate_the_proposal(self):
@@ -202,13 +202,33 @@ class Budget(unittest.TestCase):
         mine, _, _ = run(world(tick=514), led)
         self.assertEqual([c["type"] for c in mine], ["list"])
 
-    def test_offer_that_expires_by_itself_counts_as_released_and_a_new_window_opens_after_cooldown(self):
-        mine, pl, _ = run(world(tick=507), self.listed(500))                                   # la oferta ya no está abierta
-        self.assertEqual(mine, [])
-        self.assertIn("enfriamiento", pl["fast_sales_report"]["refs"][0]["assets"][0]["reason"])
-        mine, pl, _ = run(world(tick=513), self.listed(500))                                   # 500 + 6 + 6 = 512
+    def test_natural_expiry_opens_a_new_window_without_cooldown_and_dry_windows_revise_the_price(self):
+        mine, pl, _ = run(world(tick=507), self.listed(500, price=30))                          # caducó sola: sin enfriamiento
         self.assertEqual([c["type"] for c in mine], ["list"])
-        self.assertEqual(pl["fast_sales_report"]["refs"][0]["assets"][0]["stage"]["asks"], [])
+        self.assertNotIn("ventana(s) sin comprador", mine[0]["reason"])                        # 1 ventana seca: sin rebaja por silencio
+        led = self.listed(500, price=30)
+        led["actions"].append({"key": "k2", "type": "list", "module": fs.MODULE, "asset": 2, "tick": 507, "status": "released",
+                               "price": 30, "offer": 89})
+        mine, pl, _ = run(world(tick=514), led)                                                  # 2 ventanas secas a 30 P
+        lst = [c for c in mine if c["type"] == "list"]
+        self.assertTrue(lst and 6 <= lst[0]["price"] < 30)
+        self.assertIn("ventana(s) sin comprador", lst[0]["reason"])
+        self.assertEqual(pl["fast_sales_report"]["refs"][0]["assets"][0]["stage"]["dry_windows"], 2)
+
+    def test_dry_windows_never_go_below_the_minimum_and_a_fill_resets_the_count(self):
+        cfg = fs.Config(refs=("LAT-01",))
+        st = {"last_window_price": 7, "dry_windows": 5}
+        self.assertEqual(fs.revised_price(7, 7, st, cfg, False)[0], 7)                           # ya en el mínimo
+        self.assertEqual(fs.revised_price(20, 7, {"last_window_price": 20, "dry_windows": 1}, cfg, False)[0], 20)
+        self.assertLess(fs.revised_price(20, 7, {"last_window_price": 20, "dry_windows": 1}, cfg, True)[0], 20)  # urgencia
+        led = {"actions": [{"type": "list", "module": fs.MODULE, "asset": 2, "tick": t, "status": s, "price": 20}
+                           for t, s in ((500, "released"), (506, "settled"), (512, "released"))]}
+        self.assertEqual(fs.stage(led, 2, 520, cfg)["dry_windows"], 1)                           # la venta corta la racha
+        led = {"actions": [{"type": "list", "module": fs.MODULE, "asset": 2, "tick": t, "status": "released", "price": p}
+                           for t, p in ((500, 20), (506, 20), (512, 17))]}
+        st = fs.stage(led, 2, 520, cfg)
+        self.assertEqual((st["dry_windows"], st["last_window_price"]), (1, 17))                 # tras rebajar, racha nueva
+        self.assertIsNone(fs.revised_price(17, 7, st, cfg, False)[1])                            # aún no toca otra rebaja
 
     def test_valid_bid_at_deadline_closes_instead_of_releasing(self):
         own = offer(88, {"assets": [{"id": 2, "kind": "card", "ref": "LAT-01"}]}, {"cash": 30}, maker=TEAM, venue="rastro")
