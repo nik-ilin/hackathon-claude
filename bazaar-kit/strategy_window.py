@@ -63,7 +63,11 @@ _NEWS_DB = os.environ.get("NEWS_DB", "")
 # los flags propios de la ejecución desatendida (--execute, --max-spend, --allow-concurrent, etc.) que
 # no tiene sentido meter en el preset compartido.
 BASE = ["./run.sh", "t15", "--execute", "--max-spend", "400", "--allow-concurrent",
-        "--page-campaign", "none", "--news-margin", "2", "--fever-wait", "1",
+        # 4 oct 13:15: --page-campaign estaba en "none" (desactivado) con 4 páginas completas (RET/LAV/LAT/SAL)
+        # y CHA en 0/11 (hueco total) + MAL a 1 carta de completarse (MAL-11). "auto" deja que pc.choose_page
+        # decida con el presupuesto REAL restante cuál de las dos es más viable, en vez de forzar una a ciegas;
+        # page_campaign_step nunca autoriza ΔU < margen, así que no cambia el riesgo de las operaciones.
+        "--page-campaign", "auto", "--news-margin", "2", "--fever-wait", "1",
         "--v10-commission", "--max-posts", "3"]
 if _NEWS_DB and Path(_NEWS_DB).is_file():
     BASE += ["--news-db", _NEWS_DB]
