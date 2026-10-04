@@ -16,7 +16,7 @@ ya están en el mismo venue de 0 % (allí se cruzan solas), ni el mismo par más
     python3 celestina.py --pairs-json -       # además exporta las parejas en JSON (stdout o fichero)
     python3 celestina.py --loop               # un ciclo por tick, sigue en dry run
     python3 celestina.py --calibrate          # réplica offline sobre intel/market.db (sin red)
-    python3 celestina.py --execute --loop     # publica con announce() (BROKER_KEY o STARTER_BROKER_KEY)
+    python3 celestina.py --execute --loop     # publica con announce() (clave del venue obtenida de /api/me)
 
 Lecturas públicas sin clave (no gastan los 5 req/s de la clave del equipo); `my_offers` usa BAZAAR_KEY si existe,
 solo para excluir nuestras ofertas. Con --execute: como mucho un anuncio cada --every ticks (10 por defecto) y un
@@ -461,6 +461,26 @@ def export(pairs: list, path: str, tick: Optional[int]) -> None:
             f.write(data)
 
 
+def broker_key_for_venue(team_api, venue: str, key_file: str) -> Optional[str]:
+    """Resolve the matching venue key without printing or persisting it."""
+    key = os.environ.get("BROKER_KEY") or os.environ.get("STARTER_BROKER_KEY")
+    if key:
+        return key
+    if team_api is None:
+        return None
+    try:
+        me = team_api.me()
+    except Exception:
+        return None
+    own = me.get("venue") or {}
+    if own.get("venue") != venue or own.get("status") != "open":
+        return None
+    if (own.get("rules") or {}).get("mechanism") == "auto":
+        return me.get("starter_broker_key")
+    from venue_switch import load_broker_key
+    return me.get("broker_key") or load_broker_key(key_file)
+
+
 def run_live(args) -> int:
     call = Throttle(args.min_interval)
     pub = public_client(args.url)
@@ -470,9 +490,9 @@ def run_live(args) -> int:
         team_api = Bazaar(args.url, os.environ["BAZAAR_KEY"], wait_on_tick=False)
     broker = None
     if args.execute:
-        bk = os.environ.get("BROKER_KEY") or os.environ.get("STARTER_BROKER_KEY")
+        bk = broker_key_for_venue(team_api, args.venue, args.broker_key_file)
         if not bk:
-            print("--execute necesita BROKER_KEY o STARTER_BROKER_KEY en el entorno", file=sys.stderr)
+            print("--execute necesita la broker key de un venue propio abierto (entorno, /api/me o fichero 0600)", file=sys.stderr)
             return 2
         from bazaar_sdk import Broker
         broker = Broker(args.url, bk)
@@ -615,6 +635,8 @@ def parse(argv=None):
     p.add_argument("--scan", type=lambda s: [x for x in s.split(",") if x], default=None,
                    help="venues a leer (por defecto El Rastro y todos los abiertos salvo el nuestro)")
     p.add_argument("--execute", action="store_true", help="publicar con announce() (por defecto solo imprime)")
+    p.add_argument("--broker-key-file", default=os.path.join(HERE, "data", "venue_broker.key"),
+                   help="fichero 0600 creado al abrir board; se consulta si /api/me no devuelve la clave")
     p.add_argument("--loop", action="store_true", help="repetir cada tick")
     p.add_argument("--poll", type=float, default=5.0, help="segundos entre lecturas del reloj en --loop")
     p.add_argument("--every", type=int, default=10, help="mínimo de ticks entre anuncios")

@@ -91,6 +91,28 @@ class Series(unittest.TestCase):
         move = history.deltas(ROWS, "score", window=1)[0]
         self.assertNotIn("delta_market", move)                   # 7.5 clavado
 
+    def test_pausa_de_ronda_no_se_confunde_con_perdida_de_un_trato(self):
+        before = {"tick": 1, "round": 2, "score": 23.91, "negotiating": 16.41,
+                  "market": 7.5, "deals": 61, "duel_points": 28.18,
+                  "ladder_points": .27, "neg_points": 5, "mm_points": 0}
+        after = {**before, "tick": 2, "round": 3, "score": 21.11,
+                 "negotiating": 14.49, "market": 6.62}
+        event = history.impact_events([before, after])[0]
+        self.assertEqual(event["label"], "Ponderación de ronda")
+        self.assertEqual(event["delta"]["deals"], 0)
+
+    def test_nuevo_trato_no_se_oculta_tras_cambio_de_ronda(self):
+        before = {"tick": 1, "round": 2, "score": 20, "negotiating": 13,
+                  "market": 7, "deals": 61, "mm_points": 0}
+        after = {**before, "tick": 2, "round": 3, "score": 21,
+                 "negotiating": 13.5, "market": 7.5, "deals": 62}
+        self.assertEqual(history.impact_events([before, after])[0]["label"], "Negociación")
+
+    def test_ignora_cambio_de_caja_sin_cambio_en_score(self):
+        self.assertEqual(history.impact_events([
+            {"tick": 1, "score": 20, "cash": 100},
+            {"tick": 2, "score": 20, "cash": 90}]), [])
+
 
 class Race(unittest.TestCase):
     def test_los_vecinos_salen_del_estado_final_no_del_inicial(self):

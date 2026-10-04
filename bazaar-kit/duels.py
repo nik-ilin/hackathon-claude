@@ -459,7 +459,7 @@ def duel_candidates(duels: list, tick: int, history: Optional[list] = None) -> l
                 out.append(muted)
             continue
         if prof and prof != "desconocido" and f["surplus_now"] is not None and f["surplus_now"] > 0:
-            pm = price_margin(d, f["rival_price"])      # reglas por perfil: se comparan sobre el PRECIO; el total ya es > 0
+            pm = f["surplus_now"]  # en duelos de dos cuestiones decide el excedente TOTAL, incluidos los días
             profile_accept, _ = _profile_rule(
                 prof, d, pm, f["own_limit"], traj, f["recent_improvement_rate"] or 0,
                 f["trend"] == "STALLED", left, safe)

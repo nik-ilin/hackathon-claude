@@ -4,6 +4,28 @@ Este documento es un procedimiento, no una orden de ejecutar. `./run.sh day3`, `
 `./run.sh celestina --leads` y `./run.sh duels --day3` son **solo lectura** sin `--execute`. Los procesos con
 `--execute` escriben en la API. Cargar la `.env` legítima del equipo solo en el checkout operativo; no imprimir claves.
 
+## Actualización del domingo: Chamberí y puntuación
+
+Chamberí (`CHA`) ya está publicado: 12 referencias, 10 para completar su página. No perseguir la página desde cero
+con compras a precio de lista: el valor de la última carta sólo se materializa si ya están las otras nueve y el
+trato queda por debajo de la valoración privada. El equipo empezó esta ventana sin CHA; el dashboard debe confirmar
+el inventario actual antes de cada operación. La salida de Chamberí sí crea una oportunidad de **mercado**: localizar
+un equipo que necesite una referencia concreta y otro con copia libre; pedirles que publiquen ofertas en v15 y medir
+la liquidación y el valor que ambos crean. En la lectura del tick 1554 había 49 ofertas abiertas y cero parejas que
+cruzasen; t04 buscaba CHA-06/07/08 por 20 P, una demanda unilateral y con caducidad, no puntos ya capturados.
+
+La caja era 635 P después de la asignación dominical, pero la valoración esperada de los sobres a precio de lista
+seguía por debajo de su coste: barrio 17,98 frente a 26, plata 100,29 frente a 150, oro 328,49 frente a 420 P
+(estimación estratégica, sujeta al inventario). Comprar sólo si un descuento negociado o una necesidad de página
+verificada invierte ese balance. El efectivo final no puntúa, pero tampoco convierte una compra negativa en buena.
+
+El score descendió de 23,91 a 21,11 mientras los tratos seguían en 61 y los acumulados privados nuevos en cero:
+negociación y mercado cayeron proporcionalmente al entrar la ronda dominical. Es dilución por ponderación, no pérdida
+observada de una operación nueva. La sección «Qué movió el score» del dashboard distingue estos intervalos de nuevos
+duelos, dealers, tratos entre terceros y ajustes de mercado; `/api/strategy` exporta los últimos 20 impactos y el
+histórico detallado de duelos para los agentes. El histórico enseña precio, días, rival y resultado publicado; `result`
+es excedente del duelo, no puntos directos de leaderboard, y la práctica no cuenta.
+
 ## Por qué estas prioridades
 
 La presentación *Payday* de Luis Morales aclara los 100 puntos: 30 negociación, 22,5 Market Test, 7,5 valor de

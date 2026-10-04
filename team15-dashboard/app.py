@@ -27,6 +27,7 @@ sys.path.append(str(KIT))  # los módulos locales (radio.py, scoring.py) deben g
 import dashboard as public_dashboard
 
 import charts
+import duel_history
 import history
 import operations
 import scoring
@@ -265,6 +266,7 @@ class Model:
                 warnings.append('Historial de duelos: lectura privada no disponible; se conserva la última muestra.')
         rank['strategy_health'] = strategy_health.build(
             self.done_cache, (self.public.root, KIT), tick_now)
+        rank['duel_history'] = self.done_cache
         rank["ladder"] = scoring.ladder_block(self._dealers(), settled_by_dealer(self.public.stores, self.team),
                                               me.get("unlocked") or [])
         if tick_now:
@@ -274,11 +276,12 @@ class Model:
                                               rank.get("score") or {}, public.leaderboard,
                                               cash=rank.get("cash"),
                                               collection_value=rank.get("collection_value"),
-                                              team=self.team))
+                                              team=self.team, round_number=public.clock.get("round")))
             except OSError as exc:
                 warnings.append(f"Historia: {type(exc).__name__}")
         rank["history"] = history.load(self.history_path)
         rank["history_summary"] = history.summary(rank["history"], self.team)
+        rank["impact_events"] = history.impact_events(rank["history"])
         rank["rank_race"] = history.rank_race(rank["history"], self.team)
         if rank["feed_health"].get("status") != "fresh":
             rank["warnings"].append(
@@ -607,6 +610,8 @@ def strategy_export(data: dict) -> dict:
         'feed_health': data.get('feed_health') or {},
         'operations': data.get('operations') or {},
         'strategy_health': data.get('strategy_health') or {},
+        'score_impacts': (data.get('impact_events') or [])[-20:],
+        'duel_history': duel_history.rows(data.get('duel_history') or []),
         'opportunities': opportunities,
         'kpis': {
             'published_cards': len(released), 'catalog_cards': len(rows),
@@ -986,29 +991,33 @@ def render_trend(data: dict) -> str:
              'en <code>bazaar-kit/data/score_history.jsonl</code>.</p>',
              '</div></div><div class="charts">', *cards, '</div>']
 
-    moves = [m for m in history.deltas(rows, 'score', window=0) if m['delta']]
-    if moves:
-        parts += ['<table class="attrib"><caption>Qué movió los puntos</caption><thead><tr>',
-                  '<th>ticks</th><th>score</th><th>tratos</th><th>por trato</th><th>caja</th><th>colección</th>',
-                  '</tr></thead><tbody>']
-        for m in list(reversed(moves))[:8]:
-            cls = 'up' if m['delta'] > 0 else 'down'
-            ppd = m.get('points_per_deal')
+    impacts = list(reversed(data.get('impact_events') or []))[:8]
+    if impacts:
+        parts += ['<div class="impact-head"><div><h3>Qué movió el score</h3>',
+                  '<p>Lecturas entre ticks; la etiqueta describe la evidencia disponible, no atribuye una causa única.</p></div>',
+                  '<span>Últimos 8 cambios</span></div><div class="impact-grid">']
+        for event in impacts:
+            delta = event['delta']
+            amount = delta['score'] or 0
+            cls = 'positive' if amount > 0 else 'negative'
+            if event['label'] in ('Ponderación de ronda', 'Cambio de ronda'):
+                cls = 'round-shift'
+            drivers = []
+            for key, label in (('negotiating', 'Negociación'), ('market', 'Mercado'),
+                               ('duel_points', 'Duelos raw'), ('ladder_points', 'Dealers raw'),
+                               ('neg_points', 'Tratos raw'), ('mm_points', 'Terceros raw'),
+                               ('deals', 'Tratos')):
+                value = delta.get(key)
+                if isinstance(value, (int, float)) and value:
+                    drivers.append(f'<span>{label} <b>{value:+.2f}</b></span>')
             parts.append(
-                f'<tr><td>{esc(m["from_tick"])} → {esc(m["to_tick"])}</td>'
-                f'<td class="{cls}">{m["delta"]:+.2f}</td>'
-                f'<td>{esc(m.get("delta_deals") or "—")}</td>'
-                f'<td class="{cls if ppd else ""}">{(f"{ppd:+.2f}" if ppd else "—")}</td>'
-                f'<td>{esc(m.get("delta_cash") or "—")}</td>'
-                f'<td>{esc(m.get("delta_collection_value") or "—")}</td></tr>')
-        parts.append('</tbody></table>')
-        best = summary.get('best_deal')
-        if best and best.get('points_per_deal'):
-            parts.append('<p class="chart-note">Mejor intervalo: '
-                         f'{esc(best["from_tick"])} → {esc(best["to_tick"])}, '
-                         f'{best["delta"]:+.2f} puntos en {esc(best.get("delta_deals"))} trato(s) = '
-                         f'{best["points_per_deal"]:+.2f} por trato. '
-                         'La atribución junta todo lo que pasó en el intervalo: no aísla una causa.</p>')
+                f'<article class="impact-card {cls}"><div class="impact-top">'
+                f'<span class="impact-type">{esc(event["label"])}</span>'
+                f'<strong>{amount:+.2f}</strong></div>'
+                f'<div class="impact-ticks">tick {esc(event["from_tick"])} → {esc(event["to_tick"])}</div>'
+                f'<div class="impact-drivers">{"".join(drivers) or "Sin desglose disponible"}</div>'
+                f'<p>{esc(event["basis"])}</p></article>')
+        parts.append('</div>')
     parts.append('</section>')
     return ''.join(parts)
 
@@ -1057,6 +1066,14 @@ header{border-radius:18px;background:var(--card);box-shadow:var(--card-shadow);p
 @media(max-width:1040px){.pulse-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.system-pulse{grid-column:1/-1}}
 @media(max-width:700px){.pulse-head{display:block}.pulse-head>span{display:block;text-align:left;margin-top:5px}.pulse-grid{grid-template-columns:1fr}.system-pulse{grid-column:auto}}
 @media(max-width:620px){header{padding:18px;border-radius:15px}.command-deck{border-radius:17px}.pulse-card{padding:18px;border-radius:16px}.pulse-head{padding:0 3px}.ops,.monitor{border-radius:16px}.session-row>div:first-child{display:block}.session-row span{display:block;text-align:left;margin-top:2px}}
+.impact-head{display:flex;justify-content:space-between;align-items:end;gap:14px;margin:22px 0 12px}.impact-head h3{margin:0 0 4px}.impact-head p{margin:0;color:var(--muted);font-size:12px}.impact-head>span{font-size:11px;color:var(--muted);white-space:nowrap}.impact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.impact-card{background:#f7faf9;border:1px solid var(--line);border-left:4px solid var(--teal);padding:13px 15px;border-radius:12px}.impact-card.negative{border-left-color:var(--red)}.impact-card.round-shift{border-left-color:#8196a2;background:#f5f7f8}.impact-top{display:flex;justify-content:space-between;gap:9px;align-items:baseline}.impact-top strong{font-size:23px;font-variant-numeric:tabular-nums}.impact-card.positive .impact-top strong{color:var(--teal)}.impact-card.negative .impact-top strong{color:var(--red)}.impact-card.round-shift .impact-top strong{color:#536b77}.impact-type{font-weight:700;font-size:13px}.impact-ticks{font-size:11px;color:var(--muted);margin:3px 0 9px}.impact-drivers{display:flex;gap:5px;flex-wrap:wrap}.impact-drivers span{background:#e8f0f0;border-radius:20px;padding:3px 7px;font-size:10px}.impact-card p{font-size:11px;color:var(--muted);margin:10px 0 0;line-height:1.4}
+.duel-history-count{font-size:12px;color:var(--muted);font-weight:700}.duel-legend{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0}.duel-legend span{font-size:11px;padding:4px 9px;border-radius:20px;background:#f1f5f4}.duel-legend span:before{content:"";display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px;background:var(--teal)}.duel-legend .negative:before{background:var(--red)}.duel-legend .missed:before{background:#d39d50}.duel-legend .practice:before{background:#aebbc1}.duel-plot,.duel-table-wrap{overflow:auto;border:1px solid var(--line);border-radius:12px}.duel-plot{background:linear-gradient(#f7faf9,#fff);padding:5px}.duel-plot svg{display:block}.duel-plot rect.positive{fill:var(--teal)}.duel-plot rect.negative{fill:var(--red)}.duel-plot rect.missed{fill:#d39d50}.duel-plot rect.practice{fill:#aebbc1}.duel-plot rect.flat{fill:#718b94}.duel-plot rect:hover{opacity:.65}.duel-table{border-collapse:collapse;width:100%;font-size:11px}.duel-table th,.duel-table td{text-align:left;white-space:nowrap;border-bottom:1px solid #e9efee;padding:8px 10px;font-variant-numeric:tabular-nums}.duel-table th{position:sticky;top:0;background:#eff5f4;color:var(--ink-2)}.duel-table .result{font-weight:800}.duel-table .negative .result{color:var(--red)}.duel-table .positive .result{color:var(--teal)}.duel-table .practice{color:#74848a}.duel-table-wrap{max-height:520px}
+@media(max-width:700px){.impact-grid{grid-template-columns:1fr}.impact-head{display:block}.impact-head>span{display:block;margin-top:7px}}
+"""
+
+
+CSS += """
+.duel-detail summary{cursor:pointer;color:var(--teal);font-weight:700;white-space:nowrap}.duel-detail>div{max-width:440px;white-space:normal;background:#f7faf9;padding:12px;border:1px solid var(--line);border-radius:9px;line-height:1.4}.duel-detail p{margin:4px 0 8px}.duel-detail ol{padding-left:18px;margin:8px 0;max-height:250px;overflow:auto}.duel-detail li{padding:5px 0;border-top:1px solid var(--line)}.duel-detail small{display:block;color:var(--muted)}
 """
 
 
@@ -1249,7 +1266,7 @@ def render(data: dict) -> str:
              '<header><div><h1>Mesa de mando · Team 15</h1><p class="sub">Puntos, duelos, caja y mercado para decidir durante el último día.</p></div>',
              '<div class="status"><span class="flag ', 'live' if live else 'warn', '">',
              'Equipo conectado' if live else 'Sólo feed público', '</span><span class="clock">Tick ', esc(tick), '</span></div></header>',
-             '<nav class="jump" aria-label="Secciones"><a href="#pulso">Seguimiento</a><a href="#operacion">Operación</a><a href="#monitor">Puntos</a><a href="#tendencia">Trayectoria</a><a href="#guide">Ventas</a><a href="#radio">Señales</a><a href="#ranking">Oportunidades</a><a href="#estrategia-ranking">Ranking</a><a href="#catalogo">Catálogo</a></nav>', render_command_deck(data), render_strategy_health(data), render_operations(data), render_monitor(data), render_trend(data), render_dashboard_overview(data), render_rank_strategy(data)]
+             '<nav class="jump" aria-label="Secciones"><a href="#pulso">Seguimiento</a><a href="#duelos-historico">Duelos cerrados</a><a href="#operacion">Operación</a><a href="#monitor">Puntos</a><a href="#tendencia">Trayectoria</a><a href="#guide">Ventas</a><a href="#radio">Señales</a><a href="#ranking">Oportunidades</a><a href="#estrategia-ranking">Ranking</a><a href="#catalogo">Catálogo</a></nav>', render_command_deck(data), render_strategy_health(data), render_operations(data), render_monitor(data), render_trend(data), duel_history.render(data.get('duel_history') or []), render_dashboard_overview(data), render_rank_strategy(data)]
     for warning in data.get("warnings") or []:
         parts.append('<div class="warning">' + esc(warning) + '</div>')
     guide = data.get("sale_guide") or []

@@ -226,6 +226,17 @@ def merge_done(history: list, newly_done: list) -> list:
     return list(by_id.values())
 
 
+def refresh_history(b, history: list, history_tick: int | None, tick: int) -> tuple[list, int | None, bool]:
+    """Refresh confirmed evidence; a failed GET must be retried next tick."""
+    if history_tick is not None and tick - history_tick < 20:
+        return history, history_tick, False
+    try:
+        done = b.duels(done=True).get("duels", [])
+    except BazaarError:
+        return history, history_tick, False
+    return merge_done(history, done), tick, True
+
+
 def reconcile_accepted(b, awaiting: dict, tick: int, stats: dict) -> Optional[list]:
     """Tras aceptar, en el tick siguiente se relee el duelo y se registra su estado FINAL (deal/no_deal, precio, días, rol,
     deadline) con la predicción hecha antes de aceptar. `sent: true` solo prueba que se envió la acción."""
@@ -292,12 +303,8 @@ def run(b, execute, feed_file: Path | None = None, reconcile=False, verify_accep
                     prev_score = score_snapshot(b, tick, None)
                     if prev_score:
                         log({"event": "score_snapshot", "label": "inicio", **prev_score})
-                if history_tick is None or tick - history_tick >= 20:
-                    history_tick = tick
-                    try:
-                        history = [d for d in b.duels(done=True).get("duels", []) if d.get("status") in ("deal", "no_deal")]
-                    except BazaarError:
-                        history = history or []
+                history, history_tick, refreshed = refresh_history(b, history, history_tick, tick)
+                if refreshed:
                     _learn(learner, history, tick)
                 if awaiting:
                     done_now = reconcile_accepted(b, awaiting, tick, stats)

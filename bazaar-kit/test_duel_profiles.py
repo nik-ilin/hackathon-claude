@@ -92,6 +92,13 @@ class Profiles(Params):
         self.assertEqual(kinds(dl.duel_candidates([duel("Rival Oro", prices=[95, 95, 95])], 2)), [])
         self.assertEqual(kinds(dl.duel_candidates([duel("Rival Oro", prices=[95, 95, 75])], 2)), ["duel_accept"])
 
+    def test_profile_early_threshold_uses_net_days_value(self):
+        self.flags(PLAY_DAYS=True)
+        d = duel("Rival Plata", role="buyer", limit=100, prices=[5], days=9, weight=10, deadline=16)
+        self.assertEqual(dl.price_margin(d, 5), 95)
+        self.assertEqual(dl.margin(d, 5, 9), 5)
+        self.assertNotIn("duel_accept", kinds(dl.duel_candidates([d], 0)))
+
     def test_mixed_rival_accepted_when_it_worsens(self):
         self.assertEqual(kinds(dl.duel_candidates([duel("Rival Noche", prices=[80, 82])], 1)), ["duel_accept"])
         self.assertEqual(kinds(dl.duel_candidates([duel("Rival Noche", prices=[82, 80])], 1)), [])

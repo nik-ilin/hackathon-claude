@@ -247,6 +247,24 @@ class Live(unittest.TestCase):
         with mock.patch("builtins.print"):
             self.assertEqual(ce.main(["--execute", "--state", self.state]), 2)
 
+    def test_auto_venue_key_is_read_from_our_private_snapshot(self):
+        api = mock.Mock()
+        api.me.return_value = {"venue": {"venue": "v15", "status": "open", "rules": {"mechanism": "auto"}},
+                               "starter_broker_key": "bk_starter"}
+        self.assertEqual(ce.broker_key_for_venue(api, "v15", "missing"), "bk_starter")
+        self.assertIsNone(ce.broker_key_for_venue(api, "v09", "missing"))
+
+    def test_board_key_file_requires_private_permissions(self):
+        api = mock.Mock()
+        api.me.return_value = {"venue": {"venue": "v15", "status": "open", "rules": {"mechanism": "board"}}}
+        path = os.path.join(self.tmp.name, "venue.key")
+        with open(path, "w") as f:
+            f.write("bk_board\n")
+        os.chmod(path, 0o600)
+        self.assertEqual(ce.broker_key_for_venue(api, "v15", path), "bk_board")
+        os.chmod(path, 0o644)
+        self.assertIsNone(ce.broker_key_for_venue(api, "v15", path))
+
     def test_execute_announces_once_then_waits(self):
         os.environ["BROKER_KEY"] = "bk_test"
         fake = mock.MagicMock()
