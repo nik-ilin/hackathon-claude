@@ -39,12 +39,14 @@ FAILURE_BACKOFF_SECONDS = 20
 # market.db del collector del equipo, para calibrar la fiabilidad de las fuentes de --news-sell (solo
 # lectura; opcional). Por defecto None en ejecuciones donde esa ruta no exista en el disco.
 _NEWS_DB = os.environ.get("NEWS_DB", "")
-BASE = ["./run.sh", "coord", "--execute", "--max-spend", "200", "--reserve", "5",
-        "--duende-venue", "rastro", "--no-rival-venues", "--allow-concurrent",
-        "--ladder-fill", "--ladder-calibrated", "--chato-mirror", "on", "--dealer-sell-dups",
-        "--dedupe-bids", "--deny-teams", "t05,t12,t13,t14", "--page-campaign", "none",
-        "--pilar-sell", "SAL:1.25", "--pilar-from-tick", "905", "--pilar-until-tick", "1135",
-        "--news-sell", "--news-margin", "2", "--fever-priority", "--fever-wait", "1",
+# 4 oct: delega en el preset `t15` de run.sh (mantenido por el equipo) en vez de reimplementar sus
+# propios flags a mano. Esta lista privada se había quedado desincronizada del preset real: corría con
+# --per-card por defecto (60 P, no los 95 P calibrados), una lista de --deny-teams obsoleta, y sin
+# --allow-last-copy SAL-07/--pilar-last-copy/--deny-margin que el preset ya tenía. Solo se añaden aquí
+# los flags propios de la ejecución desatendida (--execute, --max-spend, --allow-concurrent, etc.) que
+# no tiene sentido meter en el preset compartido.
+BASE = ["./run.sh", "t15", "--execute", "--max-spend", "200", "--allow-concurrent",
+        "--page-campaign", "none", "--news-margin", "2", "--fever-wait", "1",
         "--v10-commission", "--max-posts", "3"]
 if _NEWS_DB and Path(_NEWS_DB).is_file():
     BASE += ["--news-db", _NEWS_DB]
