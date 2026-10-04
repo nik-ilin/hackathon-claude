@@ -79,7 +79,7 @@ export default function App() {
   return <div className="app-shell">
     <aside className={`sidebar ${mobileOpen ? 'sidebar-open' : ''}`}>
       <div className="brand"><div className="brand-mark">15</div><div><b>BAZAAR DESK</b><small>TEAM 15 · OPERATIONS</small></div><button className="mobile-close" onClick={() => setMobileOpen(false)} aria-label="Cerrar navegación"><X size={18} /></button></div>
-      <div className="team-chip"><span className="live-dot" /> <span>TEAM 15</span><small>{snapshot?.tick == null ? 'local feed' : `tick ${snapshot.tick}`}</small></div>
+      <div className="team-chip"><span className="live-dot" /> <span>TEAM 15</span><small>{snapshot?.tick == null ? 'local feed' : `tick ${snapshot.tick}${snapshot?.captured_at ? ` · ${new Intl.DateTimeFormat('es-ES', { timeZone: 'Europe/Madrid', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(snapshot.captured_at * 1000)}` : ''}`}</small></div>
       <nav className="side-nav" aria-label="Secciones del dashboard">{['01 · Mando', '02 · Ejecución', '03 · Intercambio', '04 · Inteligencia', '05 · Sistema'].map((group) => {
         const items = matched.filter((item) => item.group === group)
         return items.length ? <div className="nav-group" key={group}><h2>{group}</h2>{items.map((item) => { const Icon = item.icon; return <button className={view === item.key ? 'nav-item active' : 'nav-item'} key={item.key} onClick={() => navigate(item.key)} aria-current={view === item.key ? 'page' : undefined}><Icon size={16} /><span>{item.label}</span>{view === item.key && <i />}</button> })}</div> : null
@@ -90,7 +90,7 @@ export default function App() {
     <main className="main-shell">
       <header className="topbar"><button className="mobile-menu" aria-label="Abrir navegación" onClick={() => setMobileOpen(true)}><Menu size={19} /></button>
         <label className="global-search"><Search size={15} /><input ref={searchRef} value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Buscar sección…" aria-label="Buscar módulo" /><kbd><Command size={11} /> K</kbd></label>
-        <div className="topbar-meta"><span className={`feed-indicator ${error ? 'degraded' : 'live'}`}><i />{error ? 'Datos retrasados' : 'Conectado'}</span><span className="topbar-updated"><Clock3 size={13} />{lastSuccess ? ageLabel(Math.floor(lastSuccess / 1000)) : 'Esperando captura'}</span><button className="icon-button" aria-label="Actualizar ahora" onClick={() => void load(view)}><RefreshCw size={15} /></button></div>
+        <div className="topbar-meta"><span className={`feed-indicator ${error ? 'degraded' : 'live'}`}><i />{error ? 'Datos retrasados' : 'Conectado'}</span>{snapshot?.tick != null && <span className="topbar-updated"><Clock3 size={13} />tick {snapshot.tick} · {new Intl.DateTimeFormat('es-ES', { timeZone: 'Europe/Madrid', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format((snapshot.captured_at || 0) * 1000)}</span>}<span className="topbar-updated">{lastSuccess ? ageLabel(Math.floor(lastSuccess / 1000)) : 'Esperando captura'}</span><button className="icon-button" aria-label="Actualizar ahora" onClick={() => void load(view)}><RefreshCw size={15} /></button></div>
       </header>
       <div className="content-shell">
         {error && <div className="stale-banner" role="status"><AlertTriangle size={16} /><span>{error}{cache[view] ? ' · Se mantiene visible la última captura válida.' : ''}</span><button onClick={() => void load(view)}>Reintentar</button></div>}

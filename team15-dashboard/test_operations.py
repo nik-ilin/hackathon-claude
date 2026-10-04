@@ -17,8 +17,13 @@ class OperationsTests(unittest.TestCase):
         self.assertEqual(result["safe"], 2)
         self.assertEqual(result["urgent"], 2)
         self.assertEqual(result["rows"][0]["state"], "close_now")
-        self.assertEqual(result["rows"][1]["state"], "unsafe")
-        self.assertFalse(result["rows"][1]["safe_to_accept"])
+        self.assertEqual(result["rows"][0]["expected_capture_at_risk"], 20)
+        self.assertEqual(result["rows"][0]["vanish_risk"], 1.0)
+        self.assertEqual([row["priority_rank"] for row in result["rows"]], [1, 2, 3])
+        self.assertEqual(result["rows"][0]["duel"], 1)
+        unsafe = next(row for row in result["rows"] if row["duel"] == 2)
+        self.assertEqual(unsafe["state"], "unsafe")
+        self.assertFalse(unsafe["safe_to_accept"])
 
     def test_unknown_day_weight_never_claims_safe_acceptance(self):
         result = operations.duel_watch([{"duel": 4, "status": "live", "role": "seller",

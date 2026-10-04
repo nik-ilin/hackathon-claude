@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import type { EChartsOption } from 'echarts'
 import { Radio, Search, ShieldCheck, Store } from 'lucide-react'
 import type { JsonRecord } from '../lib/types'
-import { list, num, points } from '../lib/format'
+import { list, num, points, tickDateTime } from '../lib/format'
 import { ChartPanel, MetricTable } from '../components/Chart'
 import { Empty, Panel, Stat } from '../components/Panel'
 
@@ -31,16 +31,20 @@ export function Operations({ data }: { data: JsonRecord }) {
     window.setTimeout(() => setCopied(''), 1800)
   }
   return <div className="view-stack">
-    <div className="page-intro"><div><p className="eyebrow">Mesa operativa · solo lectura</p><h1>Operaciones</h1><p>Estado de procesos, caja comprometida y acciones que requieren revisión humana.</p></div><span className="tick-stamp">Tick {data.snapshot?.tick ?? '—'}</span></div>
-    <div className="stat-grid"><Stat label="Duelos vivos" value={num(duels.live)} note={`${num(duels.urgent)} con tiempo crítico`} tone={Number(duels.live) > 0 ? 'warn' : 'neutral'} />
+    <div className="page-intro"><div><p className="eyebrow">Mesa operativa · solo lectura</p><h1>Operaciones</h1><p>Estado de procesos, caja comprometida y acciones que requieren revisión humana.</p></div><span className="tick-stamp">Tick {data.snapshot?.tick ?? '—'} · {tickDateTime(data.snapshot?.tick, data.snapshot?.tick_time_context).label}</span></div>
+    <div className="stat-grid"><Stat label="Duelos vivos" value={num(duels.live)} note={`${num(duels.urgent)} con tiempo crítico · ${num(duels.safe)} con margen neto positivo`} tone={Number(duels.live) > 0 ? 'warn' : 'neutral'} />
       <Stat label="Caja utilizable" value={`${num(capital.spendable_after_reserve)} P`} note={`${num(capital.open_bid_commitments)} P comprometidas`} />
       <Stat label="Reserva operativa" value={`${num(capital.operating_reserve)} P`} note="No usar como presupuesto libre" />
       <Stat label="Agente de ejecución" value={runtime.status === 'running' ? 'Activo' : 'No confirmado'} note={runtime.mode || 'Estado reportado por el runtime'} tone={runtime.status === 'running' ? 'good' : 'neutral'} /></div>
     <Panel title="Ofertas que requieren seguimiento" detail="Propias y entrantes separadas. Una oferta entrante no compromete tu caja hasta aceptarla.">
       {(myOffers.length || incoming.length) ? <MetricTable columns={['Dirección', 'Mercado', 'Equipo', 'Propuesta', 'Vence', 'Referencia']} rows={[
-        ...myOffers.map((o) => ['Tu oferta', o.venue || '—', o.to || o.maker || 'Pública', offerSides(o), o.ticks_left == null ? '—' : `${num(o.ticks_left, 0)} ticks`, o.id || '—']),
-        ...incoming.map((o) => ['Entrante', o.venue || '—', o.maker || o.from || '—', offerSides(o), o.ticks_left == null ? '—' : `${num(o.ticks_left, 0)} ticks`, o.id || '—']),
+        ...myOffers.map((o) => ['Tu oferta', o.venue || '—', o.to || o.maker || 'Pública', offerSides(o), o.expires_tick == null ? '—' : `t${o.expires_tick} · ${tickDateTime(o.expires_tick, data.snapshot?.tick_time_context).label} (${num(o.ticks_left, 0)} ticks)`, o.id || '—']),
+        ...incoming.map((o) => ['Entrante', o.venue || '—', o.maker || o.from || '—', offerSides(o), o.expires_tick == null ? '—' : `t${o.expires_tick} · ${tickDateTime(o.expires_tick, data.snapshot?.tick_time_context).label} (${num(o.ticks_left, 0)} ticks)`, o.id || '—']),
       ]} /> : <Empty>No hay ofertas propias ni entrantes activas en esta captura.</Empty>}
+    </Panel>
+    <Panel title="Prioridad de cierres para el score" detail="Ordena el excedente positivo que podríamos perder por esperar; no lo presenta como puntos de leaderboard. Una aceptación consume el cupo de este tick.">
+      {queue.length ? <MetricTable columns={['Prioridad', 'Estado', 'Duelo', 'Tick límite', 'Fecha estimada', 'Margen neto', 'Riesgo de perder oferta', 'Acción']} rows={queue.map((row) => [`#${row.priority_rank ?? '—'}`, row.state === 'close_now' ? 'URGENTE' : row.state === 'safe' ? 'RENTABLE' : row.state.toUpperCase(), row.duel, `t${row.deadline_tick} · ${num(row.ticks_left, 0)} ticks`, row.deadline_time?.label || tickDateTime(row.deadline_tick, data.snapshot?.tick_time_context).label, row.total_margin == null ? 'No calculable' : `${points(row.total_margin)} · excedente, no leaderboard`, `${num((row.vanish_risk || 0) * 100, 0)} % · ≈ ${points(row.expected_capture_at_risk)}`, <b>{row.action}</b>])} /> : <Empty>No hay duelos vivos priorizados.</Empty>}
+      <p className="data-note">El orden agresivo óptimo es: oferta rentable que vence o empeora, luego la mayor captura esperada expuesta; esperar solo si la mejora probable del rival supera ese riesgo. Los duelos sin datos suficientes quedan sin aceptar.</p>
     </Panel>
     <div className="overview-grid"><Panel title="Cola de decisiones" detail="Señales calculadas a partir de las fuentes activas; revisa la evidencia antes de operar.">
       {queue.length ? <MetricTable columns={['Prioridad', 'Acción', 'Evidencia', 'Fuente']} rows={queue.map((row) => [row.priority || '—', <b>{row.action || 'Revisar'}</b>, row.evidence || '—', row.source || '—'])} /> : <Empty>No hay alertas operativas prioritarias en esta captura.</Empty>}
@@ -60,10 +64,10 @@ export function Duels({ data }: { data: JsonRecord }) {
   const scoredRows = rows.filter((r) => r.kind !== 'practice')
   const positive = scoredRows.filter((r) => Number(r.result ?? r.net ?? r.delta ?? r.surplus ?? 0) > 0).length
   const net = scoredRows.reduce((sum, row) => sum + Number(row.result ?? row.net ?? row.delta ?? row.surplus ?? 0), 0)
-  return <div className="view-stack"><div className="page-intro"><div><p className="eyebrow">Negociación · histórico por cierre</p><h1>Duelos</h1><p>Margen, cierres rentables y revisiones de aprendizaje con el dato original a mano.</p></div><span className="tick-stamp">{rows.length} registros</span></div>
+  return <div className="view-stack"><div className="page-intro"><div><p className="eyebrow">Negociación · histórico por cierre</p><h1>Duelos</h1><p>Margen, cierres rentables y revisiones de aprendizaje con el dato original a mano.</p></div><span className="tick-stamp">{rows.length} registros · tick {data.snapshot?.tick ?? '—'} · {tickDateTime(data.snapshot?.tick, data.snapshot?.tick_time_context).label}</span></div>
     <div className="stat-grid"><Stat label="Cierres históricos" value={analysis.scored ?? scoredRows.length} note={`${num(analysis.no_deal)} duelos sin acuerdo`} /><Stat label="Rentables" value={positive} note={scoredRows.length ? `${num(positive / scoredRows.length * 100, 1)} % de la muestra puntuable` : 'Sin muestra'} tone="good" /><Stat label="Δ neta observada" value={`${points(net)}`} note="Suma de resultados; no equivale a puntos seguros" tone={net < 0 ? 'bad' : 'neutral'} /><Stat label="Estado de aprendizaje" value={health.duel_learning?.status || health.duels?.source || 'Sin dato'} note={health.duel_learning?.note || 'Consultar salud de estrategia'} /></div>
     <ChartPanel title="Resultado por duelo" detail="Cada barra conserva el signo del cambio de valor registrado." option={duelTrend(rows)} empty={!rows.length} />
-    <Panel title="Detalle por duelo" detail="Incluye práctica; el resumen puntuable la excluye."><MetricTable columns={['Duelo', 'Sesión', 'Rival', 'Artículo', 'Rol', 'Resultado', 'Precio', 'Días', 'Δ valor']} rows={rows.map((r) => [r.duel ?? '—', r.session ?? '—', r.rival || '—', r.item || '—', r.role || '—', r.kind || r.status || '—', r.price == null ? '—' : `${num(r.price)} P`, r.days ?? '—', points(r.result)])} empty="El API no ha devuelto duelos cerrados." /></Panel>
+    <Panel title="Detalle por duelo" detail="Incluye práctica; el resumen puntuable la excluye."><MetricTable columns={['Duelo', 'Tick límite', 'Fecha límite', 'Sesión', 'Rival', 'Artículo', 'Rol', 'Resultado', 'Precio', 'Días', 'Δ valor']} rows={rows.map((r) => [r.duel ?? '—', r.deadline_tick ?? '—', tickDateTime(r.deadline_tick, data.snapshot?.tick_time_context).label, r.session ?? '—', r.rival || '—', r.item || '—', r.role || '—', r.kind || r.status || '—', r.price == null ? '—' : `${num(r.price)} P`, r.days ?? '—', points(r.result)])} empty="El API no ha devuelto duelos cerrados." /></Panel>
   </div>
 }
 
@@ -73,13 +77,13 @@ export function Market({ data }: { data: JsonRecord }) {
   const [query, setQuery] = useState('')
   const filtered = useMemo(() => filterRows(all, query), [all, query])
   const venues = new Map<string, JsonRecord[]>(); for (const offer of filtered) venues.set(offer.venue || 'unknown', [...(venues.get(offer.venue || 'unknown') || []), offer])
-  return <div className="view-stack"><div className="page-intro"><div><p className="eyebrow">Libro público · publicaciones privadas identificadas</p><h1>Mercado</h1><p>Qué publicas tú, qué circula en tu venue y cómo se distribuyen las ofertas entre mercados.</p></div><span className="tick-stamp">{activity.own_venue || venue.venue || '—'}</span></div>
+  return <div className="view-stack"><div className="page-intro"><div><p className="eyebrow">Libro público · publicaciones privadas identificadas</p><h1>Mercado</h1><p>Qué publicas tú, qué circula en tu venue y cómo se distribuyen las ofertas entre mercados.</p></div><span className="tick-stamp">tick {data.snapshot?.tick ?? activity.tick ?? '—'} · {tickDateTime(data.snapshot?.tick, data.snapshot?.tick_time_context).label} · {activity.own_venue || venue.venue || '—'}</span></div>
     <div className="stat-grid"><Stat label="Tus ofertas abiertas" value={summary.my_open_offers ?? own.length} note={`${summary.active_sales ?? 0} ventas`} tone={own.length ? 'good' : 'neutral'} /><Stat label="Ofertas en tu mercado" value={summary.own_market_total ?? 0} note={`${summary.own_market_by_others ?? 0} de otros equipos`} /><Stat label="Libros activos" value={summary.active_venues ?? 0} note={`${summary.open_offers_total ?? all.length} ofertas abiertas`} /><Stat label="Comisión de tu venue" value={venue.fee_bps == null ? '—' : `${num(venue.fee_bps / 100)} %`} note={activity.own_venue_name || 'Fuente de venue'} /></div>
     <Panel title="Tus publicaciones activas" detail="Separadas del libro general; cada fila indica el mercado de publicación.">
-      {own.length ? <MetricTable columns={['Mercado', 'Tipo', 'Das ↔ pides', 'Comisión', 'Caduca']} rows={own.map((o) => [`${o.venue_name || o.venue} (${o.venue})`, o.kind, offerSides(o), o.fee_bps == null ? '—' : `${num(o.fee_bps / 100)} % + ${num(o.fee_per_card)} P/carta`, o.ticks_left == null ? '—' : `${num(o.ticks_left, 0)} ticks`])} /> : <Empty>No hay publicaciones tuyas activas en el último snapshot.</Empty>}
+      {own.length ? <MetricTable columns={['Mercado', 'Tipo', 'Das ↔ pides', 'Comisión', 'Caduca']} rows={own.map((o) => [`${o.venue_name || o.venue} (${o.venue})`, o.kind, offerSides(o), o.fee_bps == null ? '—' : `${num(o.fee_bps / 100)} % + ${num(o.fee_per_card)} P/carta`, o.expires_tick == null ? '—' : `t${o.expires_tick} · ${tickDateTime(o.expires_tick, data.snapshot?.tick_time_context).label} (${num(o.ticks_left, 0)} ticks)`])} /> : <Empty>No hay publicaciones tuyas activas en el último snapshot.</Empty>}
     </Panel>
     <Panel title="Libro de ofertas" detail="Listado público, agrupado por mercado y filtrable por carta, equipo o precio." action={<SearchBox value={query} onChange={setQuery} placeholder="Buscar carta o mercado" />}>
-      {[...venues.entries()].map(([id, rows]) => <section className="venue-book" key={id}><header><Store size={15} /><b>{rows[0]?.venue_name || id}</b><span>{id} · {rows.length} ofertas</span></header><MetricTable columns={['Autor', 'Tipo', 'Ofrece → pide', 'Destino', 'Caduca']} rows={rows.map((o) => [o.mine ? 'Team 15 · tuya' : o.maker || 'Otro equipo', o.kind, offerSides(o), o.to || 'Pública', o.ticks_left == null ? '—' : `${num(o.ticks_left, 0)} ticks`])} /></section>)}
+      {[...venues.entries()].map(([id, rows]) => <section className="venue-book" key={id}><header><Store size={15} /><b>{rows[0]?.venue_name || id}</b><span>{id} · {rows.length} ofertas</span></header><MetricTable columns={['Autor', 'Tipo', 'Ofrece → pide', 'Destino', 'Caduca']} rows={rows.map((o) => [o.mine ? 'Team 15 · tuya' : o.maker || 'Otro equipo', o.kind, offerSides(o), o.to || 'Pública', o.expires_tick == null ? '—' : `t${o.expires_tick} · ${tickDateTime(o.expires_tick, data.snapshot?.tick_time_context).label} (${num(o.ticks_left, 0)} ticks)`])} /></section>)}
       {!filtered.length && <Empty>No hay ofertas que coincidan con el filtro.</Empty>}
     </Panel>
   </div>
