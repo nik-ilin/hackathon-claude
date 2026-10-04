@@ -58,6 +58,15 @@ def live(i=900, rival="Rival Rojo", price=70, tick_start=0, deadline=16, role="b
 
 
 class Audit(unittest.TestCase):
+    def test_history_loader_accepts_server_envelope_and_plain_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "duels.json"
+            rows = [done(1), done(2)]
+            path.write_text(json.dumps({"source": "server", "duels": rows}))
+            self.assertEqual(len(L.load_history(path)), 2)
+            path.write_text(json.dumps(rows))
+            self.assertEqual(len(L.load_history(path)), 2)
+
     def test_uses_server_result_and_excludes_live_duels(self):
         raw = [done(1, status="deal", price=71, result=29.0), done(2, status="no_deal", result=0.0),
                dict(done(3), status="live", result=None)]
@@ -316,6 +325,37 @@ class Runner(unittest.TestCase):
         with patch.object(runner, "log", side_effect=logs.append):
             runner._learn(Mock(model=None, update=Mock(side_effect=ValueError("x"))), improving_history(2), 5)
         self.assertEqual(logs[0]["event"], "learn_error")
+
+    def test_new_settlement_keeps_previous_training_cohort(self):
+        prior = improving_history(12)
+        new = done(13, status="deal", price=71, result=29.0)
+        merged = runner.merge_done(prior, [new, dict(prior[0], result=31.0)])
+        self.assertEqual(len(merged), 13)
+        self.assertEqual(merged[0]["result"], 31.0)
+        learner = L.Learner()
+        self.assertTrue(learner.update(merged))
+        self.assertEqual(learner.model.n_duels, 13)
+
+    def test_same_count_with_corrected_result_refits(self):
+        learner = L.Learner()
+        first = [done(1, status="deal", price=71, result=29.0)]
+        self.assertTrue(learner.update(first))
+        self.assertTrue(learner.update([dict(first[0], result=25.0)]))
+        self.assertFalse(learner.update([dict(first[0], result=25.0)]))
+
+    def test_live_model_excludes_unscored_practice(self):
+        learner = L.Learner()
+        self.assertTrue(learner.update([done(1, session=1), done(2, session=3)]))
+        self.assertEqual(learner.snapshot()["facts"]["duels_done"], 1)
+
+    def test_failed_history_fetch_retries_next_tick(self):
+        api = Mock()
+        confirmed = done(7, status="deal", price=71, result=29.0)
+        api.duels.side_effect = [runner.BazaarError("network"), {"duels": [confirmed]}]
+        history, at, refreshed = runner.refresh_history(api, [], None, 100)
+        self.assertEqual((history, at, refreshed), ([], None, False))
+        history, at, refreshed = runner.refresh_history(api, history, at, 101)
+        self.assertEqual((len(history), at, refreshed), (1, 101, True))
 
 
 if __name__ == "__main__":

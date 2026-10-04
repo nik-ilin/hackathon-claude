@@ -1,5 +1,8 @@
 # Duelos · módulo complementario
 
+> Para la operación del domingo, usar [DAY3.md](DAY3.md). Este documento conserva la evidencia y los experimentos
+> históricos; el preset actual es `./run.sh duels --day3` (análisis) o `./run.sh duels --day3 --execute`.
+
 Cubre el hueco que señala `ARCHITECTURE.md` («No existe módulo de duelos»). **No modifica ningún archivo existente**: son cinco archivos nuevos.
 
 | Archivo | Papel |
@@ -68,7 +71,8 @@ python3 duel_runner.py --execute --days --ladder --reconcile --verify-accept
 - Las peticiones se espacian 0,3 s; una respuesta ambigua a una escritura detiene el ejecutor para reconciliar antes de reiniciar (salvo con `--reconcile`).
 - Robustez (por defecto): un fallo al leer no hace perder el tick; los GET se reintentan (`retries=2`, las escrituras con fallo de red nunca se repiten); el timeout de petición es ≤ medio tick; un duelo ya aceptado no vuelve a gastar la aceptación del tick siguiente; un dato inesperado se registra y no detiene el ejecutor.
 - Escalonado: urgentes primero por deadline más próximo; las oleadas con deadlines solapados reservan un tick por cada duelo con oferta aceptable y deadline ≤ el propio.
-- No hay comando `./run.sh duels`: cargar `.env` y utilizar `python3 duel_runner.py` como arriba.
+- `./run.sh duels` carga `.env` y ejecuta `duel_runner.py`; también se puede invocar el script directamente con
+  `BAZAAR_KEY` ya cargada.
 - La repetición de 562/574 evalúa cada duelo aisladamente, con parámetros elegidos sobre la misma muestra. No reproduce el límite compartido por tick, la reacción contrafactual del rival ni acredita una rentabilidad futura. Por ello `retune()` y la carga de parámetros persistidos no se invocan automáticamente.
 - Estas protecciones coordinan procesos de este ordenador; no procesos en otros equipos con la misma clave.
 

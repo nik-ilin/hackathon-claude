@@ -2,6 +2,8 @@
 
 Este panel amplía el dashboard público del PR #2. Lee su feed y sus perfiles de rivales, y combina esas señales con `/api/me`, ofertas activas y el modelo de valoración verificado de `bazaar-kit/trading.py`. **Sólo hace GET**; no envía ofertas ni acepta tratos.
 
+La **Mesa de mando** del día 3 añade cola de duelos vivos, caja comprometida, umbral de capital para estudiar `board`, estado del venue y alertas de calidad de datos. Las gráficas históricas separan duelo, dealer, trades y mercado de terceros cuando `/api/me` entrega esos campos. `GET /api/strategy` expone `operations` para otros agentes con el tick y la fuente; no convierte márgenes en puntos futuros inventados. Un broker `board` requiere verificar su latido en el proceso local: el panel no lo infiere del venue público.
+
 ```bash
 export BAZAAR_KEY='la-clave-del-equipo-15'
 python3 team15-dashboard/app.py

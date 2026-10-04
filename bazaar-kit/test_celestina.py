@@ -107,6 +107,25 @@ class Detection(unittest.TestCase):
                swap(5, "C-01", "D-01", "t07"), swap(6, "D-01", "C-01", "t08")]
         self.assertEqual([p["kind"] for p in pairs_of(raw)], ["cross", "swap", "near"])
 
+    def test_unpaired_leads_are_live_orders_not_invented_pairs(self):
+        raw = [bid(1, "RET-06", 30, venue="rastro"), bid(2, "RET-06", 25, venue="v15"),
+               ask(3, "LAT-04", 12), ask(4, "LAT-04", 9), ask(5, "RET-06", 28)]
+        offers = [ce.norm(o) for o in raw]
+        leads = ce.find_leads(offers, paired_ids={1, 5})
+        self.assertEqual([(x["side"], x["offer"]) for x in leads], [("bid", 2), ("ask", 4)])
+        text, used = ce.compose_leads(leads, venue="v15", fee_bps=0, fee_per_card=0)
+        self.assertEqual(len(used), 2)
+        self.assertIn("no matching counterparty confirmed", text)
+        self.assertIn("A counterparty can accept this order", text)
+        self.assertIn("Maker must repost on v15", text)
+        self.assertLessEqual(len(text), ce.MAX_CHARS)
+
+    def test_external_lead_needs_time_to_repost(self):
+        offers = [ce.norm(bid(1, "RET-06", 30, exp=108)),
+                  ce.norm(bid(2, "LAT-03", 9, venue="v15", exp=102))]
+        leads = ce.find_leads(offers, tick=100)
+        self.assertEqual([x["offer"] for x in leads], [2])
+
 
 class Announcement(unittest.TestCase):
     def test_text_uses_only_book_numbers_and_fits(self):
@@ -209,7 +228,7 @@ class Live(unittest.TestCase):
     def test_snapshot_reads_only_and_maps_makers_from_feed(self):
         pub = FakePublic([100], self.boards())
         snap = ce.snapshot(pub, lambda f, *a: f(*a), our_venue="v15", scan=None)
-        self.assertEqual(pub.calls, ["clock", "venues", "feed", "board:rastro"])  # v15 no se lee
+        self.assertEqual(pub.calls, ["clock", "venues", "feed", "board:rastro", "board:v15"])
         self.assertEqual({o["id"]: o["team"] for o in snap["offers"]}, {1: "t04", 2: None})
         self.assertEqual(snap["zero_fee"], {"v15"})
 
@@ -227,6 +246,24 @@ class Live(unittest.TestCase):
     def test_execute_needs_broker_key(self):
         with mock.patch("builtins.print"):
             self.assertEqual(ce.main(["--execute", "--state", self.state]), 2)
+
+    def test_auto_venue_key_is_read_from_our_private_snapshot(self):
+        api = mock.Mock()
+        api.me.return_value = {"venue": {"venue": "v15", "status": "open", "rules": {"mechanism": "auto"}},
+                               "starter_broker_key": "bk_starter"}
+        self.assertEqual(ce.broker_key_for_venue(api, "v15", "missing"), "bk_starter")
+        self.assertIsNone(ce.broker_key_for_venue(api, "v09", "missing"))
+
+    def test_board_key_file_requires_private_permissions(self):
+        api = mock.Mock()
+        api.me.return_value = {"venue": {"venue": "v15", "status": "open", "rules": {"mechanism": "board"}}}
+        path = os.path.join(self.tmp.name, "venue.key")
+        with open(path, "w") as f:
+            f.write("bk_board\n")
+        os.chmod(path, 0o600)
+        self.assertEqual(ce.broker_key_for_venue(api, "v15", path), "bk_board")
+        os.chmod(path, 0o644)
+        self.assertIsNone(ce.broker_key_for_venue(api, "v15", path))
 
     def test_execute_announces_once_then_waits(self):
         os.environ["BROKER_KEY"] = "bk_test"
@@ -247,6 +284,16 @@ class Live(unittest.TestCase):
         self.assertEqual(ce.cycle(snap, args, {"pairs": {}})["text"], "")
         snap["ours"] = {"venue": "v15", "fee_bps": 200, "fee_per_card": 0, "status": "open"}
         self.assertIn("2 % and 0 P per card", ce.cycle(snap, args, {"pairs": {}})["text"])
+
+    def test_leads_mode_finds_a_single_sided_order_without_claiming_a_match(self):
+        args = ce.parse(["--leads", "--state", self.state])
+        snap = {"tick": 100, "offers": [ce.norm(bid(2, "RET-06", 30, venue="v15"))],
+                "own_ids": [], "team": "t15", "zero_fee": {"v15"},
+                "ours": {"venue": "v15", "fee_bps": 0, "fee_per_card": 0, "status": "open"}}
+        res = ce.cycle(snap, args, {"pairs": {}})
+        self.assertEqual(res["pairs"], [])
+        self.assertEqual(res["leads"][0]["offer"], 2)
+        self.assertIn("no matching counterparty confirmed", res["text"])
 
 
 class Calibration(unittest.TestCase):

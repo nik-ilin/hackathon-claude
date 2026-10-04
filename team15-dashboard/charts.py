@@ -33,7 +33,8 @@ def _scale(values, lo=None, hi=None, pad=0.08):
 
 def line_chart(series: dict, *, width: int = 520, height: int = 170, lo=None, hi=None,
                baseline=None, baseline_label: str = "", invert: bool = False,
-               value_fmt: str = "{:.2f}", title: str = "", caption: str = "") -> str:
+               value_fmt: str = "{:.2f}", title: str = "", caption: str = "",
+               colors: dict | None = None, highlight: str | None = None) -> str:
     """`series` es {etiqueta: [(x, y), ...]}. `invert=True` para el puesto, donde 1 es arriba."""
     drawn = {k: v for k, v in (series or {}).items() if v}
     if not drawn:
@@ -70,13 +71,16 @@ def line_chart(series: dict, *, width: int = 520, height: int = 170, lo=None, hi
             parts.append(f'<text class="tick base" x="{width - pad_r}" y="{py(baseline) - 5:.1f}" '
                          f'text-anchor="end">{escape(baseline_label)}</text>')
     for i, (label, points) in enumerate(drawn.items()):
-        colour = PALETTE[i % len(PALETTE)]
+        colour = (colors or {}).get(label, PALETTE[i % len(PALETTE)])
+        emphasis = label == highlight
+        opacity = 1 if highlight is None or emphasis else .42
+        stroke_width = 3.4 if emphasis else 1.25 if highlight else 2.2
         d = " ".join(("M" if j == 0 else "L") + f"{px(x):.1f},{py(y):.1f}"
                      for j, (x, y) in enumerate(points))
-        parts.append(f'<path d="{d}" fill="none" stroke="{colour}" stroke-width="2.2" '
+        parts.append(f'<path d="{d}" fill="none" stroke="{colour}" stroke-width="{stroke_width}" opacity="{opacity}" '
                      f'stroke-linejoin="round" stroke-linecap="round"/>')
         lx, ly = points[-1]
-        parts.append(f'<circle cx="{px(lx):.1f}" cy="{py(ly):.1f}" r="3.2" fill="{colour}"/>')
+        parts.append(f'<circle cx="{px(lx):.1f}" cy="{py(ly):.1f}" r="{4 if emphasis else 2.4}" opacity="{opacity}" fill="{colour}"/>')
     parts.append(f'<text class="tick" x="{pad_l}" y="{height - 6}">tick {x0}</text>')
     parts.append(f'<text class="tick" x="{width - pad_r}" y="{height - 6}" text-anchor="end">tick {x1}</text>')
     parts.append('</svg>')

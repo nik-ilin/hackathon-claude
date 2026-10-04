@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import argparse
 import html
+import importlib.util
 import json
+import mimetypes
 import os
 import statistics
 import sys
@@ -22,14 +24,28 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 KIT = HERE.parent / "bazaar-kit"
-sys.path.insert(0, str(KIT))
+sys.path.append(str(KIT))  # los módulos locales (radio.py, scoring.py) deben ganar a los del kit
 import dashboard as public_dashboard
 
 import charts
+import duel_history
 import history
+import market_activity
+import operations
 import scoring
+import strategy_health
+import strategy_v3
+import trade_history
 from planner import build_rank
-from radio import interpret, news_item, radio_summary, radio_event
+from history_store import HistoryStore
+
+# El kit también tiene radio.py; cargar el módulo del panel por ruta evita que
+# una importación previa del kit sustituya sus funciones en un proceso largo.
+_radio_spec = importlib.util.spec_from_file_location("team15_dashboard_radio", HERE / "radio.py")
+_radio = importlib.util.module_from_spec(_radio_spec)
+_radio_spec.loader.exec_module(_radio)
+interpret, news_item = _radio.interpret, _radio.news_item
+radio_summary, radio_event = _radio.radio_summary, _radio.radio_event
 
 URL = os.environ.get("BAZAAR_URL", "https://bazaar.causaprima.ai").rstrip("/")
 
@@ -117,11 +133,10 @@ def settled_by_dealer(stores, team: str) -> dict:
 
 class Model:
     def __init__(self, reader: Reader, team: str = "t15", reserve: int = 100,
-                 feed_root: Path = KIT):
+                 feed_root: Path = KIT, history_retention_days: int = 90):
         self.reader, self.team, self.reserve = reader, team, reserve
-        self.public = public_dashboard.Builder(reader,
+        self.public = public_dashboard.Builder(reader, team=team, root=feed_root)
         self.history_path = Path(feed_root) / "data" / "score_history.jsonl"
-                                               team=team, root=feed_root)
         self.lock = threading.Lock()
         self.cached = None
         self.cached_at = 0.0
@@ -129,6 +144,10 @@ class Model:
         self.radio_tail = public_dashboard.Tail()
         self.radio_news = {}
         self._dealer_cache = None
+        self.done_cache = []
+        self.done_at = 0.0
+        self.dashboard_history = HistoryStore(Path(feed_root) / "data" / "dashboard_history.sqlite3",
+                                              retention_days=history_retention_days)
 
     def _dealers(self) -> dict:
         if self._dealer_cache is None:
@@ -180,7 +199,7 @@ class Model:
                 self.catalog = self.reader.get("/api/catalog")
             except Exception as exc:
                 warnings.append(f"Catálogo: {type(exc).__name__}")
-        me, own_offers = {}, []
+        me, own_offers, live_duels, duel_error = {}, [], None, None
         if self.reader.key:
             try:
                 me = self.reader.get("/api/me", private=True)
@@ -189,6 +208,11 @@ class Model:
                     me = {}
                 else:
                     own_offers = self.reader.get("/api/me/offers", private=True).get("offers") or []
+                    try:
+                        live_duels = self.reader.get("/api/duels", private=True).get("duels") or []
+                    except Exception as exc:
+                        duel_error = f"{type(exc).__name__}: /api/duels"
+                        warnings.append("Duelos privados no disponibles; la cola de cierre queda desactivada.")
             except Exception as exc:
                 warnings.append(f"Equipo 15: {type(exc).__name__}. Comprueba BAZAAR_KEY.")
                 me = {}
@@ -217,6 +241,24 @@ class Model:
                           rivals, listing_teams, reserve=self.reserve,
                           market_refs={ref: {"fair": card.fair, "confidence": card.confidence}
                                        for ref, card in public.oracle.cards.items()})
+        rank['unopened_packs'] = [{k: a.get(k) for k in ('id', 'ref', 'your_value')}
+                                  for a in (me.get('assets') or []) if a.get('kind') == 'pack']
+        rank['liquidation_targets'] = []
+        if rank.get('verified'):
+            for row in rank.get('catalog_rows') or []:
+                loss, floor = row.get('sell_value_loss'), row.get('sell_floor')
+                wants = row.get('wanted_by') or []
+                if (row.get('stock', 0) and wants and not row.get('sell_breaks_page')
+                        and isinstance(loss, (int, float)) and isinstance(floor, (int, float))):
+                    rank['liquidation_targets'].append({
+                        'ref': row['ref'], 'loss': loss, 'floor': floor, 'ask': floor + 2,
+                        'floor_surplus': round(floor - loss, 2), 'stock': row['stock'],
+                        'breaks_page': bool(row.get('sell_breaks_page')),
+                        'demanders': wants, 'sold_median': row.get('sold_median'),
+                        'sold_count': row.get('sold_count', 0),
+                    })
+            rank['liquidation_targets'].sort(
+                key=lambda r: (r['floor'], r['sold_median'] is None, -len(r['demanders'])))
         enrich_catalog_market(rank.get('catalog_rows') or [], self.catalog or {}, public.oracle.cards)
         holdings = {r['ref']: r.get('stock') for r in (rank.get('catalog_rows') or [])
                     if r.get('ref') and r.get('stock')}
@@ -228,6 +270,8 @@ class Model:
         rank["warnings"] = warnings + public.errors + rank["warnings"]
         rank["board_count"] = sum(map(len, boards.values()))
         rank["venue_count"] = len(boards)
+        rank["market_activity"] = market_activity.build(
+            venues, boards, own_offers, self.team, int(public.clock.get("tick") or 0) or None)
         rank["built_at"] = time.time()
         rank["clock"] = public.clock
         rank["live"] = bool(me)
@@ -236,6 +280,20 @@ class Model:
         rank["scoring"] = scoring.scoring_block(rank.get("score") or {}, public.leaderboard, self.team)
         rank["peers"] = scoring.peers_block(public.leaderboard, self.team)
         rank["feed_health"] = scoring.feed_health(self.public.stores, tick_now)
+        rank["operations"] = operations.build(duels=live_duels, duel_error=duel_error,
+                                                tick=tick_now, cash=rank.get("cash"),
+                                                offers=own_offers, reserve=self.reserve,
+                                                venues=venues, feed_health=rank["feed_health"],
+                                                verified=bool(rank.get("verified")), team=self.team)
+        if me and time.time() - self.done_at >= 60:
+            try:
+                self.done_cache = self.reader.get('/api/duels?done=true', private=True).get('duels') or []
+                self.done_at = time.time()
+            except Exception:
+                warnings.append('Historial de duelos: lectura privada no disponible; se conserva la última muestra.')
+        rank['strategy_health'] = strategy_health.build(
+            self.done_cache, (self.public.root, KIT), tick_now)
+        rank['duel_history'] = self.done_cache
         rank["ladder"] = scoring.ladder_block(self._dealers(), settled_by_dealer(self.public.stores, self.team),
                                               me.get("unlocked") or [])
         if tick_now:
@@ -245,12 +303,17 @@ class Model:
                                               rank.get("score") or {}, public.leaderboard,
                                               cash=rank.get("cash"),
                                               collection_value=rank.get("collection_value"),
-                                              team=self.team))
+                                              team=self.team, round_number=public.clock.get("round")))
             except OSError as exc:
                 warnings.append(f"Historia: {type(exc).__name__}")
         rank["history"] = history.load(self.history_path)
         rank["history_summary"] = history.summary(rank["history"], self.team)
+        rank["impact_events"] = history.impact_events(rank["history"])
+        rank['trade_history'] = trade_history.ledger(
+            trade_history.settlements(self.public.stores, self.team), rank['history'], self.team)
+        rank['trade_summary'] = trade_history.summary(rank['trade_history'])
         rank["rank_race"] = history.rank_race(rank["history"], self.team)
+        rank["rank_race_all"] = history.rank_race_all(rank["history"], self.team)
         if rank["feed_health"].get("status") != "fresh":
             rank["warnings"].append(
                 "El almacén del feed no está al día: los precios, los rivales y el playbook se calculan sobre él. "
@@ -260,6 +323,10 @@ class Model:
                                 if row.get("team") == self.team), None)
             if public_team:
                 rank["score"] = {"score": public_team.get("score")}
+        try:
+            self.dashboard_history.record(rank)
+        except (OSError, ValueError, TypeError) as exc:
+            rank["warnings"].append(f"Histórico detallado del dashboard: {type(exc).__name__}")
         return rank
 
 
@@ -403,6 +470,7 @@ CSS += r"""
 def render_dashboard_overview(data: dict) -> str:
     """Compact decision visualizations using the same live rows as the detailed views."""
     rows = data.get('catalog_rows') or []
+    verified = bool(data.get('verified'))
     released = [r for r in rows if r.get('released')]
     sold = sorted([r for r in released if r.get('sold_median') is not None], key=lambda r: r.get('sold_median') or 0, reverse=True)[:7]
     max_sold = max([r.get('sold_median') or 0 for r in sold] or [1])
@@ -410,6 +478,22 @@ def render_dashboard_overview(data: dict) -> str:
         f'<div class="bar-row"><span class="bar-label">{esc(r["ref"])}</span><span class="bar-track"><i class="bar-fill" style="width:{max(5, (r["sold_median"] or 0)/max_sold*100):.1f}%"></i></span><b class="bar-value">{fmt(r["sold_median"])} P</b></div>'
         for r in sold
     ) or '<p class="sub">Todavía no hay liquidaciones individuales suficientes.</p>'
+    priced_missing = sorted(
+        (r for r in released if verified and r.get('stock') == 0
+         and isinstance(r.get('buy_ceiling'), (int, float))
+         and isinstance(r.get('sold_median'), (int, float))),
+        key=lambda r: r['buy_ceiling'] - r['sold_median'], reverse=True)
+    favorable = sum(r['buy_ceiling'] > r['sold_median'] for r in priced_missing)
+    compare_max = max((max(r['buy_ceiling'], r['sold_median']) for r in priced_missing[:6]), default=1)
+    headroom_rows = ''.join(
+        f'<div class="headroom-row"><b>{esc(r["ref"])}</b>'
+        f'<div class="headroom-bars"><span style="width:{r["buy_ceiling"] / compare_max * 100:.1f}%" '
+        f'title="Nuestro tope: {fmt(r["buy_ceiling"])} P"></span>'
+        f'<i style="width:{r["sold_median"] / compare_max * 100:.1f}%" '
+        f'title="Mediana liquidada: {fmt(r["sold_median"])} P"></i></div>'
+        f'<strong class="{"positive" if r["buy_ceiling"] > r["sold_median"] else "negative"}">'
+        f'{r["buy_ceiling"] - r["sold_median"]:+.0f} P</strong></div>'
+        for r in priced_missing[:6])
     sets = []
     for name, cards in _group_rows(rows, 'set').items():
         available = [r for r in cards if r.get('released')]
@@ -417,18 +501,19 @@ def render_dashboard_overview(data: dict) -> str:
         pct = round(owned / len(available) * 100) if available else 0
         sets.append((name, pct, owned, len(available)))
     sets.sort(key=lambda x: x[1], reverse=True)
-    coverage = ''.join(f'<div class="coverage-item"><b>{esc(name)}</b><span class="coverage-track"><i style="width:{pct}%"></i></span><small>{owned}/{total}</small></div>' for name,pct,owned,total in sets[:8])
+    coverage = (''.join(f'<div class="coverage-item"><b>{esc(name)}</b><span class="coverage-track"><i style="width:{pct}%"></i></span><small>{owned}/{total}</small></div>' for name,pct,owned,total in sets[:8])
+                if verified else '<p class="sub">Conecta la clave y verifica la valoración para medir cobertura real.</p>')
     holders = sorted([r for r in released if r.get('held_by')], key=lambda r: len(r.get('held_by') or []), reverse=True)[:6]
     max_holders = max([len(r.get('held_by') or []) for r in holders] or [1])
     holder_bars = ''.join(f'<div class="bar-row"><span class="bar-label">{esc(r["ref"])}</span><span class="bar-track"><i class="bar-fill" style="width:{max(5, len(r.get("held_by") or [])/max_holders*100):.1f}%;background:linear-gradient(90deg,var(--saffron),#f0c96b)"></i></span><b class="bar-value">{len(r.get("held_by") or [])} equipos</b></div>' for r in holders) or '<p class="sub">Aún no hay posesiones observadas.</p>'
     free = [r for r in released if isinstance(r.get('free'), int) and r['free'] > 0]
-    missing = [r for r in released if r.get('stock') == 0]
+    missing = [r for r in released if r.get('stock') == 0] if verified else []
     scarce = sorted([r for r in released if r.get('minted') and r.get('print_run')], key=lambda r: r['minted']/r['print_run'])[:1]
     top_scarce = scarce[0] if scarce else None
     trades = data.get('trades') or []
     best_trade = trades[0] if trades else None
-    missing_value = sum((r.get('buy_ceiling') or 0) for r in released if r.get('stock') == 0)
-    sell_value = sum((r.get('sold_median') or 0) for r in free)
+    missing_value = sum((r.get('buy_ceiling') or 0) for r in missing) if verified else None
+    sell_value = sum((r.get('sold_median') or 0) for r in free) if verified else None
     sold_values = [r.get('sold_median') for r in released if r.get('sold_median') is not None]
     avg_sold = statistics.mean(sold_values) if sold_values else None
     demand_total = sum(len(r.get('wanted_by') or []) for r in released)
@@ -436,23 +521,28 @@ def render_dashboard_overview(data: dict) -> str:
     def action(icon, title, detail, kind=''):
         return f'<article class="action-card {kind}"><span class="action-icon">{icon}</span><div><strong>{title}</strong><span>{detail}</span></div></article>'
     analytics = ('<section class="analytics-grid" aria-label="KPIs estratégicos">'
-        f'<article class="analytics-card"><small>Capital potencial en faltantes</small><strong>{fmt(missing_value)} P</strong><span>Suma de topes de compra publicados</span></article>'
-        f'<article class="analytics-card"><small>Liquidez de duplicados</small><strong>{fmt(sell_value)} P</strong><span>Medianas vendidas de cartas libres</span></article>'
+        f'<article class="analytics-card"><small>Capital potencial en faltantes</small><strong>{fmt(missing_value)} P</strong><span>{"Suma de topes privados de compra" if verified else "Requiere valoración privada verificada"}</span></article>'
+        f'<article class="analytics-card"><small>Liquidez de duplicados</small><strong>{fmt(sell_value)} P</strong><span>{"Medianas vendidas de cartas libres" if verified else "Requiere inventario privado verificado"}</span></article>'
         f'<article class="analytics-card"><small>Precio mediano del mercado</small><strong>{fmt(avg_sold)} P</strong><span>Entre referencias con venta confirmada</span></article>'
         f'<article class="analytics-card"><small>Presión de demanda</small><strong>{demand_total} / {held_total}</strong><span>Pedidos frente a posesiones observadas</span></article></section>')
     priorities = ('<section class="priority-panel" aria-label="Lectura estratégica">'
-        f'<article class="priority-card"><span class="priority-value">{len(free)} cartas</span><h3>Vender primero</h3><p>Duplicados libres detectados. Empieza por las que tienen compradores y mediana ejecutada.</p></article>'
-        f'<article class="priority-card buy"><span class="priority-value">{len(missing)} cartas · {fmt(missing_value)} P</span><h3>Comprar con criterio</h3><p>Faltantes publicados. Ordena el catálogo por “valor al recibir” y respeta la caja disponible.</p></article>'
-        f'<article class="priority-card hold"><span class="priority-value">{len(released)-len(free)-len(missing)} cartas</span><h3>Proteger</h3><p>Cartas propias sin duplicado. Son el núcleo de colección; venderlas tiene coste de oportunidad.</p></article></section>')
+        f'<article class="priority-card"><span class="priority-value">{len(free) if verified else "—"} cartas</span><h3>Vender primero</h3><p>{"Duplicados libres detectados; priorizar comprador real." if verified else "Inventario privado necesario para confirmar copias libres."}</p></article>'
+        f'<article class="priority-card buy"><span class="priority-value">{len(missing) if verified else "—"} cartas · {fmt(missing_value)} P</span><h3>Comprar con criterio</h3><p>{"Ordena por valor al recibir y respeta la caja disponible." if verified else "La ausencia en el feed no prueba que falte en tu mano."}</p></article>'
+        f'<article class="priority-card hold"><span class="priority-value">{len(released)-len(free)-len(missing) if verified else "—"} cartas</span><h3>Proteger</h3><p>{"Últimas copias y páginas completas tienen coste marginal alto." if verified else "Conecta valoración privada para proteger últimas copias."}</p></article></section>')
     overview = (analytics + priorities + '<section class="dashboard-overview" aria-label="Resumen visual">'
 
         '<article class="viz-card"><div class="viz-head"><div><h2>Precios que ya se han pagado</h2><p class="viz-caption">Mediana de ventas individuales confirmadas en el feed</p></div>'
         f'<div class="mini-stat"><strong>{len(sold)}</strong><span>referencias con venta</span></div></div><div class="bar-chart">{sold_bars}</div><div class="chart-legend"><span><i class="dot"></i>Precio mediano ejecutado</span><span>Ordenado de mayor a menor</span></div></article>'
-        '<article class="viz-card"><div class="viz-head"><div><h2>Cobertura de colección</h2><p class="viz-caption">Cartas publicadas que ya tenemos por colección</p></div></div><div class="coverage-grid">'+(coverage or '<p class="sub">Sin colecciones publicadas.</p>')+'</div><div class="chart-legend"><span><i class="dot violet"></i>Más cobertura</span><span>Haz clic en una colección abajo para filtrar</span></div></article>'
-        '<article class="viz-card"><div class="viz-head"><div><h2>Cartas más comunes</h2><p class="viz-caption">Equipos distintos en los que hemos observado cada referencia</p></div></div><div class="bar-chart">'+holder_bars+'</div><div class="chart-legend"><span><i class="dot gold"></i>Posesión observada</span><span>Más equipos = menos exclusividad</span></div></article></section>')
+        '<article class="viz-card"><div class="viz-head"><div><h2>Cobertura de colección</h2><p class="viz-caption">Cartas publicadas que ya tenemos por colección</p></div></div><div class="coverage-grid">'+(coverage or '<p class="sub">Sin colecciones publicadas.</p>')+'</div><div class="chart-legend"><span><i class="dot violet"></i>Más cobertura</span><span>La vista requiere inventario privado verificado</span></div></article>'
+        '<article class="viz-card"><div class="viz-head"><div><h2>Cartas más comunes</h2><p class="viz-caption">Equipos distintos en los que hemos observado cada referencia</p></div></div><div class="bar-chart">'+holder_bars+'</div><div class="chart-legend"><span><i class="dot gold"></i>Posesión observada</span><span>Más equipos = menos exclusividad</span></div></article>'
+        '<article class="viz-card"><div class="viz-head"><div><h2>Margen de compra observado</h2><p class="viz-caption">Cartas faltantes: tope privado menos mediana histórica liquidada</p></div>'
+        f'<div class="mini-stat"><strong>{favorable}/{len(priced_missing)}</strong><span>con margen positivo</span></div></div>'
+        '<div class="headroom-chart">'+(headroom_rows or '<p class="sub">Aún no hay ventas individuales comparables con faltantes valorados.</p>')+'</div>'
+        '<div class="chart-legend"><span><i class="dot"></i>Tope nuestro</span><span><i class="dot gold"></i>Precio histórico</span></div>'
+        '<p class="chart-note">Una venta pasada no es una oferta activa. Antes de comprar, confirma precio, comisión, valor marginal y caja.</p></article></section>')
     actions = '<section class="action-strip" aria-label="Siguientes decisiones">'
-    actions += action('↗', f'{len(free)} duplicados libres', 'Revisa el precio de venta sugerido en Venta rápida', 'hot' if free else '')
-    actions += action('＋', f'{len(missing)} cartas faltantes', 'Prioriza las que tengan mayor valor al recibirlas', 'warn' if missing else '')
+    actions += action('↗', f'{len(free) if verified else "—"} duplicados libres', 'Revisa el precio de venta sugerido en Venta rápida' if verified else 'Requiere inventario privado', 'hot' if free else '')
+    actions += action('＋', f'{len(missing) if verified else "—"} cartas faltantes', 'Prioriza las que tengan mayor valor al recibirlas' if verified else 'Requiere valoración privada', 'warn' if missing else '')
     actions += action('◎', f'{"Escasez: "+top_scarce["ref"] if top_scarce else "Sin dato de tirada"}', f'{fmt(top_scarce["minted"])} de {fmt(top_scarce["print_run"])} acuñadas' if top_scarce else 'El feed aún no publica tiradas completas', '')
     actions += '</section>'
     return overview + actions
@@ -492,6 +582,18 @@ def render_rank_strategy(data: dict) -> str:
 
 
 
+def _last_complete_leaderboard(data: dict, team: str = "t15") -> tuple[list[dict], int | None]:
+    """Recover one coherent last-known public board when the live feed is partial."""
+    for sample in reversed(data.get("history") or []):
+        rivals = sample.get("rivals") or {}
+        if team in rivals and len(rivals) >= 3:
+            rows = [{"team": name, "score": score} for name, score in rivals.items()
+                    if isinstance(score, (int, float))]
+            if team in {row["team"] for row in rows}:
+                return rows, sample.get("tick")
+    return [], None
+
+
 def strategy_export(data: dict) -> dict:
     """Agent-friendly, evidence-preserving strategy payload."""
     rows = data.get('catalog_rows') or []
@@ -501,6 +603,10 @@ def strategy_export(data: dict) -> dict:
     missing = [r for r in released if r.get('stock') == 0]
     sold_values = [r['sold_median'] for r in sold]
     leaderboard_rows = (data.get('leaderboard') or {}).get('teams') or []
+    ranking_source, ranking_tick = "live", data.get("tick")
+    if not leaderboard_rows:
+        leaderboard_rows, ranking_tick = _last_complete_leaderboard(data)
+        ranking_source = "history" if leaderboard_rows else "unavailable"
     board_sorted = sorted([r for r in leaderboard_rows if isinstance(r.get('score'), (int, float))], key=lambda r: r.get('score', 0), reverse=True)
     rank_index = next((i for i, r in enumerate(board_sorted, 1) if r.get('team') == 't15'), None)
     current_score = next((r.get('score') for r in board_sorted if r.get('team') == 't15'), data.get('score', {}).get('score'))
@@ -508,6 +614,8 @@ def strategy_export(data: dict) -> dict:
     leader_score = board_sorted[0].get('score') if board_sorted else None
     ranking = {
         'position': rank_index, 'teams_count': len(board_sorted), 'score': current_score,
+        'source': ranking_source, 'observed_tick': ranking_tick,
+        'private_score': (data.get('score') or {}).get('score'),
         'gap_to_next_position': round(next_score - current_score, 2) if next_score is not None and current_score is not None else None,
         'gap_to_leader': round(leader_score - current_score, 2) if leader_score is not None and current_score is not None else None,
         'leaderboard_order': [{'team': r.get('team'), 'score': r.get('score')} for r in board_sorted],
@@ -542,17 +650,30 @@ def strategy_export(data: dict) -> dict:
             'scarcity_ratio_minted_to_print_run': round(scarcity_ratio, 4) if scarcity_ratio is not None else None,
             'sold_median': row.get('sold_median'), 'sold_count': len(row.get('sold_prices') or []),
             'sold_prices': row.get('sold_prices') or [],
-            'sell_floor': row.get('sell_floor'), 'buy_ceiling': row.get('buy_ceiling'),
+            'sell_floor': row.get('sell_floor'), 'sell_value_loss': row.get('sell_value_loss'),
+            'sell_breaks_page': row.get('sell_breaks_page'), 'buy_ceiling': row.get('buy_ceiling'),
         })
     return {
         'schema': 'team15.strategy.v2', 'schema_compatibility': 'team15.strategy.v1 fields retained', 'team': 't15', 'tick': data.get('tick'),
         'generated_at': data.get('built_at'), 'verified_private_data': bool(data.get('verified')),
         'freshness': {'snapshot_tick': data.get('tick'), 'built_at': data.get('built_at'), 'status': 'live' if data.get('live') else 'public_only', 'cache_max_age_seconds': 12},
         'ranking': ranking,
-        'scoring': data.get('scoring') or {},
+        'leaderboard_history': data.get('rank_race_all') or {},
+        'scoring': (scoring.scoring_block(data.get('score') or {}, {'teams': board_sorted}, 't15')
+                    if board_sorted else data.get('scoring') or {}),
         'ladder': data.get('ladder') or {},
-        'peers': data.get('peers') or {},
+        'peers': scoring.peers_block({'teams': board_sorted}, 't15') if board_sorted else data.get('peers') or {},
         'feed_health': data.get('feed_health') or {},
+        'operations': data.get('operations') or {},
+        'market_activity': data.get('market_activity') or {},
+        'strategy_health': data.get('strategy_health') or {},
+        'score_impacts': (data.get('impact_events') or [])[-20:],
+        'duel_history': duel_history.rows(data.get('duel_history') or []),
+        'duel_analysis': duel_history.analysis(data.get('duel_history') or []),
+        'trade_history': data.get('trade_history') or [],
+        'trade_summary': data.get('trade_summary') or {},
+        'unopened_packs': data.get('unopened_packs') or [],
+        'liquidation_targets': data.get('liquidation_targets') or [],
         'opportunities': opportunities,
         'kpis': {
             'published_cards': len(released), 'catalog_cards': len(rows),
@@ -784,8 +905,9 @@ def render_monitor(data: dict) -> str:
     comps = block.get('components') or {}
     parts = ['<section id="monitor" class="monitor"><div class="section-head"><div>',
              '<h2>Monitor de ranking</h2>',
-             '<p class="sub">Los 60 puntos se reparten 30 de negociación y 30 de mercado. '
-             'El valor de colección y los bonos de página no son componentes del score.</p>',
+             '<p class="sub">El servidor aporta 60 puntos: 30 de negociación y 30 de mercado '
+             '(22,5 test + 7,5 tratos de terceros). Jueces aportan otros 40. '
+             'El valor de colección y los bonos de página no puntúan por tenencia.</p>',
              '</div></div>']
 
     if health.get('status') and health['status'] != 'fresh':
@@ -823,9 +945,9 @@ def render_monitor(data: dict) -> str:
 
     if ladder.get('levels'):
         parts += ['<div class="section-head"><div><h3>Casillas de escalera</h3>',
-                  f'<p class="sub">{esc(ladder.get("empty_slots_available"))} huecos disponibles '
+                  f'<p class="sub">Hasta {esc(ladder.get("empty_slots_available"))} huecos sin liquidación observada '
                   f'(peso {esc(ladder.get("empty_slots_weighted_by_level"))} contando el nivel). '
-                  'Una casilla vacía cuenta cero y los niveles altos pesan más.</p></div></div>',
+                  'El feed local puede estar incompleto; confirmar con score privado. Los niveles altos pesan más.</p></div></div>',
                   '<div class="ladder">']
         for level in ladder['levels']:
             state = 'off' if not level['available'] else ('done' if not level['slots_empty'] else 'open')
@@ -878,6 +1000,7 @@ def render_trend(data: dict) -> str:
     rows = data.get('history') or []
     summary = data.get('history_summary') or {}
     race = data.get('rank_race') or {}
+    race_all = data.get('rank_race_all') or {}
     peers = data.get('peers') or {}
     if summary.get('status') != 'ok':
         return ('<section id="tendencia" class="monitor"><div class="section-head"><div>'
@@ -902,6 +1025,17 @@ def render_trend(data: dict) -> str:
                           title='Los dos componentes, sobre 30',
                           caption='30 puntos cada uno. Un venue sin trades puntúa 7.50 sea board o auto, '
                                   'así que una línea plana en 7.50 es el suelo, no un resultado.'),
+        charts.line_chart({'duelos': history.series(rows, 'duel_points'),
+                           'dealers': history.series(rows, 'ladder_points'),
+                           'trades': history.series(rows, 'neg_points'),
+                           'terceros en v15': history.series(rows, 'mm_points')},
+                          title='Motores de puntos privados',
+                          caption='Serie sólo cuando /api/me entrega el desglose. Comparar cambios entre ticks; '
+                                  'un movimiento simultáneo no demuestra qué acción lo causó.'),
+        charts.line_chart({'caja': history.series(rows, 'cash'),
+                           'valor de colección': history.series(rows, 'collection_value')},
+                          title='Caja y colección',
+                          caption='Son recursos y riesgos operativos. Su nivel final no puntúa por sí mismo.'),
         charts.line_chart({'nuestra': history.efficiency_series(rows)}, value_fmt='{:.2f}',
                           baseline=best_eff.get('negotiating_per_deal'),
                           baseline_label=f'mejor: {esc(best_eff.get("team"))}',
@@ -909,10 +1043,22 @@ def render_trend(data: dict) -> str:
                           caption='Lo que paga la escalera es la cuota del rango capturada. '
                                   'Sube regateando mejor, no cerrando más tratos.'),
     ]
-    if race.get('series'):
-        cards.append(charts.line_chart(race['series'], title='Carrera con los vecinos',
-                                       caption='El de arriba y el de abajo son los que mueven el puesto. '
-                                               'Elegidos por el estado actual, no por el inicial.'))
+    if race_all.get('scores'):
+        names = race_all.get('teams') or list(race_all['scores'])
+        palette = ['#91a3aa', '#758b94', '#aab8bd', '#627c85']
+        colors = {name: palette[i % len(palette)] for i, name in enumerate(names)}
+        colors['t15'] = '#087c7c'
+        cards.append(charts.line_chart(race_all['scores'], width=820, height=250,
+                                       colors=colors, highlight='t15',
+                                       title='Carrera de score · todos los equipos',
+                                       caption=f'{len(names)} equipos; Team 15 resaltado. '
+                                               'El score público puede retrasarse frente al desglose privado.'))
+        cards.append(charts.line_chart(race_all['positions'], width=820, height=250,
+                                       lo=1, hi=max(2, len(names)), invert=True,
+                                       value_fmt='{:.0f}', colors=colors, highlight='t15',
+                                       title='Puesto histórico · todos los equipos',
+                                       caption='Escala completa del puesto; arriba es mejor. '
+                                               f'Posición pública más reciente de Team 15: {esc(race_all.get("position") or "—")} de {len(names)}.'))
 
     parts = ['<section id="tendencia" class="monitor"><div class="section-head"><div>',
              '<h2>Trayectoria</h2>',
@@ -920,50 +1066,410 @@ def render_trend(data: dict) -> str:
              'en <code>bazaar-kit/data/score_history.jsonl</code>.</p>',
              '</div></div><div class="charts">', *cards, '</div>']
 
-    moves = [m for m in history.deltas(rows, 'score', window=0) if m['delta']]
-    if moves:
-        parts += ['<table class="attrib"><caption>Qué movió los puntos</caption><thead><tr>',
-                  '<th>ticks</th><th>score</th><th>tratos</th><th>por trato</th><th>caja</th><th>colección</th>',
-                  '</tr></thead><tbody>']
-        for m in list(reversed(moves))[:8]:
-            cls = 'up' if m['delta'] > 0 else 'down'
-            ppd = m.get('points_per_deal')
+    impacts = list(reversed(data.get('impact_events') or []))[:8]
+    if impacts:
+        parts += ['<div class="impact-head"><div><h3>Qué movió el score</h3>',
+                  '<p>Lecturas entre ticks; la etiqueta describe la evidencia disponible, no atribuye una causa única.</p></div>',
+                  '<span>Últimos 8 cambios</span></div><div class="impact-grid">']
+        for event in impacts:
+            delta = event['delta']
+            amount = delta['score'] or 0
+            cls = 'positive' if amount > 0 else 'negative'
+            if event['label'] in ('Ponderación de ronda', 'Cambio de ronda'):
+                cls = 'round-shift'
+            drivers = []
+            for key, label in (('negotiating', 'Negociación'), ('market', 'Mercado'),
+                               ('duel_points', 'Duelos raw'), ('ladder_points', 'Dealers raw'),
+                               ('neg_points', 'Tratos raw'), ('mm_points', 'Terceros raw'),
+                               ('deals', 'Tratos')):
+                value = delta.get(key)
+                if isinstance(value, (int, float)) and value:
+                    drivers.append(f'<span>{label} <b>{value:+.2f}</b></span>')
             parts.append(
-                f'<tr><td>{esc(m["from_tick"])} → {esc(m["to_tick"])}</td>'
-                f'<td class="{cls}">{m["delta"]:+.2f}</td>'
-                f'<td>{esc(m.get("delta_deals") or "—")}</td>'
-                f'<td class="{cls if ppd else ""}">{(f"{ppd:+.2f}" if ppd else "—")}</td>'
-                f'<td>{esc(m.get("delta_cash") or "—")}</td>'
-                f'<td>{esc(m.get("delta_collection_value") or "—")}</td></tr>')
-        parts.append('</tbody></table>')
-        best = summary.get('best_deal')
-        if best and best.get('points_per_deal'):
-            parts.append('<p class="chart-note">Mejor intervalo: '
-                         f'{esc(best["from_tick"])} → {esc(best["to_tick"])}, '
-                         f'{best["delta"]:+.2f} puntos en {esc(best.get("delta_deals"))} trato(s) = '
-                         f'{best["points_per_deal"]:+.2f} por trato. '
-                         'La atribución junta todo lo que pasó en el intervalo: no aísla una causa.</p>')
+                f'<article class="impact-card {cls}"><div class="impact-top">'
+                f'<span class="impact-type">{esc(event["label"])}</span>'
+                f'<strong>{amount:+.2f}</strong></div>'
+                f'<div class="impact-ticks">tick {esc(event["from_tick"])} → {esc(event["to_tick"])}</div>'
+                f'<div class="impact-drivers">{"".join(drivers) or "Sin desglose disponible"}</div>'
+                f'<p>{esc(event["basis"])}</p></article>')
+        parts.append('</div>')
     parts.append('</section>')
     return ''.join(parts)
+
+
+CSS += """
+.ops{margin:0 0 22px;background:#fff;border:1px solid var(--line);border-radius:19px;padding:20px 22px;box-shadow:var(--shadow)}
+.ops-heading{display:flex;justify-content:space-between;gap:14px;align-items:baseline;border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:16px}
+.ops-heading h2{margin:0}.ops-heading p{color:var(--muted);margin:4px 0 0}.ops-heading>span{font-weight:700;color:var(--teal);white-space:nowrap}
+.ops-grid{display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:18px}.ops-grid article+article{border-left:1px solid var(--line);padding-left:18px}
+.ops-grid h3{margin:0 0 9px}.ops-grid p{color:var(--muted);font-size:12px;line-height:1.45;margin:8px 0}
+.ops-alerts{list-style:none;padding:0;margin:0;display:grid;gap:8px}.ops-alert{display:grid;gap:3px;border-left:3px solid var(--teal);padding:7px 9px;background:#f2f7f7}
+.ops-alert.critical{border-color:var(--red);background:#fff1ef}.ops-alert.high{border-color:var(--saffron);background:#fff8e9}
+.ops-alert b{font-size:13px}.ops-alert span{font-size:11px;color:var(--muted)}.ops-empty{border:1px dashed var(--line);padding:12px}
+.duel-lane{border-bottom:1px solid var(--line);padding:8px 0}.duel-lane>div:first-child{display:flex;justify-content:space-between;gap:8px;font-size:11px}.duel-lane b{font-size:12px}.duel-lane span,.duel-lane small{color:var(--muted)}
+.duel-track{height:5px;background:#e4edf0;border-radius:9px;overflow:hidden;margin:6px 0}.duel-track i{display:block;height:100%;background:var(--teal)}.duel-lane.close_now .duel-track i{background:var(--red)}.duel-lane.unsafe .duel-track i{background:var(--saffron)}
+.cash-stack{height:13px;background:#ccebe5;display:flex;border-radius:10px;overflow:hidden;margin:9px 0}.cash-stack i{height:100%;display:block}.cash-stack .committed{background:var(--red)}.cash-stack .reserved{background:var(--saffron)}
+@media(max-width:1050px){.ops-grid{grid-template-columns:1fr 1fr}.ops-primary{grid-column:1/-1}.ops-grid article+article{border-left:0;padding-left:0}.ops-detail:last-child{border-left:1px solid var(--line);padding-left:18px}}
+@media(max-width:680px){.ops-grid{display:block}.ops-grid article{padding:12px 0!important;border:0!important;border-bottom:1px solid var(--line)!important}.ops-heading{display:block}.ops-heading>span{display:block;margin-top:8px}}
+"""
+
+CSS += """
+/* Hallmark · pre-emit critique: P5 H4 E4 S5 R4 V4
+ * macrostructure: Operations ledger · genre: modern-minimal · theme: Cobalt · tone: focused
+ * anchor hue: teal with restrained amber signal
+ */
+:root{--paper:#f3f5f4;--surface:#fff;--ink:#142b36;--ink-2:#294550;--line:#d7e0df;--muted:#5b7078;--teal:#087c7c;--saffron:#b77915;--red:#a8483c;--blue:#e7f1f0;--signal:#e9a83c;--night:#102d3a;--night-2:#1a4050;--soft:#eff5f4;--shadow:none}
+html,body{overflow-x:clip;scroll-behavior:smooth}body{background:var(--paper);color:var(--ink);font-family:Arial,Helvetica,sans-serif;letter-spacing:0}.wrap{max-width:1520px;padding:20px 28px 72px}
+header{background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:0;padding:18px 24px;box-shadow:none;align-items:center}header .sub{color:var(--muted);margin:5px 0 0}h1,h2,h3{font-family:Arial,Helvetica,sans-serif;letter-spacing:-.025em}h1{font-size:26px;font-weight:800}h2{font-size:22px}header .flag{border-radius:3px}.flag.live{background:var(--teal)}.clock{font-size:13px}
+.summary{display:none}.jump{position:sticky;top:0;z-index:8;margin:0 0 14px;padding:8px 2px;border-radius:0;background:var(--paper);border-bottom:1px solid var(--line);gap:2px;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:thin}.jump a{display:inline-flex;align-items:center;white-space:nowrap;padding:8px 12px;border-radius:3px;font-size:12px}.jump a:hover,.jump a:focus-visible{background:var(--blue)}
+.command-deck{background:var(--night);color:#fff;margin:0 0 16px;padding:25px 28px 20px;display:grid;gap:20px}.deck-lead{display:grid;grid-template-columns:minmax(260px,.75fr) minmax(330px,1.25fr);gap:28px;align-items:end}.deck-kicker{display:block;color:#b3d6d3;font-size:12px;font-weight:700;letter-spacing:.02em}.deck-score>strong{display:block;font-size:clamp(62px,8vw,112px);line-height:.94;letter-spacing:-.08em;font-variant-numeric:tabular-nums;margin:9px 0 3px}.deck-score-label{color:#b8d1d2;font-size:12px}.deck-rank{border-top:1px solid #42616d;margin-top:21px;padding-top:12px;font-size:14px}.deck-rank b{font-size:24px}.deck-rank span{display:block;color:#f3c775;font-size:12px;margin-top:3px}.deck-title{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:15px}.deck-title h2{font-size:16px;color:#fff;margin:0}.deck-title a{font-size:12px;color:#a8dbd5;text-decoration:underline;text-underline-offset:3px;white-space:nowrap}.deck-race{padding:5px 0 0}.race-row{display:grid;grid-template-columns:36px minmax(0,1fr) 45px;align-items:center;gap:11px;margin:10px 0;font-size:12px;font-variant-numeric:tabular-nums}.race-row b{text-align:right;font-size:13px}.race-row.self{color:#f3c775}.race-track{height:10px;background:#31515e}.race-track i{display:block;height:100%;background:#77949f}.race-row.self .race-track i{background:var(--signal)}.deck-race p{color:#a9c0c5;font-size:11px;margin:14px 0 0}.deck-lower{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(250px,.7fr);gap:28px;padding-top:18px;border-top:1px solid #42616d}.deck-sources{display:grid;grid-template-columns:1fr 1fr;gap:0 24px}.deck-sources .deck-title{grid-column:1/-1}.deck-component{min-width:0}.deck-line{display:flex;justify-content:space-between;gap:10px;font-size:14px}.deck-line span small{display:block;color:#acc6c9;font-size:11px;margin-top:3px}.deck-line b{white-space:nowrap;font-variant-numeric:tabular-nums}.deck-line em{font-style:normal;color:#acc6c9;font-weight:400}.deck-track{height:9px;background:#31515e;margin:11px 0 0}.deck-track i{display:block;height:100%;background:#44aca2}.deck-component:nth-child(3) .deck-track i{background:var(--signal)}.deck-capital{border-left:1px solid #42616d;padding-left:24px}.deck-capital-value{font-size:31px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}.deck-capital-value span{display:block;color:#c1d5d5;font-size:11px;font-weight:400;margin-top:6px}.deck-capital p{color:#a9c0c5;font-size:11px;margin-bottom:0}.deck-decision{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:20px;align-items:center;background:var(--night-2);margin:0 -28px -20px;padding:18px 28px}.deck-decision h2{font-size:19px;margin:4px 0}.deck-decision p{color:#c5d9dc;font-size:12px;margin:0;max-width:74ch}.deck-decision>a{background:var(--signal);color:var(--night);font-weight:800;font-size:12px;padding:10px 14px;text-decoration:none;white-space:nowrap}.deck-fresh{font-size:11px;color:#a8dbd5;white-space:nowrap}
+.ops,.monitor,.viz-card,.chart,.sale-card,.radio-item,.panel,.trade,.slot,.rank-strategy,.catalog-brief,.set-card{box-shadow:none;border-radius:3px}.ops,.monitor{padding:22px 25px;background:var(--surface);border:1px solid var(--line);margin-bottom:16px}.monitor .bar{background:var(--soft)}.monitor .bar-fill{background:var(--teal)}.monitor .bar-best{background:var(--signal)}.monitor .slot{background:var(--soft);border:1px solid var(--line)}.monitor .slot.open{border-color:var(--saffron)}.monitor .slot.done{border-color:var(--teal)}.monitor .pip{background:#d6e3e1}.monitor .pip.on{background:var(--teal)}.monitor .breakdown th,.monitor .breakdown td{border-color:var(--line)}.monitor .breakdown .why{opacity:1;color:var(--muted)}.chart{padding:18px 18px 12px}.chart figcaption{font-size:15px;color:var(--ink)}.chart svg{height:190px}.chart .grid{stroke:#dbe6e4}.chart .baseline{stroke:var(--saffron)}.chart .tick.base{fill:var(--saffron)}.charts{grid-template-columns:repeat(2,minmax(0,1fr))}.dashboard-overview{grid-template-columns:repeat(2,minmax(0,1fr))}.viz-card{padding:22px}.section-shell{border-radius:3px;background:var(--surface)}.action-card{box-shadow:none;border-radius:3px}.sidebar{border-radius:3px}.catalog-toolbar{top:47px}.sale-card{border-top-width:3px}
+.headroom-chart{display:grid;gap:11px}.headroom-row{display:grid;grid-template-columns:65px minmax(0,1fr) 54px;gap:10px;align-items:center;font-size:12px}.headroom-row strong{text-align:right;font-variant-numeric:tabular-nums}.headroom-row strong.positive{color:var(--teal)}.headroom-row strong.negative{color:var(--red)}.headroom-bars{display:grid;gap:3px}.headroom-bars span,.headroom-bars i{height:5px;display:block;min-width:2px}.headroom-bars span{background:var(--teal)}.headroom-bars i{background:var(--saffron)}
+@media(max-width:900px){.deck-lead{grid-template-columns:1fr 1fr}.deck-lower{grid-template-columns:1fr}.deck-capital{border:0;border-top:1px solid #42616d;padding:15px 0 0}.dashboard-overview,.charts{grid-template-columns:1fr}.deck-decision{grid-template-columns:1fr auto}.deck-fresh{grid-column:1/-1}}
+@media(max-width:620px){.wrap{padding:10px 10px 45px}header{padding:15px;display:block}header .status{margin-top:12px}h1{font-size:22px}.command-deck{padding:20px 17px 17px}.deck-lead,.deck-sources,.deck-lower{display:block}.deck-race{border-top:1px solid #42616d;margin-top:18px;padding-top:17px}.deck-component+.deck-component{margin-top:18px}.deck-capital{margin-top:20px}.deck-decision{margin:0 -17px -17px;padding:18px 17px;display:block}.deck-decision>a{display:inline-block;margin-top:14px}.deck-fresh{display:block;margin-top:12px}.ops,.monitor{padding:16px}.coverage-grid{grid-template-columns:1fr}.dashboard-overview,.charts{display:block}.dashboard-overview>*+*,.charts>*+*{margin-top:12px}.viz-head{display:block}.viz-head .mini-stat{text-align:left;margin:9px 0}.bar-row{grid-template-columns:76px minmax(0,1fr) 60px}.catalog-toolbar{top:45px}.catalog-brief{grid-template-columns:1fr 1fr}}
+@media(prefers-reduced-motion:reduce){html,body{scroll-behavior:auto}*{transition-duration:.01ms!important;animation-duration:.01ms!important}}
+"""
+
+CSS += """
+/* Team 15 · Sunday visual pass: rounded instruments, restrained depth and one night-market gradient. */
+:root{--canvas:#edf3f4;--canvas-end:#f8faf9;--card:#fff;--night:#143542;--night-2:#214d58;--market:#33a79b;--amber:#edb25b;--coral:#ca695a;--lavender:#8d89c5;--slate:#9bb1ba;--card-shadow:0 10px 28px rgba(24,59,71,.065)}
+body{background:linear-gradient(180deg,var(--canvas),var(--canvas-end) 520px);background-attachment:fixed}.wrap{max-width:1580px}
+header{border-radius:18px;background:var(--card);box-shadow:var(--card-shadow);padding:22px 28px}.jump{border:1px solid var(--line);border-radius:13px;background:rgba(255,255,255,.96);margin:12px 0 16px;padding:6px;box-shadow:0 5px 18px rgba(24,59,71,.04);backdrop-filter:blur(12px)}.jump a{border-radius:9px}.jump a:hover,.jump a:focus-visible{background:var(--blue)}
+.command-deck{border-radius:22px;background:linear-gradient(125deg,var(--night) 0%,var(--night-2) 60%,#246b6d 100%);box-shadow:0 18px 36px rgba(14,48,58,.17);overflow:hidden}.deck-decision{background:rgba(255,255,255,.075)}.deck-decision>a{border-radius:10px;background:var(--amber)}.deck-track,.race-track{border-radius:20px;overflow:hidden}.deck-track i,.race-track i{border-radius:20px}.deck-race p,.deck-capital p{color:#d3e4e4}
+.pulse{margin:0 0 16px}.pulse-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin:0 2px 13px}.pulse-head h2{margin:0 0 4px}.pulse-head p,.pulse-head>span{font-size:12px;color:var(--muted);margin:0}.pulse-head>span{text-align:right;max-width:42ch}.pulse-grid{display:grid;grid-template-columns:1.25fr .9fr .95fr;gap:14px}.pulse-card{min-width:0;background:var(--card);border:1px solid var(--line);border-radius:18px;padding:20px 21px;box-shadow:var(--card-shadow);display:flex;flex-direction:column}.pulse-card-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:17px}.pulse-card-head h3{font-size:16px;margin:0}.pulse-card-head>strong{font-size:22px;color:var(--ink);font-variant-numeric:tabular-nums}.pulse-card-head small{font-size:12px;color:var(--muted);font-weight:400}.session-row{margin:0 0 14px}.session-row>div:first-child{display:flex;align-items:baseline;justify-content:space-between;gap:8px;font-size:12px}.session-row b{font-size:13px}.session-row span{color:var(--muted);text-align:right}.session-track{height:10px;display:flex;border-radius:50px;overflow:hidden;background:var(--soft);margin-top:7px}.session-track span{height:100%;display:block}.session-track .won,.session-key i.won{background:var(--market)}.session-track .flat{background:var(--slate)}.session-track .lost,.session-key i.lost{background:var(--coral)}.session-track .missed,.session-key i.missed{background:var(--amber)}.session-key{display:flex;flex-wrap:wrap;gap:11px;color:var(--muted);font-size:11px;margin:5px 0}.session-key span{display:inline-flex;align-items:center;gap:5px}.session-key i{width:8px;height:8px;display:inline-block;border-radius:2px}.pulse-note{font-size:12px;color:var(--muted);line-height:1.5;margin:auto 0 0;padding-top:13px}.pulse-empty{font-size:12px;color:var(--muted)}.market-pulse{background:linear-gradient(160deg,#fff 48%,#eaf6f4 100%)}.market-hero{display:flex;align-items:baseline;gap:10px;margin:0 0 12px}.market-hero b{font-size:47px;line-height:1;color:var(--teal);letter-spacing:-.06em}.market-hero span{font-size:12px;color:var(--muted);max-width:16ch}.market-pulse>a{font-size:12px;margin-top:12px;font-weight:700;text-underline-offset:3px}.system-pulse{background:linear-gradient(160deg,#fff 55%,#f1f4fb 100%)}.system-mark{color:var(--market)!important;font-size:13px!important}.system-line{display:flex;justify-content:space-between;gap:8px;padding:10px 0;border-top:1px solid var(--line);font-size:12px}.system-line b{text-align:right;color:var(--ink-2);font-size:11px}.system-line span{color:var(--muted)}
+.ops,.monitor,.viz-card,.chart,.sale-card,.radio-item,.panel,.trade,.slot,.rank-strategy,.catalog-brief,.set-card,.action-card,.sidebar{border-radius:17px;box-shadow:var(--card-shadow)}.ops,.monitor{padding:23px 26px}.viz-card,.chart{border-radius:18px}.chart svg{border-radius:10px}.sale-card{border-top-width:4px}.radio-item{border-left-width:4px}.rank-strategy{border-radius:20px}.rank-opportunity{border-radius:12px}.catalog-toolbar{border-radius:12px}.set-card:hover,.set-card:focus-visible{transform:translateY(-2px)}.bar-track,.coverage-track,.headroom-bars span,.headroom-bars i,.cash-stack,.duel-track,.set-track{border-radius:50px}.chart .baseline{stroke:var(--amber)}
+@media(max-width:1040px){.pulse-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.system-pulse{grid-column:1/-1}}
+@media(max-width:700px){.pulse-head{display:block}.pulse-head>span{display:block;text-align:left;margin-top:5px}.pulse-grid{grid-template-columns:1fr}.system-pulse{grid-column:auto}}
+@media(max-width:620px){header{padding:18px;border-radius:15px}.command-deck{border-radius:17px}.pulse-card{padding:18px;border-radius:16px}.pulse-head{padding:0 3px}.ops,.monitor{border-radius:16px}.session-row>div:first-child{display:block}.session-row span{display:block;text-align:left;margin-top:2px}}
+.impact-head{display:flex;justify-content:space-between;align-items:end;gap:14px;margin:22px 0 12px}.impact-head h3{margin:0 0 4px}.impact-head p{margin:0;color:var(--muted);font-size:12px}.impact-head>span{font-size:11px;color:var(--muted);white-space:nowrap}.impact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.impact-card{background:#f7faf9;border:1px solid var(--line);border-left:4px solid var(--teal);padding:13px 15px;border-radius:12px}.impact-card.negative{border-left-color:var(--red)}.impact-card.round-shift{border-left-color:#8196a2;background:#f5f7f8}.impact-top{display:flex;justify-content:space-between;gap:9px;align-items:baseline}.impact-top strong{font-size:23px;font-variant-numeric:tabular-nums}.impact-card.positive .impact-top strong{color:var(--teal)}.impact-card.negative .impact-top strong{color:var(--red)}.impact-card.round-shift .impact-top strong{color:#536b77}.impact-type{font-weight:700;font-size:13px}.impact-ticks{font-size:11px;color:var(--muted);margin:3px 0 9px}.impact-drivers{display:flex;gap:5px;flex-wrap:wrap}.impact-drivers span{background:#e8f0f0;border-radius:20px;padding:3px 7px;font-size:10px}.impact-card p{font-size:11px;color:var(--muted);margin:10px 0 0;line-height:1.4}
+.duel-history-count{font-size:12px;color:var(--muted);font-weight:700}.duel-legend{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0}.duel-legend span{font-size:11px;padding:4px 9px;border-radius:20px;background:#f1f5f4}.duel-legend span:before{content:"";display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px;background:var(--teal)}.duel-legend .negative:before{background:var(--red)}.duel-legend .missed:before{background:#d39d50}.duel-legend .practice:before{background:#aebbc1}.duel-plot,.duel-table-wrap{overflow:auto;border:1px solid var(--line);border-radius:12px}.duel-plot{background:linear-gradient(#f7faf9,#fff);padding:5px}.duel-plot svg{display:block}.duel-plot rect.positive{fill:var(--teal)}.duel-plot rect.negative{fill:var(--red)}.duel-plot rect.missed{fill:#d39d50}.duel-plot rect.practice{fill:#aebbc1}.duel-plot rect.flat{fill:#718b94}.duel-plot rect:hover{opacity:.65}.duel-table{border-collapse:collapse;width:100%;font-size:11px}.duel-table th,.duel-table td{text-align:left;white-space:nowrap;border-bottom:1px solid #e9efee;padding:8px 10px;font-variant-numeric:tabular-nums}.duel-table th{position:sticky;top:0;background:#eff5f4;color:var(--ink-2)}.duel-table .result{font-weight:800}.duel-table .negative .result{color:var(--red)}.duel-table .positive .result{color:var(--teal)}.duel-table .practice{color:#74848a}.duel-table-wrap{max-height:520px}
+@media(max-width:700px){.impact-grid{grid-template-columns:1fr}.impact-head{display:block}.impact-head>span{display:block;margin-top:7px}}
+"""
+
+
+CSS += """
+.duel-detail summary{cursor:pointer;color:var(--teal);font-weight:700;white-space:nowrap}.duel-detail>div{max-width:440px;white-space:normal;background:#f7faf9;padding:12px;border:1px solid var(--line);border-radius:9px;line-height:1.4}.duel-detail p{margin:4px 0 8px}.duel-detail ol{padding-left:18px;margin:8px 0;max-height:250px;overflow:auto}.duel-detail li{padding:5px 0;border-top:1px solid var(--line)}.duel-detail small{display:block;color:var(--muted)}
+.duel-insight-grid,.trade-history-kpis{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:18px 0}.duel-insight-grid article,.trade-history-kpis article{background:#f5f9f8;border:1px solid var(--line);border-radius:13px;padding:13px 15px}.duel-insight-grid small,.trade-history-kpis small{display:block;color:var(--muted);font-size:11px}.duel-insight-grid strong,.trade-history-kpis strong{display:block;font-size:25px;line-height:1.1;margin:6px 0;font-variant-numeric:tabular-nums}.duel-insight-grid span,.trade-history-kpis span{font-size:11px;color:var(--muted);line-height:1.35;display:block}.duel-analysis-columns{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin:20px 0}.duel-analysis-columns h3{font-size:15px}.duel-splits{display:grid;grid-template-columns:1fr 1fr;gap:7px}.duel-split,.duel-rival{border:1px solid var(--line);border-radius:10px;padding:9px 11px;display:grid;gap:3px}.duel-split b,.duel-rival span{font-size:11px}.duel-split strong{font-size:18px}.duel-split span,.duel-rival small{font-size:10px;color:var(--muted)}.duel-rivals{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.duel-rival b{font-size:14px}.duel-review-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px}.duel-review-head h3{margin-bottom:3px}.duel-review-head p,.duel-review-head>span{font-size:11px;color:var(--muted)}.duel-review-list{display:flex;gap:7px;overflow:auto;padding:4px 0 9px}.duel-review{min-width:165px;text-align:left;background:#f8f5ef;border:1px solid #e7d7b8;border-radius:10px;padding:8px 10px;cursor:pointer;display:grid;gap:4px;color:var(--ink)}.duel-review span{font-size:10px}.duel-review strong{font-size:12px}.duel-controls{display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin:18px 0 11px}.duel-controls label{font-size:10px;color:var(--muted);display:grid;gap:4px}.duel-controls select{padding:7px;border:1px solid var(--line);border-radius:8px;background:#fff;min-width:105px;color:var(--ink)}.duel-controls .duel-review-only{display:flex;align-items:center;padding:8px;gap:5px;font-size:11px}.duel-controls>span{font-size:11px;color:var(--muted)}.duel-table tr.focused{background:#fff1d8}
+.trade-net-chart{display:flex;align-items:center;gap:7px;overflow:auto;border:1px solid var(--line);border-radius:12px;padding:10px;min-height:115px}.trade-net-bar{display:flex;flex-direction:column;justify-content:end;align-items:center;height:103px;min-width:23px}.trade-net-bar span{width:16px;border-radius:4px 4px 0 0;background:var(--teal)}.trade-net-bar.bad span{background:var(--red)}.trade-net-bar small{font-size:9px;color:var(--muted)}.trade-history-scroll{max-height:540px;overflow:auto;border:1px solid var(--line);border-radius:12px}.trade-history-table{border-collapse:collapse;width:100%;font-size:11px}.trade-history-table th,.trade-history-table td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}.trade-history-table th{position:sticky;top:0;background:#eff5f4}.trade-history-table .good td:nth-child(8){color:var(--teal);font-weight:800}.trade-history-table .bad td:nth-child(8){color:var(--red);font-weight:800}.trade-history-table details{max-width:400px;white-space:normal}.trade-history-table summary{cursor:pointer;color:var(--teal)}
+@media(max-width:800px){.duel-analysis-columns{grid-template-columns:1fr}.duel-insight-grid,.trade-history-kpis{grid-template-columns:1fr 1fr}}
+@media(max-width:540px){.duel-insight-grid,.trade-history-kpis,.duel-splits{grid-template-columns:1fr}}
+.charts .chart:has(.chart-keys .key:nth-child(8)){grid-column:1/-1}.chart-keys{max-height:105px;overflow:auto}.chart-keys .key{white-space:nowrap}.chart svg .tick{font-variant-numeric:tabular-nums}
+.liquidation-tag{font-size:11px;color:var(--red);font-weight:700}.liquidation-lead{padding:13px 16px;background:#eff6f5;border-left:4px solid var(--teal);display:grid;gap:4px;font-size:12px}.liquidation-lead span{color:var(--muted)}.liquidation-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:13px 0}.liquidation-card{display:grid;grid-template-columns:1.3fr .8fr .8fr .8fr;gap:9px;align-items:center;padding:13px;border:1px solid var(--line);border-radius:12px;background:#fff}.liquidation-card h3{margin:0;font-size:15px}.liquidation-card>div:first-child span{font-size:10px;color:var(--muted);display:block;margin-top:4px}.liquidation-card small{display:block;font-size:9px;color:var(--muted)}.liquidation-card>div b{font-size:14px;white-space:nowrap}.liquidation-card p{grid-column:1/-1;margin:1px 0 0;font-size:10px;color:var(--muted);line-height:1.4}.liquidation-card p b{color:var(--teal)}
+@media(max-width:850px){.liquidation-grid{grid-template-columns:1fr}}@media(max-width:520px){.liquidation-card{grid-template-columns:1fr 1fr}.liquidation-card>div:first-child,.liquidation-card p{grid-column:1/-1}}
+
+"""
+
+CSS += """
+.market-live{border-color:#c6d9d7;background:linear-gradient(145deg,#fff 0%,#f3f8f7 100%)}.market-live .section-head{align-items:center}.market-live h2{margin:2px 0 4px}.market-live-badge{display:inline-flex;padding:7px 12px;border:1px solid #c6d9d7;border-radius:999px;background:#eaf3f1;color:#176966;font-size:12px;font-weight:800}.market-live-headline{display:flex;justify-content:space-between;gap:12px;align-items:center;margin:12px 0;padding:13px 16px;border-left:4px solid var(--teal);border-radius:8px;background:#edf6f4}.market-live-headline b{font-size:15px}.market-live-headline span{font-size:11px;color:var(--muted)}.market-live-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin:12px 0 18px}.market-live-kpis article{padding:13px;border:1px solid var(--line);border-radius:12px;background:#fff}.market-live-kpis small{display:block;color:var(--muted);font-size:11px}.market-live-kpis strong{display:block;margin-top:6px;font-size:25px;font-variant-numeric:tabular-nums}.market-live details{margin:10px 0;border:1px solid var(--line);border-radius:11px;background:#fff;overflow:hidden}.market-live details summary{padding:12px 14px;cursor:pointer;font-weight:750;color:var(--ink);background:#f7faf9}.market-table-scroll{overflow:auto;max-height:460px}.market-table{min-width:850px;width:100%;border-collapse:collapse;font-size:12px}.market-table th,.market-table td{padding:9px 11px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.market-table th{position:sticky;top:0;z-index:1;background:#edf4f3;color:#53636a;font-size:10px;text-transform:uppercase;letter-spacing:.04em}.market-table td small{display:block;margin-top:4px;color:var(--muted);font-size:10px}.market-empty{margin:0;padding:17px;color:var(--muted);font-size:12px}.market-live details[open] summary{border-bottom:1px solid var(--line)}@media(max-width:720px){.market-live-kpis{grid-template-columns:1fr 1fr}.market-live-headline{align-items:flex-start;flex-direction:column}}
+.market-live-columns{display:grid;grid-template-columns:1fr 1fr;gap:14px}.market-live-block{min-width:0;padding:15px;border:1px solid var(--line);border-radius:14px;background:rgba(255,255,255,.75)}.market-live-block h3{margin:0 0 4px;font-size:16px}.market-live-block>p{min-height:30px;margin:0 0 12px;color:var(--muted);font-size:11px;line-height:1.4}.market-venue-group+.market-venue-group{margin-top:13px;padding-top:12px;border-top:1px solid var(--line)}.market-venue-title{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin:0 0 8px}.market-venue-title b{font-size:12px}.market-venue-title span{font-size:10px;color:var(--muted)}.market-offer-list{display:grid;gap:8px}.market-offer-card{padding:11px;border:1px solid var(--line);border-radius:11px;background:#fff}.market-offer-top,.market-offer-foot{display:flex;justify-content:space-between;align-items:center;gap:8px}.market-offer-id{font-size:9px;font-weight:800;letter-spacing:.06em;color:var(--muted)}.market-kind,.market-owner-badge{display:inline-block;margin-left:5px;padding:3px 7px;border-radius:999px;background:#eaf3f1;color:#176966;font-size:9px;font-weight:800}.market-owner-badge{background:#fff2d6;color:#885b06}.market-maker{font-size:10px;color:var(--muted);text-align:right}.market-exchange{display:grid;grid-template-columns:minmax(0,1fr) 22px minmax(0,1fr);align-items:center;gap:8px;margin:11px 0}.market-exchange>div{min-width:0;padding:9px;border-radius:8px;background:#f5f8f7}.market-exchange small{display:block;margin-bottom:4px;color:var(--muted);font-size:9px;font-weight:700;letter-spacing:.04em}.market-exchange b{display:block;overflow-wrap:anywhere;font-size:13px}.market-arrow{text-align:center;color:var(--teal);font-weight:800}.market-offer-foot{padding-top:7px;border-top:1px solid #edf0ef;color:var(--muted);font-size:9px}.market-live details[open] summary{border-bottom:1px solid var(--line)}@media(max-width:900px){.market-live-columns{grid-template-columns:1fr}}@media(max-width:520px){.market-live-kpis{grid-template-columns:1fr 1fr}.market-live-headline{align-items:flex-start;flex-direction:column}.market-offer-top,.market-offer-foot{align-items:flex-start;flex-direction:column}.market-maker{text-align:left}.market-exchange{grid-template-columns:1fr 18px 1fr}}
+"""
+
+CSS += """
+.quick-listings-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin:13px 0 6px;padding-top:11px;border-top:1px solid var(--line)}.quick-listings-head b{font-size:12px}.quick-listings-head>span{font-size:10px;font-weight:750;color:var(--teal)}.quick-listing{display:grid;gap:4px;padding:7px 0;border-bottom:1px solid #e9efeb}.quick-listing>span{display:flex;justify-content:space-between;align-items:baseline;gap:8px}.quick-listing>span b{font-size:10px;color:var(--ink-2)}.quick-listing small{font-size:9px;color:var(--muted)}.quick-listing strong{font-size:10px;color:var(--ink);overflow-wrap:anywhere}.quick-listing strong i{font-style:normal;color:var(--teal);padding:0 3px}.quick-listing-empty,.quick-listings-more{margin:4px 0;color:var(--muted);font-size:10px;line-height:1.4}.market-copy-button{align-self:flex-start;margin-top:10px;padding:8px 11px;border:1px solid #b9d4cb;border-radius:9px;background:#f0f7f3;color:#205f4d;font-size:11px;font-weight:750;cursor:pointer}.market-copy-button:hover{background:#e5f1eb}.market-copy-button:focus-visible{outline:3px solid #c8a75e;outline-offset:2px}.market-copy-status{min-height:14px;margin-top:3px;color:#28634f;font-size:10px}.market-pulse>a{display:inline-block;margin-top:8px}
+"""
+
+def render_operations(data: dict) -> str:
+    op = data.get('operations') or {}
+    duel, capital, market = (op.get('duels') or {}), (op.get('capital') or {}), (op.get('market') or {})
+    queue = op.get('queue') or []
+    alerts = ''.join(f'<li class="ops-alert {esc(item.get("priority"))}"><b>{esc(item.get("action"))}</b>'
+                     f'<span>{esc(item.get("evidence"))}</span></li>' for item in queue[:6])
+    if not alerts:
+        alerts = '<li class="ops-alert"><b>Sin alertas prioritarias</b><span>Seguir el reloj y confirmar la frescura de las fuentes.</span></li>'
+    duel_rows = []
+    for row in (duel.get('rows') or [])[:12]:
+        width = min(100, max(3, row['ticks_left'] / 12 * 100))
+        duel_rows.append(f'<div class="duel-lane {esc(row["state"])}">'
+                         f'<div><b>Duelo {esc(row["duel"])}</b><span>{esc(row["role"])} · '
+                         f'{esc(row["ticks_left"])} ticks · margen {fmt(row["total_margin"])} P</span></div>'
+                         f'<div class="duel-track"><i style="width:{width:.1f}%"></i></div>'
+                         f'<small>{esc(row["action"])}</small></div>')
+    if not duel_rows:
+        duel_rows.append('<p class="ops-empty">'
+                         + ('Lectura privada de duelos no disponible.' if duel.get('status') == 'unavailable'
+                            else 'No hay duelos vivos en este tick.') + '</p>')
+    cash = capital.get('cash')
+    cash_parts = ''
+    if isinstance(cash, (int, float)) and cash > 0:
+        committed = min(100, 100 * capital.get('open_bid_commitments', 0) / cash)
+        reserve = min(100 - committed, 100 * capital.get('operating_reserve', 0) / cash)
+        cash_parts = (f'<div class="cash-stack" role="img" aria-label="Caja comprometida {fmt(capital.get("open_bid_commitments"))} P, '
+                      f'reserva {fmt(capital.get("operating_reserve"))} P, gastable {fmt(capital.get("spendable_after_reserve"))} P">'
+                      f'<i class="committed" style="width:{committed:.1f}%"></i>'
+                      f'<i class="reserved" style="width:{reserve:.1f}%"></i></div>')
+    return ('<section id="operacion" class="ops"><div class="ops-heading"><div><h2>Mesa de mando</h2>'
+            '<p>Decisiones del tick actual. El panel observa; los agentes ejecutan con sus propios límites.</p></div>'
+            f'<span>Tick {esc(op.get("source_tick"))}</span></div><div class="ops-grid">'
+            '<article class="ops-primary"><h3>Atender ahora</h3><ul class="ops-alerts">' + alerts + '</ul></article>'
+            '<article class="ops-detail"><h3>Duelos vivos</h3><p>Una aceptación por tick. Releer antes de aceptar.</p>'
+            + ''.join(duel_rows) + '</article>'
+            '<article class="ops-detail"><h3>Capital y mercado</h3>'
+            f'<p><strong>{fmt(cash)} P</strong> en caja · {fmt(capital.get("open_bid_commitments"))} P comprometidas</p>'
+            + cash_parts + f'<p>Gastable tras reserva: <b>{fmt(capital.get("spendable_after_reserve"))} P</b></p>'
+            f'<p>Venue {esc(market.get("venue"))} · {esc(market.get("mechanism"))}; '
+            f'broker vivo: {"por verificar" if market.get("broker_required") else "no requerido"}</p>'
+            f'<p>Board: {"caja suficiente para preflight" if capital.get("board_cash_ready") else "caja insuficiente o privada no disponible"}. '
+            'La decisión final requiere autotest y supervisor.</p></article></div></section>')
+
+
+def render_command_deck(data: dict) -> str:
+    """First-screen decision view; every number comes from the current snapshot."""
+    board = sorted((r for r in (data.get('leaderboard') or {}).get('teams') or []
+                    if isinstance(r.get('score'), (int, float))),
+                   key=lambda r: r['score'], reverse=True)
+    idx = next((i for i, r in enumerate(board) if r.get('team') == 't15'), None)
+    mine = (data.get('score') or {}).get('score')
+    if not isinstance(mine, (int, float)) and idx is not None:
+        mine = board[idx]['score']
+    public_mine = board[idx]['score'] if idx is not None else None
+    above = board[idx - 1] if idx is not None and idx > 0 else None
+    below = board[idx + 1] if idx is not None and idx + 1 < len(board) else None
+    gap = max(0, above['score'] - public_mine) if above and public_mine is not None else None
+    score = data.get('scoring') or {}
+    components = score.get('components') or {}
+    op = data.get('operations') or {}
+    capital = op.get('capital') or {}
+    queue = op.get('queue') or []
+    trades = data.get('trades') or []
+    if queue:
+        action = queue[0].get('action')
+    elif trades:
+        first_trade = trades[0]
+        action = (f'{first_trade.get("action") or "Operar"} · {first_trade.get("team") or ""} '
+                  f'{", ".join(first_trade.get("give") or [])}').strip()
+    else:
+        action = None
+    evidence = queue[0].get('evidence') if queue else (trades[0].get('why') if trades else None)
+    action_target = '#operacion' if queue else '#ranking'
+    spendable = capital.get('spendable_after_reserve')
+    cash = capital.get('cash')
+    feed = data.get('feed_health') or {}
+    source_label = ('Feed al día' if feed.get('status') == 'fresh' else
+                    'Feed pendiente de verificar')
+    bars = []
+    for key, label, note in (
+            ('negotiating', 'Negociación', 'Duelos, dealers y trades'),
+            ('market', 'Mercado', 'Test y valor entre terceros')):
+        value = (components.get(key) or {}).get('ours')
+        pct = max(0, min(100, value / 30 * 100)) if isinstance(value, (int, float)) else 0
+        bars.append(f'<div class="deck-component"><div class="deck-line"><span>{label}<small>{note}</small></span>'
+                    f'<b>{fmt(value)} <em>/ 30</em></b></div><div class="deck-track" role="img" '
+                    f'aria-label="{label}: {fmt(value)} de 30 puntos"><i style="width:{pct:.1f}%"></i></div></div>')
+    comparison = []
+    for row, kind in ((above, 'above'), ({'team': 't15', 'score': public_mine}, 'self'), (below, 'below')):
+        if not row or not isinstance(row.get('score'), (int, float)):
+            continue
+        pct = max(2, min(100, row['score'] / max(40, board[0]['score'] if board else 40) * 100))
+        comparison.append(f'<div class="race-row {kind}"><span>{esc(row["team"])}</span>'
+                          f'<div class="race-track"><i style="width:{pct:.1f}%"></i></div>'
+                          f'<b>{fmt(row["score"])}</b></div>')
+    freshness = ('Dato privado verificado' if data.get('verified') else 'Sólo lectura pública')
+    return ('<section class="command-deck" aria-label="Situación actual">'
+            '<div class="deck-lead"><div class="deck-score"><span class="deck-kicker">Situación actual</span>'
+            f'<strong>{fmt(mine)}</strong><span class="deck-score-label">puntos de servidor · {freshness}</span>'
+            f'<div class="deck-rank">Puesto <b>{idx + 1 if idx is not None else "—"}</b> de {len(board) or "—"}'
+            f'<span>{("Faltan " + fmt(gap) + " puntos para superar a " + esc(above["team"])) if gap is not None else "Sin rival superior medido"}</span></div>'
+            '</div><div class="deck-race"><div class="deck-title"><h2>Carrera inmediata</h2>'
+            '<a href="#estrategia-ranking">Ver ruta</a></div>' + ''.join(comparison) +
+            '<p>Comparación del leaderboard público. El score privado puede ir por delante.</p></div></div>'
+            '<div class="deck-lower"><div class="deck-sources"><div class="deck-title"><h2>De dónde vienen los puntos</h2>'
+            '<a href="#monitor">Ver desglose</a></div>' + ''.join(bars) + '</div>'
+            '<div class="deck-capital"><div class="deck-title"><h2>Capital para actuar</h2>'
+            '<a href="#operacion">Ver operación</a></div>'
+            f'<div class="deck-capital-value">{fmt(spendable)} <span>P disponibles tras reserva</span></div>'
+            f'<p>Caja {fmt(cash)} P · reserva {fmt(capital.get("operating_reserve"))} P · '
+            f'comprometido {fmt(capital.get("open_bid_commitments"))} P</p></div></div>'
+            '<div class="deck-decision"><div><span class="deck-kicker">Siguiente decisión</span>'
+            f'<h2>{esc(action or "Revisar oportunidades nuevas")}</h2>'
+            f'<p>{esc(evidence or "No hay una alerta prioritaria en este tick. Vigila duelos y demandas nuevas.")}</p></div>'
+            f'<a href="{action_target}">Abrir detalle</a><span class="deck-fresh">{source_label}</span></div>'
+            '</section>')
+
+
+def render_strategy_health(data: dict) -> str:
+    state = data.get('strategy_health') or {}
+    duels = state.get('duels') or {}
+    memory = state.get('memory') or {}
+    learner = state.get('duel_learning') or {}
+    execution = state.get('execution') or {}
+    market = ((data.get('operations') or {}).get('market') or {})
+    market_activity_data = data.get('market_activity') or {}
+    my_open_offers = market_activity_data.get('my_open_offers') or []
+    score = data.get('scoring') or {}
+    sessions = []
+    for row in duels.get('sessions') or []:
+        total = max(1, row['total'])
+        segments = ''.join(
+            f'<span class="{cls}" style="width:{row[key] / total * 100:.1f}%"></span>'
+            for key, cls in (('positive', 'won'), ('zero_deal', 'flat'),
+                             ('negative', 'lost'), ('no_deal', 'missed')))
+        sessions.append(f'<div class="session-row"><div><b>Sesión {esc(row["session"])}</b>'
+                        f'<span>{row["positive"]} rentables · {row["negative"]} negativas · '
+                        f'{row["no_deal"]} sin trato</span></div>'
+                        f'<div class="session-track" role="img" aria-label="Sesión {row["session"]}: '
+                        f'{row["positive"]} rentables, {row["negative"]} negativas, '
+                        f'{row["no_deal"]} sin trato">{segments}</div></div>')
+    memory_text = {
+        'fresh': 'Evidencia reciente', 'stale': 'Memoria atrasada',
+        'database_only': 'Base creada; falta informe', 'not_started': 'Aún no integrada',
+    }.get(memory.get('status'), 'Sin confirmar')
+    if execution.get('mode') != 'coordinator' and memory.get('last_tick') is not None:
+        memory_text = 'Historial guardado · tick ' + esc(memory['last_tick'])
+    execution_text = ({'duels': 'Duelos en ejecución', 'coordinator': 'Coordinador en ejecución'}
+                      .get(execution.get('mode'), 'Agente operativo detenido')
+                      if execution.get('status') == 'running' else 'Agente operativo detenido')
+    learner_text = ('Informe guardado: ' + fmt(learner.get('duels_done')) + ' duelos'
+                    if learner.get('status') == 'saved_report' else 'Sin informe de aprendizaje')
+    listing_rows = []
+    for offer in my_open_offers[:3]:
+        gives = [str(value) for value in offer.get('gives') or []]
+        wants = [str(value) for value in offer.get('wants') or []]
+        if offer.get('cash_give'):
+            gives.append(fmt(offer['cash_give']) + ' P')
+        if offer.get('cash_want'):
+            wants.append(fmt(offer['cash_want']) + ' P')
+        listing_rows.append(
+            '<div class="quick-listing"><span><b>' + esc(offer.get('venue_name') or offer.get('venue') or 'Mercado sin identificar')
+            + '</b><small>' + esc(offer.get('venue') or '—') + ' · ' + esc(offer.get('kind') or 'Oferta') + '</small></span>'
+            '<strong>' + esc(' + '.join(gives) or 'Nada indicado') + ' <i>→</i> '
+            + esc(' + '.join(wants) or 'Nada indicado') + '</strong></div>')
+    listing_detail = (''.join(listing_rows) if listing_rows else
+                      '<p class="quick-listing-empty">No tienes publicaciones abiertas detectadas en este tick.</p>')
+    own_market_id = market_activity_data.get('own_venue') or '—'
+    own_market_name = market_activity_data.get('own_venue_name') or 'Mercado Team 15'
+    own_market_offers = market_activity_data.get('own_market_offers') or []
+    incoming_offers = market_activity_data.get('incoming_offers') or []
+    catalog_by_ref = {row.get('ref'): row for row in data.get('catalog_rows') or [] if row.get('ref')}
+    def share_side(cards, cash):
+        values = [str(value) for value in cards or []]
+        if cash:
+            values.append(fmt(cash) + ' P')
+        return ' + '.join(values) or '—'
+    def opportunity_note(offer):
+        refs = (offer.get('gives') or []) + (offer.get('wants') or [])
+        card = catalog_by_ref.get(refs[0]) if len(refs) == 1 else None
+        if not card:
+            return 'No single-card private comparison is available.'
+        if offer.get('kind') == 'Venta' and not offer.get('mine'):
+            ask = offer.get('cash_want')
+            cap = card.get('buy_ceiling')
+            if isinstance(ask, (int, float)) and isinstance(cap, (int, float)):
+                return (f'Ask is {fmt(ask - cap)} P above our {fmt(cap)} P private buy cap; '
+                        f'not profitable for Team 15 at this price. '
+                        f'Observed sale median {fmt(card.get("sold_median"))} P '
+                        f'(n={fmt(card.get("sold_count", 0))}).')
+            return 'Private buy cap is unavailable; verify before offering.'
+        if offer.get('kind') == 'Venta' and offer.get('mine'):
+            ask = offer.get('cash_want')
+            floor = card.get('sell_floor')
+            if isinstance(ask, (int, float)) and isinstance(floor, (int, float)):
+                verdict = f'{fmt(ask - floor)} P above' if ask >= floor else f'{fmt(floor - ask)} P below'
+                note = f'Our ask is {verdict} the {fmt(floor)} P private sale floor.'
+                if card.get('sell_breaks_page'):
+                    note += ' Selling risks breaking a collection page.'
+                return note
+        if offer.get('kind') == 'Compra':
+            ref = next(iter(offer.get('wants') or []), None)
+            card = catalog_by_ref.get(ref) if ref else None
+            bid = offer.get('cash_give')
+            if card and isinstance(bid, (int, float)):
+                floor = card.get('sell_floor')
+                if offer.get('mine'):
+                    cap = card.get('buy_ceiling')
+                    if isinstance(cap, (int, float)):
+                        return (f'Our bid is {fmt(bid)} P vs a {fmt(cap)} P private buy cap; '
+                                + ('within value.' if bid <= cap else f'{fmt(bid-cap)} P over cap.'))
+                if isinstance(floor, (int, float)):
+                    if (card.get('free') or 0) <= 0:
+                        return (f'We have no free copy; bid is {fmt(bid)} P vs a {fmt(floor)} P floor '
+                                'and selling would remove a held card.')
+                    if bid < floor:
+                        return f'Bid is {fmt(floor-bid)} P below our {fmt(floor)} P private sale floor.'
+                    return f'Bid meets our {fmt(floor)} P floor and a free copy is available.'
+        return 'Compare the cards, price and collection impact before accepting.'
+
+    def market_offer_line(offer):
+        who = 'Team 15' if offer.get('mine') else 'Another team'
+        expiry = f' · {offer["ticks_left"]} ticks left' if offer.get('ticks_left') is not None else ''
+        base = (f'• {who} · {offer.get("kind") or "Offer"}: '
+                f'{share_side(offer.get("gives"), offer.get("cash_give"))} → '
+                f'{share_side(offer.get("wants"), offer.get("cash_want"))}{expiry}')
+        return base + '\n  Why it matters: ' + opportunity_note(offer)
+
+    team_buy_posts = [offer for offer in my_open_offers if offer.get('kind') == 'Compra']
+    share_lines = [f'🏪 EL DUENDE · TEAM 15 · MARKET {own_market_id}', f'📍 {own_market_name}',
+                   f'🕒 Snapshot tick {data.get("tick") or "—"}', '',
+                   f'📌 PUBLIC OFFERS ON {own_market_id} ({len(own_market_offers)}):']
+    if own_market_offers:
+        share_lines.extend(market_offer_line(offer) for offer in own_market_offers)
+    else:
+        share_lines.append('• No active public offers at the latest refresh.')
+    share_lines += ['', f'🛒 WHAT TEAM 15 IS BUYING ({len(team_buy_posts)} active buy requests):']
+    if team_buy_posts:
+        share_lines.extend(market_offer_line(offer) for offer in team_buy_posts)
+    else:
+        share_lines.append('• No active Team 15 buy requests.')
+    share_lines += ['', f'📨 OFFERS ADDRESSED TO TEAM 15 ({len(incoming_offers)}):']
+    if incoming_offers:
+        share_lines.extend(market_offer_line(offer) for offer in incoming_offers)
+    else:
+        share_lines.append('• No incoming offers addressed to us.')
+    share_lines += ['', f'🧾 OUR OPEN LISTINGS ACROSS MARKETS ({len(my_open_offers)}):']
+    if my_open_offers:
+        for offer in my_open_offers:
+            place = offer.get('venue_name') or offer.get('venue') or 'Market unknown'
+            expiry = f' · expires in {offer["ticks_left"]} ticks' if offer.get('ticks_left') is not None else ''
+            share_lines.append(f'• {place} ({offer.get("venue") or "—"}) · {offer.get("kind") or "Offer"}: '
+                               f'{share_side(offer.get("gives"), offer.get("cash_give"))} → '
+                               f'{share_side(offer.get("wants"), offer.get("cash_want"))}{expiry}')
+    else:
+        share_lines.append('• No Team 15 listings currently open.')
+    copy_message = '\n'.join(share_lines)
+    return ('<section id="pulso" class="pulse"><div class="pulse-head"><div>'
+            '<h2>Seguimiento de la estrategia</h2><p>Resultados confirmados y estado real de los agentes.</p>'
+            '</div><span>La API decide el resultado; el historial local explica la ejecución</span></div>'
+            '<div class="pulse-grid"><article class="pulse-card duel-pulse"><div class="pulse-card-head">'
+            '<h3>Duelos cerrados</h3><strong>' + fmt(duels.get('settled')) + '</strong></div>'
+            + (''.join(sessions) or '<p class="pulse-empty">Aún no hay resultados privados de duelos.</p>') +
+            '<div class="session-key"><span><i class="won"></i>Rentable</span><span><i class="lost"></i>Pérdida</span>'
+            '<span><i class="missed"></i>Sin trato</span></div>'
+            f'<p class="pulse-note">{fmt(duels.get("negative"))} cierres negativos y '
+            f'{fmt(duels.get("no_deal"))} sin acuerdo en sesiones puntuables. '
+            'La práctica queda fuera.</p></article>'
+            '<article class="pulse-card market-pulse"><div class="pulse-card-head"><h3>Mercado propio</h3>'
+            f'<strong>{fmt(score.get("market"))}<small> / 30</small></strong></div>'
+            f'<div class="market-hero"><b>{fmt(market.get("trades"))}</b><span>tratos de terceros en '
+            f'{esc(market.get("venue") or "nuestro venue")}</span></div>'
+            '<div class="quick-listings-head"><b>Mis publicaciones</b><span>' + fmt(len(my_open_offers)) + ' abiertas</span></div>'
+            + listing_detail + (f'<p class="quick-listings-more">+{len(my_open_offers) - 3} más en el detalle</p>' if len(my_open_offers) > 3 else '')
+            + '<button class="market-copy-button" type="button" data-copy-market="' + esc(copy_message) + '">'
+            '📋 Copiar estado del mercado</button><span class="market-copy-status" aria-live="polite"></span>'
+            + '<a href="#mercado-vivo">Ver todas y sus mercados</a>'
+            f'<p class="pulse-note">Valor creado entre terceros: {fmt(score.get("mm_points"))} P. '
+            'Invitar parejas con demanda real a publicar y cerrar aquí; el tráfico bruto no puntúa.</p>'
+            '<a href="#ranking">Ver oportunidades de negociación</a></article>'
+            '<article class="pulse-card system-pulse"><div class="pulse-card-head"><h3>Sistema de decisión</h3>'
+            '<strong class="system-mark">●</strong></div>'
+            f'<div class="system-line"><span>Proceso operativo</span><b>{execution_text}</b></div>'
+            f'<div class="system-line"><span>Memoria del coordinador</span><b>{memory_text}</b></div>'
+            f'<div class="system-line"><span>Evidencia reciente</span><b>{fmt(memory.get("events_in_window"))} eventos</b></div>'
+            f'<div class="system-line"><span>Aprendizaje de duelos</span><b>{learner_text}</b></div>'
+            '<p class="pulse-note">El historial de duelos ajusta aperturas al ejecutar. Cambiar aceptar o esperar requiere '
+            '<code>--learn</code>; el replay temporal aún no ha demostrado mejora. Un informe guardado no confirma '
+            'que el modelo esté activo.</p></article></div></section>')
 
 
 def render(data: dict) -> str:
     tick = data.get("tick")
     live = data.get("live")
-    score = data.get("score") or {}
     teams = data.get("teams") or []
     trades = data.get("trades") or []
     parts = ['<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
              '<title>Team 15 · mesa de trades</title><style>', CSS, '</style></head><body data-tick="' + esc(tick) + '"><div class="wrap">',
-             '<header><div><h1>Vender duplicados · Team 15</h1><p class="sub">Compradores concretos, precio razonado y valor neto para nuestra colección.</p></div>',
+             '<header><div><h1>Mesa de mando · Team 15</h1><p class="sub">Puntos, duelos, caja y mercado para decidir durante el último día.</p></div>',
              '<div class="status"><span class="flag ', 'live' if live else 'warn', '">',
              'Equipo conectado' if live else 'Sólo feed público', '</span><span class="clock">Tick ', esc(tick), '</span></div></header>',
-             '<div class="summary">',
-             f'<div class="metric"><small>Efectivo nuestro</small><strong>{fmt(data.get("cash"))} P</strong></div>',
-             f'<div class="metric"><small>Valor de colección</small><strong>{fmt(data.get("collection_value"))} P</strong></div>',
-             f'<div class="metric"><small>{"Puntos propios en vivo" if live else "Puntos del leaderboard (con retraso)"}</small><strong>{fmt(score.get("score"))}</strong></div>',
-             f'<div class="metric"><small>Ofertas visibles · venues</small><strong>{data.get("board_count",0)} · {data.get("venue_count",0)}</strong></div>',
-             '</div><nav class="jump"><a href="#monitor">Monitor de ranking</a><a href="#tendencia">Trayectoria</a><a href="#guide">Venta rápida</a><a href="#radio">Radio y decisión</a><a href="#ranking">Ranking</a><a href="#estrategia-ranking">Estrategia</a><a href="#catalogo">Catálogo completo</a></nav>', render_monitor(data), render_trend(data), render_dashboard_overview(data), render_rank_strategy(data)]
+             '<nav class="jump" aria-label="Secciones"><a href="#pulso">Seguimiento</a><a href="#duelos-historico">Duelos cerrados</a><a href="#compras-ventas">Compras y ventas</a><a href="#mercado-vivo">Mercado en vivo</a><a href="#estrategia-ventas">Liquidación</a><a href="#operacion">Operación</a><a href="#monitor">Puntos</a><a href="#tendencia">Trayectoria</a><a href="#guide">Ventas</a><a href="#radio">Señales</a><a href="#ranking">Oportunidades</a><a href="#estrategia-ranking">Ranking</a><a href="#catalogo">Catálogo</a></nav>', render_command_deck(data), market_activity.render(data), render_strategy_health(data), render_operations(data), render_monitor(data), render_trend(data), duel_history.render(data.get('duel_history') or []), trade_history.render(data.get('trade_history') or [], data.get('unopened_packs') or []), render_dashboard_overview(data), render_rank_strategy(data)]
     for warning in data.get("warnings") or []:
         parts.append('<div class="warning">' + esc(warning) + '</div>')
     guide = data.get("sale_guide") or []
@@ -995,6 +1501,35 @@ def render(data: dict) -> str:
             parts.append('<span class="label">Ningún equipo pidió esta carta en el feed reciente.</span>')
         parts.append('</div></article>')
     parts.append('</div></section>')
+    targets = data.get('liquidation_targets') or []
+    parts += ['<section id="estrategia-ventas" class="monitor liquidation"><div class="section-head"><div>',
+              '<h2>Liquidación de cartas para subir</h2>',
+              '<p class="sub">Propuestas agresivas solo para cartas cuyo precio cubre el valor privado perdido. '
+              'El interés del feed no es una puja ni garantiza que acepten.</p></div>',
+              '<span class="liquidation-tag">No tocar bajo el suelo</span></div>']
+    if targets:
+        parts += ['<div class="liquidation-lead"><b>Regla de ataque</b><span>Abrir en el objetivo; si el rival regatea, '
+                  'conceder como máximo hasta el suelo privado. Nunca sacrificar páginas completadas ni aceptar '
+                  'precio por debajo del suelo.</span></div><div class="liquidation-grid">']
+        for item in targets[:8]:
+            median = (f'{fmt(item["sold_median"])} P · n={esc(item["sold_count"])}'
+                      if item.get('sold_median') is not None else 'Sin venta comparable observada')
+            buyers = ', '.join(item.get('demanders') or [])
+            parts.append(
+                f'<article class="liquidation-card"><div><h3>{esc(item["ref"])}</h3>'
+                f'<span>{esc(len(item["demanders"]))} equipos la buscan: {esc(buyers)}</span></div>'
+                f'<div><small>Objetivo de apertura</small><b>{fmt(item["ask"])} P</b></div>'
+                f'<div><small>Suelo rentable</small><b>{fmt(item["floor"])} P</b></div>'
+                f'<div><small>Valor perdido</small><b>{fmt(item["loss"])} P</b></div>'
+                f'<p>Última mediana vendida: {median}. El suelo conserva al menos '
+                f'+{fmt(item["floor_surplus"])} P de excedente privado si la valoración sigue vigente.</p></article>')
+        parts.append('</div><p class="chart-note">El precio objetivo suma 2 P de margen al suelo. '
+                     'Los puntos de leaderboard por oferta concreta no son públicos; el score solo confirma el resultado '
+                     'agregado tras liquidar.</p>')
+    else:
+        parts.append('<p>No hay cartas con interés observado que cumplan el suelo privado y la protección de página. '
+                     'Vender un singleton sin cubrir su valor puede bajar el score.</p>')
+    parts.append('</section>')
     summary = data.get('radio_summary') or {}
     counts = summary.get('by_verdict') or {}
     parts += ['<section id="radio" class="radio"><div class="section-head"><div>',
@@ -1100,6 +1635,10 @@ def render(data: dict) -> str:
               "if(tickPrev&&tickNow>tickPrev){const jump=document.querySelector('.jump');const note=document.createElement('span');note.className='refresh-diff';note.textContent='+'+(tickNow-tickPrev)+' ticks nuevos';jump.appendChild(note)}"
               "sessionStorage.setItem('t15.last_tick',String(tickNow));"
               "pause.addEventListener('change',()=>sessionStorage.setItem('t15.pause',pause.checked?'1':'0'));",
+              "document.querySelectorAll('.market-copy-button').forEach(b=>b.addEventListener('click',async()=>{const status=b.nextElementSibling;"
+              "const text=b.dataset.copyMarket||'';try{await navigator.clipboard.writeText(text);status.textContent='Copied — ready to paste into WhatsApp.'}"
+              "catch(e){const area=document.createElement('textarea');area.value=text;area.style.position='fixed';area.style.opacity='0';document.body.appendChild(area);"
+              "area.select();const ok=document.execCommand('copy');area.remove();status.textContent=ok?'Copied — ready to paste into WhatsApp.':'Copy unavailable; select and copy from browser.'}}));",
               CATALOG_JS,
               "setInterval(()=>{if(!pause.checked)location.reload()},15000);",
               '</script></body></html>']
@@ -1108,9 +1647,12 @@ def render(data: dict) -> str:
 
 class Handler(BaseHTTPRequestHandler):
     model: Model = None
+    web_dist = HERE / "web" / "dist"
 
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        request = urllib.parse.urlsplit(self.path)
+        path = urllib.parse.unquote(request.path)
+        status = 200
         if path == "/healthz":
             body, typ, status = b"ok\n", "text/plain", 200
         elif path == "/api/strategy":
@@ -1119,13 +1661,61 @@ class Handler(BaseHTTPRequestHandler):
                 body, typ, status = payload, "application/json; charset=utf-8", 200
             except Exception as exc:
                 body, typ, status = json.dumps({"error": f"{type(exc).__name__}: {exc}"}).encode(), "application/json; charset=utf-8", 500
-        elif path in ("/", "/index.html"):
+        elif path == "/api/v3/history":
+            try:
+                query = urllib.parse.parse_qs(request.query)
+                section = (query.get("section") or ["score"])[0]
+                ref = (query.get("ref") or [None])[0]
+                limit = int((query.get("limit") or [800])[0])
+                payload = self.model.dashboard_history.series(section, ref=ref, limit=limit)
+                body, typ, status = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode(), "application/json; charset=utf-8", 200
+            except (ValueError, TypeError) as exc:
+                body, typ, status = json.dumps({"error": str(exc)}, ensure_ascii=False).encode(), "application/json; charset=utf-8", 400
+            except Exception as exc:
+                body, typ, status = json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False).encode(), "application/json; charset=utf-8", 500
+        elif path.startswith("/api/v3/"):
+            section = path.removeprefix("/api/v3/")
+            try:
+                snapshot = self.model.snapshot()
+                exported = strategy_v3.export(snapshot, strategy_export)
+                if section not in exported["sections"]:
+                    body, typ, status = json.dumps({"error": "Sección v3 desconocida"}).encode(), "application/json; charset=utf-8", 404
+                else:
+                    envelope = {"schema": exported["schema"], "section": section,
+                                "snapshot": exported["snapshot"], "sources": exported["sources"],
+                                "data": exported["sections"][section]}
+                    body, typ, status = json.dumps(envelope, ensure_ascii=False, allow_nan=False).encode(), "application/json; charset=utf-8", 200
+            except Exception as exc:
+                body, typ, status = json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False).encode(), "application/json; charset=utf-8", 500
+        elif path == "/legacy":
             try:
                 body, typ, status = render(self.model.snapshot()).encode(), "text/html; charset=utf-8", 200
             except Exception as exc:
                 body, typ, status = f"Panel: {type(exc).__name__}: {exc}\n".encode(), "text/plain", 500
+        elif path in ("/", "/index.html"):
+            index = self.web_dist / "index.html"
+            if index.is_file():
+                body, typ, status = index.read_bytes(), "text/html; charset=utf-8", 200
+            else:
+                try:
+                    body, typ, status = render(self.model.snapshot()).encode(), "text/html; charset=utf-8", 200
+                except Exception as exc:
+                    body, typ, status = f"Panel: {type(exc).__name__}: {exc}\n".encode(), "text/plain", 500
         else:
-            body, typ, status = b"not found\n", "text/plain", 404
+            try:
+                root = self.web_dist.resolve()
+                target = (root / path.lstrip("/")).resolve()
+                target.relative_to(root)
+                if target.is_file():
+                    body = target.read_bytes()
+                    typ = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+                    if typ.startswith("text/") or typ in ("application/javascript", "image/svg+xml"):
+                        typ += "; charset=utf-8"
+                    status = 200
+                else:
+                    body, typ, status = b"not found\n", "text/plain", 404
+            except (OSError, ValueError):
+                body, typ, status = b"not found\n", "text/plain", 404
         self.send_response(status)
         self.send_header("Content-Type", typ)
         self.send_header("Content-Length", str(len(body)))
@@ -1143,6 +1733,8 @@ def main():
     parser.add_argument("--port", type=int, default=8775)
     parser.add_argument("--url", default=URL)
     parser.add_argument("--reserve", type=int, default=100)
+    parser.add_argument("--history-retention-days", type=int, default=90,
+                        help="días de histórico detallado local del dashboard (predeterminado: 90)")
     parser.add_argument("--feed-root", type=Path, default=KIT,
                         help="carpeta bazaar-kit con data/feed_history.jsonl")
     parser.add_argument("--env-file", type=Path, help="archivo .env existente para leer BAZAAR_KEY")
@@ -1154,7 +1746,8 @@ def main():
             if sep and name.strip() == "BAZAAR_KEY":
                 key = value.strip().strip("\"'")
                 break
-    model = Model(Reader(args.url, key), reserve=args.reserve, feed_root=args.feed_root)
+    model = Model(Reader(args.url, key), reserve=args.reserve, feed_root=args.feed_root,
+                  history_retention_days=args.history_retention_days)
     handler = type("Team15Handler", (Handler,), {"model": model})
     with ThreadingHTTPServer(("127.0.0.1", args.port), handler) as server:
         print(f"Mesa de trades en http://127.0.0.1:{args.port}", flush=True)

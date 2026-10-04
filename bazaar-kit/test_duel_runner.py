@@ -12,6 +12,25 @@ from negotiation import InstanceLock
 
 
 class DuelSafety(unittest.TestCase):
+    def test_day3_preset_enables_verified_two_issue_policy_without_writes_in_analysis(self):
+        saved = dict(duels.PARAMS)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with patch.object(runner, 'DATA', Path(tmp)), patch.object(runner, 'log'), \
+                     patch.object(runner, 'run') as run, patch.dict(os.environ, {'BAZAAR_KEY': 'test-key'}), \
+                     patch('sys.argv', ['duel_runner.py', '--day3']):
+                    runner.main()
+                    self.assertTrue(duels.PARAMS['PLAY_DAYS'])
+                    self.assertTrue(duels.PARAMS['PROFILES'])
+                    self.assertTrue(duels.PARAMS['LADDER'])
+                    self.assertFalse(duels.PARAMS['LOGROLL'])
+                    self.assertEqual(run.call_args.args[1], False)
+                    self.assertEqual(run.call_args.kwargs['reconcile'], True)
+                    self.assertEqual(run.call_args.kwargs['verify_accept'], True)
+        finally:
+            duels.PARAMS.clear()
+            duels.PARAMS.update(saved)
+
     def test_expired_and_days_duels_are_skipped(self):
         d = dict(duel=1, status='live', role='buyer', your_limit=100,
                  deadline_tick=10, rival_offer={'price': 1}, messages=[])

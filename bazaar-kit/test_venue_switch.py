@@ -27,10 +27,14 @@ class FakeTeam:
         self.me_key, self.opened = me_key, []
 
     def me(self):
-        d = {"cash": self.cash, "level": self.level, "venue": self.venue, "starter_broker_key": STARTER}
+        d = {"id": "t15", "cash": self.cash, "level": self.level, "venue": self.venue,
+             "starter_broker_key": STARTER}
         if self.me_key and self.opened:
             d["venue"] = {**d["venue"], "broker_key": KEY}
         return d
+
+    def my_offers(self):
+        return {"offers": []}
 
     def clock(self):
         return {"tick": self.tick, "t_hours": self.t_hours, "tick_seconds": 30.0, "doors": "open"}
@@ -138,6 +142,31 @@ class Preflight(unittest.TestCase):
         ok, detail = vs.broker_selftest(sessions=4)
         self.assertTrue(ok, detail)
 
+    def test_operating_reserve_includes_open_bid_commitments(self):
+        t = FakeTeam(cash=420)
+        t.my_offers = lambda: {"offers": [{"status": "open", "maker": "t15", "give": {"cash": 60}},
+                                           {"status": "closed", "maker": "t15", "give": {"cash": 99}}]}
+        p = vs.preflight(t, args("--operating-reserve", "100"), ok_selftest)
+        self.assertEqual(p.need, 450)  # 270 + 20 colchón + 100 operación + 60 comprometido
+        self.assertFalse(p.ok)
+        self.assertIn("60 P", next(c for c in p.checks if c.name == "compromisos").detail)
+
+    def test_operating_reserve_blocks_if_private_offers_unavailable(self):
+        t = FakeTeam(cash=500)
+        t.my_offers = lambda: (_ for _ in ()).throw(RuntimeError("sin respuesta"))
+        p = vs.preflight(t, args("--operating-reserve", "100"), ok_selftest)
+        self.assertFalse(p.ok)
+        self.assertFalse(next(c for c in p.checks if c.name == "compromisos").ok)
+
+    def test_key_file_is_private_and_recoverable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "nested", "key")
+            vs.save_broker_key(path, KEY)
+            self.assertEqual(vs.load_broker_key(path), KEY)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            os.chmod(path, 0o644)
+            self.assertIsNone(vs.load_broker_key(path))
+
 
 class Execute(unittest.TestCase):
     def go(self, team, *argv):
@@ -165,6 +194,18 @@ class Execute(unittest.TestCase):
         self.assertNotIn(KEY, " ".join(cap["cmd"]))
         self.assertNotIn("SECRETO", out)
         self.assertIn("v22", out)
+
+    def test_execute_persists_recovery_key_only_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            key_file = os.path.join(tmp, "broker.key")
+            t = FakeTeam(cash=500)
+            with patch.dict(os.environ, {"BAZAAR_KEY": "tk-equipo"}):
+                rc, out, cap = self.go(t, "--key-file", key_file, "--operating-reserve", "100")
+            self.assertEqual(rc, 0)
+            self.assertEqual(vs.load_broker_key(key_file), KEY)
+            self.assertEqual(os.stat(key_file).st_mode & 0o777, 0o600)
+            self.assertEqual(cap["env"]["BROKER_KEY"], KEY)
+            self.assertNotIn(KEY, out)
 
     def test_blocked_plan_never_opens(self):
         t = FakeTeam(cash=10)

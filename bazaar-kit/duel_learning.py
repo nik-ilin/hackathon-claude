@@ -53,7 +53,10 @@ def wilson(k: float, n: float, z: float = 1.645) -> tuple:
 
 def load_history(path) -> list:
     try:
-        return json.loads(Path(path).read_text())
+        data = json.loads(Path(path).read_text())
+        if isinstance(data, dict):
+            data = data.get("duels")
+        return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
     except (OSError, ValueError):
         return []
 
@@ -302,8 +305,12 @@ class Learner:
         self.records: list = []
 
     def update(self, done: list, log_rows: Optional[list] = None) -> bool:
-        ids = sorted(d["duel"] for d in done if d.get("status") in ("deal", "no_deal"))
-        sig = (len(ids), ids[-1] if ids else None)
+        # Una sesión puede entregar la misma cantidad de duelos con otros IDs o
+        # completar campos de una liquidación ya vista. Ambos casos exigen refit.
+        done = [d for d in done if d.get("session") != 1]  # la práctica no puntúa ni representa la política competitiva
+        sig = tuple(sorted((d["duel"], d.get("status"), d.get("result"),
+                            d.get("price"), d.get("days"), d.get("rounds"))
+                           for d in done if d.get("status") in ("deal", "no_deal")))
         if sig == self.signature:
             return False
         rows = log_rows if log_rows is not None else self._log_rows()

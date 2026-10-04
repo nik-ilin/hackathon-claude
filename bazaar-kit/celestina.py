@@ -16,7 +16,7 @@ ya están en el mismo venue de 0 % (allí se cruzan solas), ni el mismo par más
     python3 celestina.py --pairs-json -       # además exporta las parejas en JSON (stdout o fichero)
     python3 celestina.py --loop               # un ciclo por tick, sigue en dry run
     python3 celestina.py --calibrate          # réplica offline sobre intel/market.db (sin red)
-    python3 celestina.py --execute --loop     # publica con announce() (BROKER_KEY o STARTER_BROKER_KEY)
+    python3 celestina.py --execute --loop     # publica con announce() (clave del venue obtenida de /api/me)
 
 Lecturas públicas sin clave (no gastan los 5 req/s de la clave del equipo); `my_offers` usa BAZAAR_KEY si existe,
 solo para excluir nuestras ofertas. Con --execute: como mucho un anuncio cada --every ticks (10 por defecto) y un
@@ -194,6 +194,66 @@ def rank(pairs: list) -> list:
     return sorted(pairs, key=key)
 
 
+def find_leads(offers: list, *, our_venue: str = "v15", paired_ids=(), tick=None,
+               min_external_ticks_left: int = 10) -> list:
+    """Demanda/oferta vigente de un solo lado. Es una invitación, nunca una pareja ni un trato prometido.
+
+    Se prioriza una orden que ya esté en nuestro venue: su contraparte puede aceptarla directamente. Para cada
+    referencia y lado se muestra solo la mejor cotización; una oferta usada en una pareja se excluye.
+    """
+    used = set(paired_ids)
+    best = {}
+    for o in offers:
+        if o["id"] in used:
+            continue
+        if (o["venue"] != our_venue and isinstance(tick, int) and isinstance(o["expires"], int)
+                and o["expires"] - tick < min_external_ticks_left):
+            continue  # mudarse de venue requiere tiempo para que ambas partes lean y publiquen
+        bid, ask = simple_bid(o), simple_ask(o)
+        if bid and bid[0].startswith("card:"):
+            side, item, price = "bid", bid[0], bid[1]
+        elif ask and ask[0].startswith("card:"):
+            side, item, price = "ask", ask[0], ask[1]
+        else:
+            continue
+        k = side, item
+        lead = {"kind": "lead", "side": side, "item": item, "ref": ref_of(item), "price": price,
+                "offer": o["id"], "venue": o["venue"], "team": o["team"], "expires": o["expires"],
+                "key": f"lead:{side}:{item}:{o['id']}"}
+        previous = best.get(k)
+        order = (o["venue"] == our_venue, price if side == "bid" else -price,
+                 o["expires"] if isinstance(o["expires"], int) else 0)
+        if previous is None or order > previous[0]:
+            best[k] = order, lead
+    return [x[1] for x in sorted(best.values(), key=lambda x: (
+        x[1]["venue"] != our_venue, x[1]["side"] != "bid", -x[1]["price"] if x[1]["side"] == "bid" else x[1]["price"],
+        x[1]["ref"]))]
+
+
+def compose_leads(leads: list, *, venue: str, fee_bps: int, fee_per_card: int,
+                  max_leads: int = 3, max_chars: int = MAX_CHARS) -> tuple:
+    """Anuncio verificable de órdenes vivas. Si la orden está fuera, ambas partes deben mudarla; no promete cruce."""
+    if not leads:
+        return "", []
+    head = f"{venue} · {fee_text(fee_bps, fee_per_card)}. Live one-sided orders; no matching counterparty confirmed:"
+    lines, used = [head], []
+    for lead in leads[:max_leads]:
+        side = "bids" if lead["side"] == "bid" else "asks"
+        source = _where(lead["venue"])
+        if lead["venue"] == venue:
+            action = "A counterparty can accept this order on our venue."
+        else:
+            action = f"Maker must repost on {venue}; then a counterparty can accept there."
+        line = (f"Offer #{lead['offer']} {side} {lead['price']} P for {lead['ref']} on {source}"
+                + (f" (expires tick {lead['expires']})" if lead["expires"] is not None else "")
+                + f". {action}")
+        if len(" ".join(lines + [line])) > max_chars:
+            continue
+        lines.append(line)
+        used.append(lead)
+    return (" ".join(lines), used) if used else ("", [])
+
+
 # --------------------------------------------------------------------------- anuncio
 
 def _who(side: dict) -> str:
@@ -345,7 +405,7 @@ def snapshot(pub, call, *, our_venue: str, scan: Optional[list], team_api=None, 
     tick = int(call(pub.clock)["tick"])
     venues = _list(call(pub.venues), "venues")
     info = {v.get("venue"): v for v in venues}
-    names = scan or ["rastro"] + [v["venue"] for v in venues if v.get("venue") not in (None, "rastro", our_venue)
+    names = scan or ["rastro"] + [v["venue"] for v in venues if v.get("venue") not in (None, "rastro")
                                   and v.get("status", "open") == "open"]
     makers = {**(known or {}), **makers_from_feed(_list(call(pub.feed, 500), "events"))}
     offers = []
@@ -373,16 +433,23 @@ def cycle(snap: dict, args, state: dict) -> dict:
     offers = eligible(snap["offers"], team=team, own_ids=snap["own_ids"], tick=snap["tick"],
                       min_ticks_left=args.min_ticks_left)
     pairs = find_pairs(offers, our_venue=args.venue, zero_fee=snap["zero_fee"], near_extra=args.near_extra)
+    paired_ids = {x for p in pairs for x in (
+        [p["sell"]["offer"], p["buy"]["offer"]] if p["kind"] != "swap" else [p["a"]["offer"], p["b"]["offer"]])}
+    leads = find_leads(offers, our_venue=args.venue, paired_ids=paired_ids,
+                       tick=snap["tick"]) if args.leads else []
     ours = snap.get("ours")
     if ours is None:
-        return {"pairs": pairs, "text": "", "used": [], "reason": f"{args.venue} no aparece en /api/venues"}
+        return {"pairs": pairs, "leads": leads, "text": "", "used": [], "reason": f"{args.venue} no aparece en /api/venues"}
     if ours.get("status", "open") != "open":
-        return {"pairs": pairs, "text": "", "used": [], "reason": f"{args.venue} no está abierto"}
+        return {"pairs": pairs, "leads": leads, "text": "", "used": [], "reason": f"{args.venue} no está abierto"}
     fee_bps, per_card = int(ours.get("fee_bps") or 0), int(ours.get("fee_per_card") or 0)
     text, used = compose(fresh(pairs, state, snap["tick"], args.repeat_ticks), venue=args.venue, fee_bps=fee_bps,
                          fee_per_card=per_card, max_pairs=args.max_pairs)
-    reason = "" if text else ("sin parejas" if not pairs else "todas las parejas anunciadas hace poco")
-    return {"pairs": pairs, "text": text, "used": used, "reason": reason}
+    if not text and args.leads:
+        text, used = compose_leads(fresh(leads, state, snap["tick"], args.repeat_ticks), venue=args.venue,
+                                   fee_bps=fee_bps, fee_per_card=per_card, max_leads=args.max_leads)
+    reason = "" if text else ("sin parejas ni órdenes elegibles" if args.leads else "sin parejas")
+    return {"pairs": pairs, "leads": leads, "text": text, "used": used, "reason": reason}
 
 
 def export(pairs: list, path: str, tick: Optional[int]) -> None:
@@ -394,6 +461,26 @@ def export(pairs: list, path: str, tick: Optional[int]) -> None:
             f.write(data)
 
 
+def broker_key_for_venue(team_api, venue: str, key_file: str) -> Optional[str]:
+    """Resolve the matching venue key without printing or persisting it."""
+    key = os.environ.get("BROKER_KEY") or os.environ.get("STARTER_BROKER_KEY")
+    if key:
+        return key
+    if team_api is None:
+        return None
+    try:
+        me = team_api.me()
+    except Exception:
+        return None
+    own = me.get("venue") or {}
+    if own.get("venue") != venue or own.get("status") != "open":
+        return None
+    if (own.get("rules") or {}).get("mechanism") == "auto":
+        return me.get("starter_broker_key")
+    from venue_switch import load_broker_key
+    return me.get("broker_key") or load_broker_key(key_file)
+
+
 def run_live(args) -> int:
     call = Throttle(args.min_interval)
     pub = public_client(args.url)
@@ -403,9 +490,9 @@ def run_live(args) -> int:
         team_api = Bazaar(args.url, os.environ["BAZAAR_KEY"], wait_on_tick=False)
     broker = None
     if args.execute:
-        bk = os.environ.get("BROKER_KEY") or os.environ.get("STARTER_BROKER_KEY")
+        bk = broker_key_for_venue(team_api, args.venue, args.broker_key_file)
         if not bk:
-            print("--execute necesita BROKER_KEY o STARTER_BROKER_KEY en el entorno", file=sys.stderr)
+            print("--execute necesita la broker key de un venue propio abierto (entorno, /api/me o fichero 0600)", file=sys.stderr)
             return 2
         from bazaar_sdk import Broker
         broker = Broker(args.url, bk)
@@ -421,6 +508,8 @@ def run_live(args) -> int:
                   f"{len(res['pairs'])} parejas ({Counter(p['kind'] for p in res['pairs'])})")
             if args.pairs_json:
                 export(res["pairs"], args.pairs_json, snap["tick"])
+            if args.leads_json:
+                export(res["leads"], args.leads_json, snap["tick"])
             if not res["text"]:
                 print(f"[celestina] sin anuncio: {res['reason']}")
             elif not may_announce(state, snap["tick"], args.every):
@@ -546,11 +635,16 @@ def parse(argv=None):
     p.add_argument("--scan", type=lambda s: [x for x in s.split(",") if x], default=None,
                    help="venues a leer (por defecto El Rastro y todos los abiertos salvo el nuestro)")
     p.add_argument("--execute", action="store_true", help="publicar con announce() (por defecto solo imprime)")
+    p.add_argument("--broker-key-file", default=os.path.join(HERE, "data", "venue_broker.key"),
+                   help="fichero 0600 creado al abrir board; se consulta si /api/me no devuelve la clave")
     p.add_argument("--loop", action="store_true", help="repetir cada tick")
     p.add_argument("--poll", type=float, default=5.0, help="segundos entre lecturas del reloj en --loop")
     p.add_argument("--every", type=int, default=10, help="mínimo de ticks entre anuncios")
     p.add_argument("--repeat-ticks", type=int, default=60, help="no repetir el mismo par antes de N ticks")
     p.add_argument("--max-pairs", type=int, default=6)
+    p.add_argument("--leads", action="store_true", help="si no hay pareja, anunciar órdenes vigentes de un solo lado")
+    p.add_argument("--max-leads", type=int, default=3)
+    p.add_argument("--leads-json", default=None, help="exportar órdenes unilaterales (ruta o - para stdout)")
     p.add_argument("--near-extra", type=int, default=0, help="P extra de hueco admitido sobre la comisión del Rastro")
     p.add_argument("--min-ticks-left", type=int, default=2, help="ignorar ofertas que caducan antes")
     p.add_argument("--min-interval", type=float, default=0.4, help="segundos mínimos entre peticiones")
