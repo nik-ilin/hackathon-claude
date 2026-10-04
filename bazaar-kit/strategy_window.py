@@ -62,7 +62,13 @@ _NEWS_DB = os.environ.get("NEWS_DB", "")
 # --allow-last-copy SAL-07/--pilar-last-copy/--deny-margin que el preset ya tenía. Solo se añaden aquí
 # los flags propios de la ejecución desatendida (--execute, --max-spend, --allow-concurrent, etc.) que
 # no tiene sentido meter en el preset compartido.
-BASE = ["./run.sh", "t15", "--execute", "--max-spend", "400", "--allow-concurrent",
+BASE = ["./run.sh", "t15", "--execute", "--max-spend", "700", "--allow-concurrent",
+        # 4 oct 13:51, recta final: --max-spend 400 volvió a ser el límite vinculante (spent_session 353,
+        # quedaban 47 P de margen) con 223 P de caja táctica libre sin usar y la campaña CHA activa
+        # generando pujas constantes. Es un tope de RITMO para no gastar todo de golpe al principio del día;
+        # a esta hora (cierra en ~1h) ya no protege nada que --reserve/--margin/el guard de la campaña no
+        # protejan ya por su cuenta. Subir a 700 (> caja total 300 P) lo deja de ser el cuello de botella
+        # sin tocar ninguna de las comprobaciones de seguridad por operación (siguen exigiendo ΔU ≥ margen).
         # 4 oct 13:15: --page-campaign estaba en "none" (desactivado) con 4 páginas completas (RET/LAV/LAT/SAL)
         # y CHA en 0/11 (hueco total) + MAL a 1 carta de completarse (MAL-11). "auto" deja que pc.choose_page
         # decida con el presupuesto REAL restante cuál de las dos es más viable, en vez de forzar una a ciegas;
