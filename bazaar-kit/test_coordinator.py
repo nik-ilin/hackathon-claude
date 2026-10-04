@@ -62,7 +62,7 @@ class Policies(unittest.TestCase):
         self.assertEqual((d.action, d.price), ("counter", 5))
         msgs = [her(1, 41, 12, "cancelled"), ours(2, 41, 5), her(3, 42, 12)]
         d = neg.decide_dealer(self.st(msgs, 42), pol, 11, 7)
-        self.assertEqual((d.action, d.price), ("counter", 8))  # 5 + ceil(0.30 * 7): no pasos de 1 P
+        self.assertEqual((d.action, d.price), ("counter", 7))  # 5 + ceil(0.20 * 7): no pasos de 1 P
         stalled = msgs[:2] + [her(3, 42, 12, "cancelled"), ours(4, 42, 8), her(5, 43, 12, "cancelled"),
                               ours(6, 43, 11), her(7, 44, 12)]
         self.assertEqual(neg.decide_dealer(self.st(stalled, 44), pol, 20, 5).action, "abandon",

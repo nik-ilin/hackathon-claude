@@ -41,12 +41,13 @@ case "${1:-}" in
             --no-rival-venues --duende-venue rastro \
             --dealer-sell-dups --ladder-fill --ladder-calibrated --chato-mirror auto \
             --dedupe-bids "$@" ;;
-  t15)    shift; exec python3 coordinator.py --reserve 5 --per-card 95 --margin 2 \
+  t15)    shift; exec python3 coordinator.py --reserve 5 --per-card 150 --margin 2 \
             --no-rival-venues --duende-venue rastro \
             --deny-teams t05,t14,t12,t10,t18 --deny-margin 15 \
             --ladder-fill --ladder-calibrated --dealer-sell-dups --dedupe-bids \
             --pilar-sell SAL,LAV:1.25 --pilar-last-copy --allow-last-copy SAL-07 \
-            --news-sell --chato-mirror on --fever-priority "$@" ;;
+            --news-sell --chato-mirror on --fever-priority \
+            --dealer-banco --ernesto "$@" ;;
   broker) exec python3 starter_broker.py ;;
   market-broker) shift; exec python3 market_broker.py "$@" ;;
   duels) shift; exec python3 duel_runner.py "$@" ;;
