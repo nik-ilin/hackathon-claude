@@ -9,7 +9,9 @@ class StrategyV3Tests(unittest.TestCase):
                 "feed_health": {"status": "fresh", "last_tick": 25},
                 "market_activity": {"own_venue": "v15", "own_venue_name": "Puesto Team 15",
                                     "my_open_offers": [{"id": 1}], "incoming_offers": [{"id": 2}],
-                                    "own_market_offers": [{"id": 3}], "summary": {"my_open_offers": 1}},
+                                    "own_market_offers": [{"id": 3, "to": "t04"}, {"id": 4}], "summary": {"my_open_offers": 1}},
+                "clock": {"tick": 25, "tick_seconds": 15},
+                "tick_time_context": {"tick": 25, "captured_at": 1234, "samples": []},
                 "trades": [], "history": []}
         v2 = {"operations": {}, "scoring": {}, "ranking": {"position": 4},
               "strategy_health": {}, "market_activity": data["market_activity"],
@@ -19,10 +21,13 @@ class StrategyV3Tests(unittest.TestCase):
         self.assertTrue(result["snapshot"]["read_only"])
         self.assertEqual(result["sections"]["overview"]["my_offers"], [{"id": 1}])
         self.assertEqual(result["sections"]["overview"]["incoming_offers"], [{"id": 2}])
-        self.assertEqual(result["sections"]["overview"]["public_offers"], [{"id": 3}])
+        self.assertEqual(result["sections"]["overview"]["public_offers"], [{"id": 3, "to": "t04"}, {"id": 4}])
         self.assertEqual(result["sections"]["overview"]["cards"], [{"ref": "LAT-01"}])
         self.assertEqual(result["sections"]["operations"]["my_offers"], [{"id": 1}])
         self.assertEqual(result["sections"]["operations"]["incoming_offers"], [{"id": 2}])
+        self.assertIn("TEAM 15 MARKET · v15", result["sections"]["overview"]["group_share_message"])
+        self.assertNotIn("t04", result["sections"]["overview"]["group_share_message"])
+        self.assertEqual(result["sections"]["market"]["snapshot"]["tick_time_context"]["tick"], 25)
 
 
 if __name__ == "__main__":

@@ -48,6 +48,16 @@ def duel_watch(duels: list[dict], tick: int | None) -> dict:
             except (KeyError, TypeError, ValueError):
                 total_margin = None
         safe = price_margin is not None and price_margin >= 0 and total_margin is not None and total_margin > 0
+        recent = [m.get("price") for m in d.get("messages") or []
+                  if m.get("from") == d.get("rival") and _number(m.get("price")) is not None]
+        if len(recent) >= 2:
+            improvement = (recent[-1] - recent[-2]) * (1 if role == "buyer" else -1)
+            trend = "WORSENING" if improvement < 0 else "IMPROVING" if improvement > 0 else "STALLED"
+        else:
+            trend = "UNKNOWN"
+        vanish_risk = (1.0 if left <= counts[d["deadline_tick"]] + 1 else
+                       min(0.95, ({"WORSENING": 0.5, "STALLED": 0.2, "UNKNOWN": 0.1}.get(
+                           trend, 0.05) + 0.5 / max(1, left)))) if safe else 0.0
         if left == 0:
             state, action = "expired", "Verificar resultado"
         elif not safe and price is None:
@@ -62,9 +72,20 @@ def duel_watch(duels: list[dict], tick: int | None) -> dict:
                      "ticks_left": left, "same_deadline": counts[d["deadline_tick"]],
                      "rival_price": price, "rival_day": offer.get("days"),
                      "price_margin": price_margin, "total_margin": total_margin,
+                     "observed_result": (d.get("result") if d.get("status") != "live" else None),
+                     "vanish_risk": round(vanish_risk, 3),
+                     "trend": trend,
+                     "expected_capture_at_risk": round(max(0.0, total_margin) * vanish_risk, 2) if safe else 0.0,
                      "days_known": days_known, "safe_to_accept": safe,
                      "state": state, "action": action,
                      "source": "/api/duels", "observed_tick": tick})
+    # The single acceptance slot is most valuable for offers that are safe and
+    # likely to disappear; break ties by the positive surplus exposed.
+    rows.sort(key=lambda row: (0 if row["state"] == "close_now" else
+                               1 if row["safe_to_accept"] else 2,
+                               -row["expected_capture_at_risk"], row["deadline_tick"], str(row["duel"])))
+    for index, row in enumerate(rows, 1):
+        row["priority_rank"] = index
     return {"status": "ok", "live": len(rows), "safe": sum(r["safe_to_accept"] for r in rows),
             "urgent": sum(r["state"] == "close_now" for r in rows), "rows": rows,
             "accepts_per_tick": 1, "note": "La oferta puede cambiar; releer antes de aceptar."}
@@ -104,7 +125,7 @@ def decision_queue(duel: dict, capital: dict, market: dict, feed: dict, verified
     for row in duel.get("rows") or []:
         if row["state"] == "close_now":
             items.append({"priority": "critical", "topic": "duels", "action": f"Revisar y cerrar duelo {row['duel']}",
-                          "evidence": f"{row['ticks_left']} ticks; {row['same_deadline']} duelos con ese plazo; margen {row['total_margin']} P"})
+                          "evidence": f"{row['ticks_left']} ticks; {row['same_deadline']} duelos con ese plazo; margen neto {row['total_margin']} P; captura expuesta ≈ {row['expected_capture_at_risk']} P (proxy, no leaderboard)"})
     if feed.get("status") != "fresh":
         delay = feed.get("ticks_behind")
         items.append({"priority": "high", "topic": "data", "action": "Actualizar recolector del feed",

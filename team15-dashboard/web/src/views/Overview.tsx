@@ -1,7 +1,7 @@
 import { Gauge } from 'lucide-react'
 import type { EChartsOption } from 'echarts'
 import type { JsonRecord } from '../lib/types'
-import { num, points } from '../lib/format'
+import { num, points, tickDateTime } from '../lib/format'
 import { ChartPanel, MetricTable } from '../components/Chart'
 import { MyListings } from '../components/MyListings'
 import { Empty, Panel, SourceTag, Stat } from '../components/Panel'
@@ -46,7 +46,7 @@ export function Overview({ data }: { data: JsonRecord }) {
   return <div className="view-stack">
     <div className="page-intro"><div><p className="eyebrow">Team 15 / centro de mando</p><h1>Estado de la partida</h1>
       <p>Score, movimiento del ranking y siguiente oportunidad en una sola lectura.</p></div>
-      <div className="intro-tools"><span className="tick-stamp">Tick {ranking.tick ?? data.snapshot?.tick ?? '—'}</span>
+      <div className="intro-tools"><span className="tick-stamp">Tick {ranking.tick ?? data.snapshot?.tick ?? '—'} · {tickDateTime(data.snapshot?.tick, data.snapshot?.tick_time_context).label}</span>
         <span className="updated-at"><Gauge size={14} />{data.snapshot?.captured_at ? new Date(data.snapshot.captured_at * 1000).toLocaleTimeString('es-ES') : 'Sin hora'}</span></div>
     </div>
     <section className="score-ribbon" aria-label="Posición de Team 15">
@@ -92,7 +92,7 @@ export function Overview({ data }: { data: JsonRecord }) {
         })} />
       </Panel>
     </div>
-    <MyListings offers={data.my_offers || []} incoming={data.incoming_offers || []} publicOffers={data.public_offers || []}
-      cards={data.cards || []} venue={data.own_venue || {}} tick={data.snapshot?.tick} />
+    <MyListings offers={data.my_offers || []} venue={data.own_venue || {}} tick={data.snapshot?.tick}
+      shareMessage={data.group_share_message} />
   </div>
 }

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Callable
 
+import market_activity
+
 
 SECTION_SOURCES = {
     "overview": ["/api/me", "/api/leaderboard", "/api/clock", "local:score_history"],
@@ -43,7 +45,8 @@ def export(data: dict, v2_export: Callable[[dict], dict]) -> dict:
     }
     snapshot = {"id": f"t15-{data.get('tick', 'unknown')}", "team": "t15", "tick": data.get("tick"),
                 "captured_at": data.get("built_at"), "verified_private_data": bool(data.get("verified")),
-                "read_only": True}
+                "read_only": True, "clock": data.get("clock") or {},
+                "tick_time_context": data.get("tick_time_context") or {}}
     sections = {
         "overview": {"ranking": rankings, "scoring": scoring, "top_actions": (data.get("trades") or [])[:6],
                      "opportunities": opportunities[:6], "capital": ops.get("capital"),
@@ -51,6 +54,7 @@ def export(data: dict, v2_export: Callable[[dict], dict]) -> dict:
                      "my_offers": activity.get("my_open_offers") or [],
                      "incoming_offers": activity.get("incoming_offers") or [],
                      "public_offers": activity.get("own_market_offers") or [],
+                     "group_share_message": market_activity.group_share_message(activity),
                      "cards": v2.get("cards") or [],
                      "my_sales": activity.get("my_active_sales") or [],
                      "own_venue": {"id": activity.get("own_venue"), "name": activity.get("own_venue_name")},
@@ -87,6 +91,8 @@ def export(data: dict, v2_export: Callable[[dict], dict]) -> dict:
         "agents": {"health": strategy_health, "operations": ops, "sources": sources,
                    "history": data.get("history_summary") or {}},
     }
+    for section_data in sections.values():
+        section_data["snapshot"] = snapshot
     return {"schema": "team15.dashboard.v3", "snapshot": snapshot, "sources": sources,
             "sections": sections, "definitions": v2.get("definitions") or {}}
 

@@ -1,6 +1,6 @@
 import type { EChartsOption } from 'echarts'
 import type { JsonRecord } from '../lib/types'
-import { num, points } from '../lib/format'
+import { num, points, tickDateTime } from '../lib/format'
 import { ChartPanel, MetricTable } from '../components/Chart'
 import { Empty, Panel, Stat } from '../components/Panel'
 
@@ -28,7 +28,7 @@ export function Ranking({ data, history }: { data: JsonRecord; history: JsonReco
   const peer = order[(ranking.position || 1) - 2]
   const our = order.find((t: JsonRecord) => t.team === 't15')
   return <div className="view-stack">
-    <div className="page-intro"><div><p className="eyebrow">Puntuación pública y desglose privado</p><h1>Carrera del leaderboard</h1><p>Brechas, componentes e histórico de los 18 equipos.</p></div><span className="tick-stamp">{ranking.source === 'history' ? `Captura tick ${ranking.observed_tick}` : `Tick ${data.snapshot?.tick ?? '—'}`}</span></div>
+    <div className="page-intro"><div><p className="eyebrow">Puntuación pública y desglose privado</p><h1>Carrera del leaderboard</h1><p>Brechas, componentes e histórico de los 18 equipos.</p></div><span className="tick-stamp">{ranking.source === 'history' ? `Captura tick ${ranking.observed_tick}` : `Tick ${data.snapshot?.tick ?? '—'}`} · {tickDateTime(data.snapshot?.tick, data.snapshot?.tick_time_context).label}</span></div>
     {ranking.source === 'history' && <div className="data-quality-banner" role="status"><span className="quality-indicator" />Ranking en vivo no disponible; tabla y brechas muestran la última captura completa del tick {ranking.observed_tick}.</div>}
     <div className="stat-grid"><Stat label="Puesto Team 15" value={`${ranking.position ?? '—'} / ${ranking.teams_count ?? '—'}`} note={`Score público ${points(ranking.score)}`} />
       <Stat label="Brecha al puesto de arriba" value={`${num(ranking.gap_to_next_position ?? (peer && our ? peer.score - our.score : null))} P`} tone="warn" note={peer ? `${peer.team.toUpperCase()} · ${points(peer.score)}` : '—'} />
