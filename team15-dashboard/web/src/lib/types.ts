@@ -3,7 +3,7 @@ export type JsonRecord = Record<string, any>
 export interface V3Envelope<T = JsonRecord> {
   schema: string
   section: string
-  snapshot: { id: string; team: string; tick: number | null; captured_at: number | null; verified_private_data: boolean; read_only: true }
+  snapshot: { id: string; team: string; tick: number | null; captured_at: number | null; verified_private_data: boolean; read_only: true; clock?: JsonRecord; tick_time_context?: JsonRecord }
   sources: Record<string, JsonRecord>
   data: T
 }

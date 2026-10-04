@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import html
 
+import tick_time
+
 
 def _e(value):
     return html.escape("" if value is None else str(value), quote=True)
@@ -32,7 +34,8 @@ def _kind(give: dict, want: dict) -> str:
 
 
 def build(venues: list[dict], boards: dict[str, list[dict]], own_offers: list[dict],
-          team: str = "t15", tick: int | None = None) -> dict:
+          team: str = "t15", tick: int | None = None, *, clock: dict | None = None,
+          captured_at: float | None = None, time_samples: list[dict] | None = None) -> dict:
     venue_map = {v.get("venue"): v for v in venues or [] if v.get("venue")}
     own_venue = next((v.get("venue") for v in venues or [] if v.get("owner") == team), None)
     rows = []
@@ -67,6 +70,9 @@ def build(venues: list[dict], boards: dict[str, list[dict]], own_offers: list[di
         venue_id = row.get("venue")
         venue = venue_map.get(venue_id) or {}
         expires = row.get("expires_tick")
+        expiry_time = tick_time.estimate(int(expires) if expires is not None else None,
+                                         current_tick=tick, captured_at=captured_at,
+                                         clock=clock, samples=time_samples)
         return {
             "id": row.get("id"), "venue": venue_id,
             "venue_name": venue.get("name") or ("El Rastro" if venue_id == "rastro" else venue_id or "—"),
@@ -76,6 +82,7 @@ def build(venues: list[dict], boards: dict[str, list[dict]], own_offers: list[di
             "cash_give": give_cash, "cash_want": want_cash,
             "fee_bps": venue.get("fee_bps"), "fee_per_card": venue.get("fee_per_card"),
             "expires_tick": expires,
+            "expires_at": expiry_time,
             "ticks_left": max(0, int(expires) - int(tick)) if expires is not None and tick is not None else None,
             "thread": row.get("thread"),
             "mine": row.get("maker") == team,
@@ -87,7 +94,10 @@ def build(venues: list[dict], boards: dict[str, list[dict]], own_offers: list[di
     incoming = [r for r in account_offers if not r["mine"]]
     own_market = [r for r in offers if r["venue"] == own_venue]
     my_sales = [r for r in my_posts if r["kind"] == "Venta"]
-    return {"tick": tick, "own_venue": own_venue,
+    return {"tick": tick, "tick_time": tick_time.estimate(tick, current_tick=tick,
+                                                            captured_at=captured_at,
+                                                            clock=clock, samples=time_samples),
+            "own_venue": own_venue,
             "own_venue_name": (venue_map.get(own_venue) or {}).get("name") or own_venue or "—",
             "my_open_offers": my_posts, "my_active_sales": my_sales,
             "incoming_offers": incoming,
@@ -98,6 +108,42 @@ def build(venues: list[dict], boards: dict[str, list[dict]], own_offers: list[di
                         "own_market_by_others": sum(not r["mine"] for r in own_market),
                         "open_offers_total": len(offers),
                         "active_venues": len({r["venue"] for r in offers})}}
+
+
+def group_share_message(activity: dict, team: str = "t15") -> str:
+    """Copyable group post from the public own-venue book only."""
+    venue_id = activity.get("own_venue") or "v15"
+    venue_name = activity.get("own_venue_name") or "Team 15 market"
+    tick = activity.get("tick")
+    offers = [row for row in activity.get("own_market_offers") or []
+              if not row.get("to") and row.get("venue", venue_id) == venue_id]
+
+    def side_text(cards, cash):
+        values = [str(card) for card in cards or []]
+        if cash:
+            values.append(f"{int(cash)} P")
+        return " + ".join(values) or "—"
+
+    current_time = activity.get("tick_time") or {}
+    stamp = (f"tick {tick if tick is not None else '—'} · {current_time['label']}" if current_time.get("label")
+             else f"tick {tick if tick is not None else '—'}")
+    lines = [f"🏪 TEAM 15 MARKET · {venue_id}", f"📍 {venue_name}",
+             f"🕒 Public book · {stamp}", "",
+             f"📌 LIVE PUBLIC OFFERS ({len(offers)}):"]
+    if offers:
+        for offer in offers:
+            maker = "Team 15" if offer.get("mine") else str(offer.get("maker") or "Another team").upper()
+            gives = side_text(offer.get("gives"), offer.get("cash_give"))
+            wants = side_text(offer.get("wants"), offer.get("cash_want"))
+            exp_time = offer.get("expires_at") or {}
+            expiry_date = f" · t{offer['expires_tick']} · {exp_time['label']}" if exp_time.get("label") else ""
+            expiry = (f" · {int(offer['ticks_left'])} ticks left" if offer.get("ticks_left") is not None else "") + expiry_date
+            lines.append(f"• {maker} · {offer.get('kind') or 'Offer'}: {gives} → {wants}{expiry}")
+    else:
+        lines.append("• No live public offers at this snapshot.")
+    lines += ["", "🔄 Have a missing card or a spare? Post a public offer on v15 — card-for-card swaps welcome. "
+              "We can help spot matches between teams and complete sets."]
+    return "\n".join(lines)
 
 
 def render(data: dict) -> str:

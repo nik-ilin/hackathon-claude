@@ -36,6 +36,7 @@ import scoring
 import strategy_health
 import strategy_v3
 import trade_history
+import tick_time
 from planner import build_rank
 from history_store import HistoryStore
 
@@ -270,10 +271,13 @@ class Model:
         rank["warnings"] = warnings + public.errors + rank["warnings"]
         rank["board_count"] = sum(map(len, boards.values()))
         rank["venue_count"] = len(boards)
-        rank["market_activity"] = market_activity.build(
-            venues, boards, own_offers, self.team, int(public.clock.get("tick") or 0) or None)
         rank["built_at"] = time.time()
         rank["clock"] = public.clock
+        tick_samples = self.dashboard_history.ticks(limit=5000)
+        rank["tick_time_context"] = tick_time.context(public.clock, rank["built_at"], tick_samples)
+        rank["market_activity"] = market_activity.build(
+            venues, boards, own_offers, self.team, int(public.clock.get("tick") or 0) or None,
+            clock=public.clock, captured_at=rank["built_at"], time_samples=tick_samples)
         rank["live"] = bool(me)
         rank["leaderboard"] = public.leaderboard
         tick_now = int(public.clock.get("tick") or 0) or None
@@ -285,6 +289,13 @@ class Model:
                                                 offers=own_offers, reserve=self.reserve,
                                                 venues=venues, feed_health=rank["feed_health"],
                                                 verified=bool(rank.get("verified")), team=self.team)
+        if tick_now:
+            for duel in rank["operations"].get("duels", {}).get("rows", []):
+                deadline = duel.get("deadline_tick")
+                duel["deadline_time"] = tick_time.estimate(
+                    int(deadline) if deadline is not None else None,
+                    current_tick=tick_now, captured_at=rank["built_at"],
+                    clock=public.clock, samples=tick_samples)
         if me and time.time() - self.done_at >= 60:
             try:
                 self.done_cache = self.reader.get('/api/duels?done=true', private=True).get('duels') or []
@@ -327,6 +338,9 @@ class Model:
             self.dashboard_history.record(rank)
         except (OSError, ValueError, TypeError) as exc:
             rank["warnings"].append(f"Histórico detallado del dashboard: {type(exc).__name__}")
+        # Include the current tick in the UI's interpolation context after recording it.
+        rank["tick_time_context"] = tick_time.context(
+            public.clock, rank["built_at"], self.dashboard_history.ticks(limit=5000))
         return rank
 
 
@@ -1339,92 +1353,7 @@ def render_strategy_health(data: dict) -> str:
     own_market_name = market_activity_data.get('own_venue_name') or 'Mercado Team 15'
     own_market_offers = market_activity_data.get('own_market_offers') or []
     incoming_offers = market_activity_data.get('incoming_offers') or []
-    catalog_by_ref = {row.get('ref'): row for row in data.get('catalog_rows') or [] if row.get('ref')}
-    def share_side(cards, cash):
-        values = [str(value) for value in cards or []]
-        if cash:
-            values.append(fmt(cash) + ' P')
-        return ' + '.join(values) or '—'
-    def opportunity_note(offer):
-        refs = (offer.get('gives') or []) + (offer.get('wants') or [])
-        card = catalog_by_ref.get(refs[0]) if len(refs) == 1 else None
-        if not card:
-            return 'No single-card private comparison is available.'
-        if offer.get('kind') == 'Venta' and not offer.get('mine'):
-            ask = offer.get('cash_want')
-            cap = card.get('buy_ceiling')
-            if isinstance(ask, (int, float)) and isinstance(cap, (int, float)):
-                return (f'Ask is {fmt(ask - cap)} P above our {fmt(cap)} P private buy cap; '
-                        f'not profitable for Team 15 at this price. '
-                        f'Observed sale median {fmt(card.get("sold_median"))} P '
-                        f'(n={fmt(card.get("sold_count", 0))}).')
-            return 'Private buy cap is unavailable; verify before offering.'
-        if offer.get('kind') == 'Venta' and offer.get('mine'):
-            ask = offer.get('cash_want')
-            floor = card.get('sell_floor')
-            if isinstance(ask, (int, float)) and isinstance(floor, (int, float)):
-                verdict = f'{fmt(ask - floor)} P above' if ask >= floor else f'{fmt(floor - ask)} P below'
-                note = f'Our ask is {verdict} the {fmt(floor)} P private sale floor.'
-                if card.get('sell_breaks_page'):
-                    note += ' Selling risks breaking a collection page.'
-                return note
-        if offer.get('kind') == 'Compra':
-            ref = next(iter(offer.get('wants') or []), None)
-            card = catalog_by_ref.get(ref) if ref else None
-            bid = offer.get('cash_give')
-            if card and isinstance(bid, (int, float)):
-                floor = card.get('sell_floor')
-                if offer.get('mine'):
-                    cap = card.get('buy_ceiling')
-                    if isinstance(cap, (int, float)):
-                        return (f'Our bid is {fmt(bid)} P vs a {fmt(cap)} P private buy cap; '
-                                + ('within value.' if bid <= cap else f'{fmt(bid-cap)} P over cap.'))
-                if isinstance(floor, (int, float)):
-                    if (card.get('free') or 0) <= 0:
-                        return (f'We have no free copy; bid is {fmt(bid)} P vs a {fmt(floor)} P floor '
-                                'and selling would remove a held card.')
-                    if bid < floor:
-                        return f'Bid is {fmt(floor-bid)} P below our {fmt(floor)} P private sale floor.'
-                    return f'Bid meets our {fmt(floor)} P floor and a free copy is available.'
-        return 'Compare the cards, price and collection impact before accepting.'
-
-    def market_offer_line(offer):
-        who = 'Team 15' if offer.get('mine') else 'Another team'
-        expiry = f' · {offer["ticks_left"]} ticks left' if offer.get('ticks_left') is not None else ''
-        base = (f'• {who} · {offer.get("kind") or "Offer"}: '
-                f'{share_side(offer.get("gives"), offer.get("cash_give"))} → '
-                f'{share_side(offer.get("wants"), offer.get("cash_want"))}{expiry}')
-        return base + '\n  Why it matters: ' + opportunity_note(offer)
-
-    team_buy_posts = [offer for offer in my_open_offers if offer.get('kind') == 'Compra']
-    share_lines = [f'🏪 EL DUENDE · TEAM 15 · MARKET {own_market_id}', f'📍 {own_market_name}',
-                   f'🕒 Snapshot tick {data.get("tick") or "—"}', '',
-                   f'📌 PUBLIC OFFERS ON {own_market_id} ({len(own_market_offers)}):']
-    if own_market_offers:
-        share_lines.extend(market_offer_line(offer) for offer in own_market_offers)
-    else:
-        share_lines.append('• No active public offers at the latest refresh.')
-    share_lines += ['', f'🛒 WHAT TEAM 15 IS BUYING ({len(team_buy_posts)} active buy requests):']
-    if team_buy_posts:
-        share_lines.extend(market_offer_line(offer) for offer in team_buy_posts)
-    else:
-        share_lines.append('• No active Team 15 buy requests.')
-    share_lines += ['', f'📨 OFFERS ADDRESSED TO TEAM 15 ({len(incoming_offers)}):']
-    if incoming_offers:
-        share_lines.extend(market_offer_line(offer) for offer in incoming_offers)
-    else:
-        share_lines.append('• No incoming offers addressed to us.')
-    share_lines += ['', f'🧾 OUR OPEN LISTINGS ACROSS MARKETS ({len(my_open_offers)}):']
-    if my_open_offers:
-        for offer in my_open_offers:
-            place = offer.get('venue_name') or offer.get('venue') or 'Market unknown'
-            expiry = f' · expires in {offer["ticks_left"]} ticks' if offer.get('ticks_left') is not None else ''
-            share_lines.append(f'• {place} ({offer.get("venue") or "—"}) · {offer.get("kind") or "Offer"}: '
-                               f'{share_side(offer.get("gives"), offer.get("cash_give"))} → '
-                               f'{share_side(offer.get("wants"), offer.get("cash_want"))}{expiry}')
-    else:
-        share_lines.append('• No Team 15 listings currently open.')
-    copy_message = '\n'.join(share_lines)
+    copy_message = market_activity.group_share_message(market_activity_data, team='t15')
     return ('<section id="pulso" class="pulse"><div class="pulse-head"><div>'
             '<h2>Seguimiento de la estrategia</h2><p>Resultados confirmados y estado real de los agentes.</p>'
             '</div><span>La API decide el resultado; el historial local explica la ejecución</span></div>'
@@ -1443,7 +1372,8 @@ def render_strategy_health(data: dict) -> str:
             '<div class="quick-listings-head"><b>Mis publicaciones</b><span>' + fmt(len(my_open_offers)) + ' abiertas</span></div>'
             + listing_detail + (f'<p class="quick-listings-more">+{len(my_open_offers) - 3} más en el detalle</p>' if len(my_open_offers) > 3 else '')
             + '<button class="market-copy-button" type="button" data-copy-market="' + esc(copy_message) + '">'
-            '📋 Copiar estado del mercado</button><span class="market-copy-status" aria-live="polite"></span>'
+            '📋 Copiar mensaje para el grupo</button><span class="market-copy-status" aria-live="polite"></span>'
+            '<small class="copy-market-note">Comparte solo el libro público de v15; excluye valoraciones privadas, ofertas entrantes y otros mercados.</small>'
             + '<a href="#mercado-vivo">Ver todas y sus mercados</a>'
             f'<p class="pulse-note">Valor creado entre terceros: {fmt(score.get("mm_points"))} P. '
             'Invitar parejas con demanda real a publicar y cerrar aquí; el tráfico bruto no puntúa.</p>'
