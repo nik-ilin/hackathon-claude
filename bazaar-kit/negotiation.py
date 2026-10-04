@@ -449,7 +449,12 @@ DEALER_TRAITS = {
                     sell_open_mult=1.8, sell_gap_frac=0.40, sell_step=4),
     "pilar":   dict(open_frac=0.50, gap_frac=0.35, max_counteroffers=3, max_ticks=6,
                     sell_open_mult=2.2, sell_gap_frac=0.30, sell_step=2),
-    "picaros": dict(open_frac=0.50, gap_frac=0.40, max_counteroffers=2, max_ticks=5,
+    # 4 oct: max_counteroffers/max_ticks subidos de 2/5 a 3/7 (no toca open_frac/gap_frac, solo da una ronda
+    # más antes de rendirse). Tras subir --per-card/--max-spend hoy, picaros es el dealer con más hilos nuevos
+    # y el ratio de cierre global bajó (25/91 -> 25/95: los 4 hilos nuevos no cerraron ninguno); confianza MEDIA,
+    # sin log por-hilo que separe "agotamos rondas" de "el dealer nunca llegó a nuestro suelo", pero el riesgo es
+    # bajo porque no cambia la agresividad de precio, solo la paciencia.
+    "picaros": dict(open_frac=0.50, gap_frac=0.40, max_counteroffers=3, max_ticks=7,
                     sell_open_mult=2.0, sell_gap_frac=0.35, sell_step=3),
     # Don Ernesto (banco): paciencia 0.95 / astucia 0.95 / rigor 1.0 -> no se le gana por desgaste; una propuesta y
     # como mucho DOS contraofertas, luego se reevalúa. Sin observaciones propias todavía: valores prudentes, no medidos.
