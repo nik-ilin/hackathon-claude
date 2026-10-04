@@ -39,7 +39,7 @@ FAILURE_BACKOFF_SECONDS = 20
 # market.db del collector del equipo, para calibrar la fiabilidad de las fuentes de --news-sell (solo
 # lectura; opcional). Por defecto None en ejecuciones donde esa ruta no exista en el disco.
 _NEWS_DB = os.environ.get("NEWS_DB", "")
-BASE = ["./run.sh", "coord", "--execute", "--max-spend", "0", "--reserve", "5",
+BASE = ["./run.sh", "coord", "--execute", "--max-spend", "200", "--reserve", "5",
         "--duende-venue", "rastro", "--no-rival-venues", "--allow-concurrent",
         "--ladder-fill", "--ladder-calibrated", "--chato-mirror", "on", "--dealer-sell-dups",
         "--dedupe-bids", "--deny-teams", "t05,t12,t13,t14", "--page-campaign", "none",
@@ -63,21 +63,65 @@ def _read_env(path: Path) -> dict[str, str]:
     return env
 
 
+FINALE_SAFETY_MARGIN = dt.timedelta(minutes=5)  # los dealers se desactivan en el instante exacto del evento
+
+
+def _finale_target(now: dt.datetime, close_at: dt.datetime, clock: dict, schedule: dict) -> dt.datetime | None:
+    """Los dealers pueden desactivarse (evento `persona` "stalls close") o darse el último duelo
+    (`duels` cuyo nombre incluya "Final") ANTES del cierre general del día — hasta 1h antes, visto
+    el 4 oct. Calibra at_hours -> hora real con el propio `closes` como ancla (self.closes es el único
+    punto fijo fiable; `t_hours` no es 1:1 con horas reales entre días, varía con tick_seconds)."""
+    t_hours_now = clock.get("t_hours")
+    upcoming = schedule.get("upcoming") or []
+    close_ev = next((e for e in upcoming if e.get("action") == "day_closes"), None)
+    if t_hours_now is None or close_ev is None:
+        return None
+    t_hours_close = close_ev.get("at_hours")
+    real_seconds_to_close = (close_at - now).total_seconds()
+    t_hours_remaining = t_hours_close - t_hours_now
+    if not t_hours_remaining or t_hours_remaining <= 0:
+        return None
+    ratio = real_seconds_to_close / t_hours_remaining  # segundos reales por unidad t_hours
+    finale_ats = [e["at_hours"] for e in upcoming
+                  if (e.get("action") == "persona" and "stalls close" in (e.get("note") or "").lower())
+                  or (e.get("action") == "duels" and "final" in (e.get("params", {}).get("name") or "").lower())]
+    if not finale_ats:
+        return None
+    soonest = min(finale_ats)
+    return now + dt.timedelta(seconds=(soonest - t_hours_now) * ratio)
+
+
 def _live_target(default_target: dt.datetime) -> tuple[dt.datetime, float]:
-    """Lee /api/clock().closes para fijar el relevo al cierre real del día; 20:35 si falla."""
+    """Lee /api/clock() y /api/schedule() para fijar el relevo al evento real que corte antes:
+    el cierre del día o la desactivación de dealers/duelo final (visto el 4 oct: ~1h antes del
+    cierre general). Si algo falla, cae de vuelta a las 20:35."""
     try:
         import bazaar_sdk
         env = {**_read_env(HERE / ".env"), **os.environ}
         url, key = env.get("BAZAAR_URL", ""), env.get("BAZAAR_KEY", "")
         if not url or not key:
             raise RuntimeError("falta BAZAAR_URL/BAZAAR_KEY")
-        clock = bazaar_sdk.Bazaar(url, key, timeout=10, retries=2).clock()
+        sdk = bazaar_sdk.Bazaar(url, key, timeout=10, retries=2)
+        clock = sdk.clock()
         closes = clock.get("closes")
         tick_seconds = float(clock.get("tick_seconds") or 30.0)
         if not closes:
             raise RuntimeError("clock() sin 'closes'")
         close_at = dt.datetime.fromisoformat(closes)
-        return close_at - CLOSE_SAFETY_MARGIN, tick_seconds
+        target = close_at - CLOSE_SAFETY_MARGIN
+        now = dt.datetime.now(TZ)
+        try:
+            schedule = sdk.schedule()
+            finale_at = _finale_target(now, close_at, clock, schedule)
+            if finale_at is not None:
+                finale_target = finale_at - FINALE_SAFETY_MARGIN
+                if finale_target < target:
+                    print(f"AVISO: evento de cierre de dealers/duelo final en {finale_at.isoformat()}, "
+                          f"antes que el cierre general; adelanto el relevo.", flush=True)
+                    target = finale_target
+        except Exception as exc:
+            print(f"AVISO: no se pudo leer /api/schedule ({exc}); uso solo el cierre general.", flush=True)
+        return target, tick_seconds
     except Exception as exc:
         print(f"AVISO: no se pudo leer /api/clock en vivo ({exc}); uso relevo por defecto 20:35.", flush=True)
         return default_target, 30.0
