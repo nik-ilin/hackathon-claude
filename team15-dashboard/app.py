@@ -10,6 +10,7 @@ import argparse
 import html
 import importlib.util
 import json
+import mimetypes
 import os
 import statistics
 import sys
@@ -33,8 +34,10 @@ import market_activity
 import operations
 import scoring
 import strategy_health
+import strategy_v3
 import trade_history
 from planner import build_rank
+from history_store import HistoryStore
 
 # El kit también tiene radio.py; cargar el módulo del panel por ruta evita que
 # una importación previa del kit sustituya sus funciones en un proceso largo.
@@ -130,7 +133,7 @@ def settled_by_dealer(stores, team: str) -> dict:
 
 class Model:
     def __init__(self, reader: Reader, team: str = "t15", reserve: int = 100,
-                 feed_root: Path = KIT):
+                 feed_root: Path = KIT, history_retention_days: int = 90):
         self.reader, self.team, self.reserve = reader, team, reserve
         self.public = public_dashboard.Builder(reader, team=team, root=feed_root)
         self.history_path = Path(feed_root) / "data" / "score_history.jsonl"
@@ -143,6 +146,8 @@ class Model:
         self._dealer_cache = None
         self.done_cache = []
         self.done_at = 0.0
+        self.dashboard_history = HistoryStore(Path(feed_root) / "data" / "dashboard_history.sqlite3",
+                                              retention_days=history_retention_days)
 
     def _dealers(self) -> dict:
         if self._dealer_cache is None:
@@ -318,6 +323,10 @@ class Model:
                                 if row.get("team") == self.team), None)
             if public_team:
                 rank["score"] = {"score": public_team.get("score")}
+        try:
+            self.dashboard_history.record(rank)
+        except (OSError, ValueError, TypeError) as exc:
+            rank["warnings"].append(f"Histórico detallado del dashboard: {type(exc).__name__}")
         return rank
 
 
@@ -573,6 +582,18 @@ def render_rank_strategy(data: dict) -> str:
 
 
 
+def _last_complete_leaderboard(data: dict, team: str = "t15") -> tuple[list[dict], int | None]:
+    """Recover one coherent last-known public board when the live feed is partial."""
+    for sample in reversed(data.get("history") or []):
+        rivals = sample.get("rivals") or {}
+        if team in rivals and len(rivals) >= 3:
+            rows = [{"team": name, "score": score} for name, score in rivals.items()
+                    if isinstance(score, (int, float))]
+            if team in {row["team"] for row in rows}:
+                return rows, sample.get("tick")
+    return [], None
+
+
 def strategy_export(data: dict) -> dict:
     """Agent-friendly, evidence-preserving strategy payload."""
     rows = data.get('catalog_rows') or []
@@ -582,6 +603,10 @@ def strategy_export(data: dict) -> dict:
     missing = [r for r in released if r.get('stock') == 0]
     sold_values = [r['sold_median'] for r in sold]
     leaderboard_rows = (data.get('leaderboard') or {}).get('teams') or []
+    ranking_source, ranking_tick = "live", data.get("tick")
+    if not leaderboard_rows:
+        leaderboard_rows, ranking_tick = _last_complete_leaderboard(data)
+        ranking_source = "history" if leaderboard_rows else "unavailable"
     board_sorted = sorted([r for r in leaderboard_rows if isinstance(r.get('score'), (int, float))], key=lambda r: r.get('score', 0), reverse=True)
     rank_index = next((i for i, r in enumerate(board_sorted, 1) if r.get('team') == 't15'), None)
     current_score = next((r.get('score') for r in board_sorted if r.get('team') == 't15'), data.get('score', {}).get('score'))
@@ -589,6 +614,8 @@ def strategy_export(data: dict) -> dict:
     leader_score = board_sorted[0].get('score') if board_sorted else None
     ranking = {
         'position': rank_index, 'teams_count': len(board_sorted), 'score': current_score,
+        'source': ranking_source, 'observed_tick': ranking_tick,
+        'private_score': (data.get('score') or {}).get('score'),
         'gap_to_next_position': round(next_score - current_score, 2) if next_score is not None and current_score is not None else None,
         'gap_to_leader': round(leader_score - current_score, 2) if leader_score is not None and current_score is not None else None,
         'leaderboard_order': [{'team': r.get('team'), 'score': r.get('score')} for r in board_sorted],
@@ -632,9 +659,10 @@ def strategy_export(data: dict) -> dict:
         'freshness': {'snapshot_tick': data.get('tick'), 'built_at': data.get('built_at'), 'status': 'live' if data.get('live') else 'public_only', 'cache_max_age_seconds': 12},
         'ranking': ranking,
         'leaderboard_history': data.get('rank_race_all') or {},
-        'scoring': data.get('scoring') or {},
+        'scoring': (scoring.scoring_block(data.get('score') or {}, {'teams': board_sorted}, 't15')
+                    if board_sorted else data.get('scoring') or {}),
         'ladder': data.get('ladder') or {},
-        'peers': data.get('peers') or {},
+        'peers': scoring.peers_block({'teams': board_sorted}, 't15') if board_sorted else data.get('peers') or {},
         'feed_health': data.get('feed_health') or {},
         'operations': data.get('operations') or {},
         'market_activity': data.get('market_activity') or {},
@@ -1136,6 +1164,10 @@ CSS += """
 .market-live-columns{display:grid;grid-template-columns:1fr 1fr;gap:14px}.market-live-block{min-width:0;padding:15px;border:1px solid var(--line);border-radius:14px;background:rgba(255,255,255,.75)}.market-live-block h3{margin:0 0 4px;font-size:16px}.market-live-block>p{min-height:30px;margin:0 0 12px;color:var(--muted);font-size:11px;line-height:1.4}.market-venue-group+.market-venue-group{margin-top:13px;padding-top:12px;border-top:1px solid var(--line)}.market-venue-title{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin:0 0 8px}.market-venue-title b{font-size:12px}.market-venue-title span{font-size:10px;color:var(--muted)}.market-offer-list{display:grid;gap:8px}.market-offer-card{padding:11px;border:1px solid var(--line);border-radius:11px;background:#fff}.market-offer-top,.market-offer-foot{display:flex;justify-content:space-between;align-items:center;gap:8px}.market-offer-id{font-size:9px;font-weight:800;letter-spacing:.06em;color:var(--muted)}.market-kind,.market-owner-badge{display:inline-block;margin-left:5px;padding:3px 7px;border-radius:999px;background:#eaf3f1;color:#176966;font-size:9px;font-weight:800}.market-owner-badge{background:#fff2d6;color:#885b06}.market-maker{font-size:10px;color:var(--muted);text-align:right}.market-exchange{display:grid;grid-template-columns:minmax(0,1fr) 22px minmax(0,1fr);align-items:center;gap:8px;margin:11px 0}.market-exchange>div{min-width:0;padding:9px;border-radius:8px;background:#f5f8f7}.market-exchange small{display:block;margin-bottom:4px;color:var(--muted);font-size:9px;font-weight:700;letter-spacing:.04em}.market-exchange b{display:block;overflow-wrap:anywhere;font-size:13px}.market-arrow{text-align:center;color:var(--teal);font-weight:800}.market-offer-foot{padding-top:7px;border-top:1px solid #edf0ef;color:var(--muted);font-size:9px}.market-live details[open] summary{border-bottom:1px solid var(--line)}@media(max-width:900px){.market-live-columns{grid-template-columns:1fr}}@media(max-width:520px){.market-live-kpis{grid-template-columns:1fr 1fr}.market-live-headline{align-items:flex-start;flex-direction:column}.market-offer-top,.market-offer-foot{align-items:flex-start;flex-direction:column}.market-maker{text-align:left}.market-exchange{grid-template-columns:1fr 18px 1fr}}
 """
 
+CSS += """
+.quick-listings-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin:13px 0 6px;padding-top:11px;border-top:1px solid var(--line)}.quick-listings-head b{font-size:12px}.quick-listings-head>span{font-size:10px;font-weight:750;color:var(--teal)}.quick-listing{display:grid;gap:4px;padding:7px 0;border-bottom:1px solid #e9efeb}.quick-listing>span{display:flex;justify-content:space-between;align-items:baseline;gap:8px}.quick-listing>span b{font-size:10px;color:var(--ink-2)}.quick-listing small{font-size:9px;color:var(--muted)}.quick-listing strong{font-size:10px;color:var(--ink);overflow-wrap:anywhere}.quick-listing strong i{font-style:normal;color:var(--teal);padding:0 3px}.quick-listing-empty,.quick-listings-more{margin:4px 0;color:var(--muted);font-size:10px;line-height:1.4}.market-copy-button{align-self:flex-start;margin-top:10px;padding:8px 11px;border:1px solid #b9d4cb;border-radius:9px;background:#f0f7f3;color:#205f4d;font-size:11px;font-weight:750;cursor:pointer}.market-copy-button:hover{background:#e5f1eb}.market-copy-button:focus-visible{outline:3px solid #c8a75e;outline-offset:2px}.market-copy-status{min-height:14px;margin-top:3px;color:#28634f;font-size:10px}.market-pulse>a{display:inline-block;margin-top:8px}
+"""
+
 def render_operations(data: dict) -> str:
     op = data.get('operations') or {}
     duel, capital, market = (op.get('duels') or {}), (op.get('capital') or {}), (op.get('market') or {})
@@ -1261,6 +1293,8 @@ def render_strategy_health(data: dict) -> str:
     learner = state.get('duel_learning') or {}
     execution = state.get('execution') or {}
     market = ((data.get('operations') or {}).get('market') or {})
+    market_activity_data = data.get('market_activity') or {}
+    my_open_offers = market_activity_data.get('my_open_offers') or []
     score = data.get('scoring') or {}
     sessions = []
     for row in duels.get('sessions') or []:
@@ -1286,6 +1320,111 @@ def render_strategy_health(data: dict) -> str:
                       if execution.get('status') == 'running' else 'Agente operativo detenido')
     learner_text = ('Informe guardado: ' + fmt(learner.get('duels_done')) + ' duelos'
                     if learner.get('status') == 'saved_report' else 'Sin informe de aprendizaje')
+    listing_rows = []
+    for offer in my_open_offers[:3]:
+        gives = [str(value) for value in offer.get('gives') or []]
+        wants = [str(value) for value in offer.get('wants') or []]
+        if offer.get('cash_give'):
+            gives.append(fmt(offer['cash_give']) + ' P')
+        if offer.get('cash_want'):
+            wants.append(fmt(offer['cash_want']) + ' P')
+        listing_rows.append(
+            '<div class="quick-listing"><span><b>' + esc(offer.get('venue_name') or offer.get('venue') or 'Mercado sin identificar')
+            + '</b><small>' + esc(offer.get('venue') or '—') + ' · ' + esc(offer.get('kind') or 'Oferta') + '</small></span>'
+            '<strong>' + esc(' + '.join(gives) or 'Nada indicado') + ' <i>→</i> '
+            + esc(' + '.join(wants) or 'Nada indicado') + '</strong></div>')
+    listing_detail = (''.join(listing_rows) if listing_rows else
+                      '<p class="quick-listing-empty">No tienes publicaciones abiertas detectadas en este tick.</p>')
+    own_market_id = market_activity_data.get('own_venue') or '—'
+    own_market_name = market_activity_data.get('own_venue_name') or 'Mercado Team 15'
+    own_market_offers = market_activity_data.get('own_market_offers') or []
+    incoming_offers = market_activity_data.get('incoming_offers') or []
+    catalog_by_ref = {row.get('ref'): row for row in data.get('catalog_rows') or [] if row.get('ref')}
+    def share_side(cards, cash):
+        values = [str(value) for value in cards or []]
+        if cash:
+            values.append(fmt(cash) + ' P')
+        return ' + '.join(values) or '—'
+    def opportunity_note(offer):
+        refs = (offer.get('gives') or []) + (offer.get('wants') or [])
+        card = catalog_by_ref.get(refs[0]) if len(refs) == 1 else None
+        if not card:
+            return 'No single-card private comparison is available.'
+        if offer.get('kind') == 'Venta' and not offer.get('mine'):
+            ask = offer.get('cash_want')
+            cap = card.get('buy_ceiling')
+            if isinstance(ask, (int, float)) and isinstance(cap, (int, float)):
+                return (f'Ask is {fmt(ask - cap)} P above our {fmt(cap)} P private buy cap; '
+                        f'not profitable for Team 15 at this price. '
+                        f'Observed sale median {fmt(card.get("sold_median"))} P '
+                        f'(n={fmt(card.get("sold_count", 0))}).')
+            return 'Private buy cap is unavailable; verify before offering.'
+        if offer.get('kind') == 'Venta' and offer.get('mine'):
+            ask = offer.get('cash_want')
+            floor = card.get('sell_floor')
+            if isinstance(ask, (int, float)) and isinstance(floor, (int, float)):
+                verdict = f'{fmt(ask - floor)} P above' if ask >= floor else f'{fmt(floor - ask)} P below'
+                note = f'Our ask is {verdict} the {fmt(floor)} P private sale floor.'
+                if card.get('sell_breaks_page'):
+                    note += ' Selling risks breaking a collection page.'
+                return note
+        if offer.get('kind') == 'Compra':
+            ref = next(iter(offer.get('wants') or []), None)
+            card = catalog_by_ref.get(ref) if ref else None
+            bid = offer.get('cash_give')
+            if card and isinstance(bid, (int, float)):
+                floor = card.get('sell_floor')
+                if offer.get('mine'):
+                    cap = card.get('buy_ceiling')
+                    if isinstance(cap, (int, float)):
+                        return (f'Our bid is {fmt(bid)} P vs a {fmt(cap)} P private buy cap; '
+                                + ('within value.' if bid <= cap else f'{fmt(bid-cap)} P over cap.'))
+                if isinstance(floor, (int, float)):
+                    if (card.get('free') or 0) <= 0:
+                        return (f'We have no free copy; bid is {fmt(bid)} P vs a {fmt(floor)} P floor '
+                                'and selling would remove a held card.')
+                    if bid < floor:
+                        return f'Bid is {fmt(floor-bid)} P below our {fmt(floor)} P private sale floor.'
+                    return f'Bid meets our {fmt(floor)} P floor and a free copy is available.'
+        return 'Compare the cards, price and collection impact before accepting.'
+
+    def market_offer_line(offer):
+        who = 'Team 15' if offer.get('mine') else 'Another team'
+        expiry = f' · {offer["ticks_left"]} ticks left' if offer.get('ticks_left') is not None else ''
+        base = (f'• {who} · {offer.get("kind") or "Offer"}: '
+                f'{share_side(offer.get("gives"), offer.get("cash_give"))} → '
+                f'{share_side(offer.get("wants"), offer.get("cash_want"))}{expiry}')
+        return base + '\n  Why it matters: ' + opportunity_note(offer)
+
+    team_buy_posts = [offer for offer in my_open_offers if offer.get('kind') == 'Compra']
+    share_lines = [f'🏪 EL DUENDE · TEAM 15 · MARKET {own_market_id}', f'📍 {own_market_name}',
+                   f'🕒 Snapshot tick {data.get("tick") or "—"}', '',
+                   f'📌 PUBLIC OFFERS ON {own_market_id} ({len(own_market_offers)}):']
+    if own_market_offers:
+        share_lines.extend(market_offer_line(offer) for offer in own_market_offers)
+    else:
+        share_lines.append('• No active public offers at the latest refresh.')
+    share_lines += ['', f'🛒 WHAT TEAM 15 IS BUYING ({len(team_buy_posts)} active buy requests):']
+    if team_buy_posts:
+        share_lines.extend(market_offer_line(offer) for offer in team_buy_posts)
+    else:
+        share_lines.append('• No active Team 15 buy requests.')
+    share_lines += ['', f'📨 OFFERS ADDRESSED TO TEAM 15 ({len(incoming_offers)}):']
+    if incoming_offers:
+        share_lines.extend(market_offer_line(offer) for offer in incoming_offers)
+    else:
+        share_lines.append('• No incoming offers addressed to us.')
+    share_lines += ['', f'🧾 OUR OPEN LISTINGS ACROSS MARKETS ({len(my_open_offers)}):']
+    if my_open_offers:
+        for offer in my_open_offers:
+            place = offer.get('venue_name') or offer.get('venue') or 'Market unknown'
+            expiry = f' · expires in {offer["ticks_left"]} ticks' if offer.get('ticks_left') is not None else ''
+            share_lines.append(f'• {place} ({offer.get("venue") or "—"}) · {offer.get("kind") or "Offer"}: '
+                               f'{share_side(offer.get("gives"), offer.get("cash_give"))} → '
+                               f'{share_side(offer.get("wants"), offer.get("cash_want"))}{expiry}')
+    else:
+        share_lines.append('• No Team 15 listings currently open.')
+    copy_message = '\n'.join(share_lines)
     return ('<section id="pulso" class="pulse"><div class="pulse-head"><div>'
             '<h2>Seguimiento de la estrategia</h2><p>Resultados confirmados y estado real de los agentes.</p>'
             '</div><span>La API decide el resultado; el historial local explica la ejecución</span></div>'
@@ -1301,6 +1440,11 @@ def render_strategy_health(data: dict) -> str:
             f'<strong>{fmt(score.get("market"))}<small> / 30</small></strong></div>'
             f'<div class="market-hero"><b>{fmt(market.get("trades"))}</b><span>tratos de terceros en '
             f'{esc(market.get("venue") or "nuestro venue")}</span></div>'
+            '<div class="quick-listings-head"><b>Mis publicaciones</b><span>' + fmt(len(my_open_offers)) + ' abiertas</span></div>'
+            + listing_detail + (f'<p class="quick-listings-more">+{len(my_open_offers) - 3} más en el detalle</p>' if len(my_open_offers) > 3 else '')
+            + '<button class="market-copy-button" type="button" data-copy-market="' + esc(copy_message) + '">'
+            '📋 Copiar estado del mercado</button><span class="market-copy-status" aria-live="polite"></span>'
+            + '<a href="#mercado-vivo">Ver todas y sus mercados</a>'
             f'<p class="pulse-note">Valor creado entre terceros: {fmt(score.get("mm_points"))} P. '
             'Invitar parejas con demanda real a publicar y cerrar aquí; el tráfico bruto no puntúa.</p>'
             '<a href="#ranking">Ver oportunidades de negociación</a></article>'
@@ -1491,6 +1635,10 @@ def render(data: dict) -> str:
               "if(tickPrev&&tickNow>tickPrev){const jump=document.querySelector('.jump');const note=document.createElement('span');note.className='refresh-diff';note.textContent='+'+(tickNow-tickPrev)+' ticks nuevos';jump.appendChild(note)}"
               "sessionStorage.setItem('t15.last_tick',String(tickNow));"
               "pause.addEventListener('change',()=>sessionStorage.setItem('t15.pause',pause.checked?'1':'0'));",
+              "document.querySelectorAll('.market-copy-button').forEach(b=>b.addEventListener('click',async()=>{const status=b.nextElementSibling;"
+              "const text=b.dataset.copyMarket||'';try{await navigator.clipboard.writeText(text);status.textContent='Copied — ready to paste into WhatsApp.'}"
+              "catch(e){const area=document.createElement('textarea');area.value=text;area.style.position='fixed';area.style.opacity='0';document.body.appendChild(area);"
+              "area.select();const ok=document.execCommand('copy');area.remove();status.textContent=ok?'Copied — ready to paste into WhatsApp.':'Copy unavailable; select and copy from browser.'}}));",
               CATALOG_JS,
               "setInterval(()=>{if(!pause.checked)location.reload()},15000);",
               '</script></body></html>']
@@ -1499,9 +1647,12 @@ def render(data: dict) -> str:
 
 class Handler(BaseHTTPRequestHandler):
     model: Model = None
+    web_dist = HERE / "web" / "dist"
 
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        request = urllib.parse.urlsplit(self.path)
+        path = urllib.parse.unquote(request.path)
+        status = 200
         if path == "/healthz":
             body, typ, status = b"ok\n", "text/plain", 200
         elif path == "/api/strategy":
@@ -1510,13 +1661,61 @@ class Handler(BaseHTTPRequestHandler):
                 body, typ, status = payload, "application/json; charset=utf-8", 200
             except Exception as exc:
                 body, typ, status = json.dumps({"error": f"{type(exc).__name__}: {exc}"}).encode(), "application/json; charset=utf-8", 500
-        elif path in ("/", "/index.html"):
+        elif path == "/api/v3/history":
+            try:
+                query = urllib.parse.parse_qs(request.query)
+                section = (query.get("section") or ["score"])[0]
+                ref = (query.get("ref") or [None])[0]
+                limit = int((query.get("limit") or [800])[0])
+                payload = self.model.dashboard_history.series(section, ref=ref, limit=limit)
+                body, typ, status = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode(), "application/json; charset=utf-8", 200
+            except (ValueError, TypeError) as exc:
+                body, typ, status = json.dumps({"error": str(exc)}, ensure_ascii=False).encode(), "application/json; charset=utf-8", 400
+            except Exception as exc:
+                body, typ, status = json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False).encode(), "application/json; charset=utf-8", 500
+        elif path.startswith("/api/v3/"):
+            section = path.removeprefix("/api/v3/")
+            try:
+                snapshot = self.model.snapshot()
+                exported = strategy_v3.export(snapshot, strategy_export)
+                if section not in exported["sections"]:
+                    body, typ, status = json.dumps({"error": "Sección v3 desconocida"}).encode(), "application/json; charset=utf-8", 404
+                else:
+                    envelope = {"schema": exported["schema"], "section": section,
+                                "snapshot": exported["snapshot"], "sources": exported["sources"],
+                                "data": exported["sections"][section]}
+                    body, typ, status = json.dumps(envelope, ensure_ascii=False, allow_nan=False).encode(), "application/json; charset=utf-8", 200
+            except Exception as exc:
+                body, typ, status = json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False).encode(), "application/json; charset=utf-8", 500
+        elif path == "/legacy":
             try:
                 body, typ, status = render(self.model.snapshot()).encode(), "text/html; charset=utf-8", 200
             except Exception as exc:
                 body, typ, status = f"Panel: {type(exc).__name__}: {exc}\n".encode(), "text/plain", 500
+        elif path in ("/", "/index.html"):
+            index = self.web_dist / "index.html"
+            if index.is_file():
+                body, typ, status = index.read_bytes(), "text/html; charset=utf-8", 200
+            else:
+                try:
+                    body, typ, status = render(self.model.snapshot()).encode(), "text/html; charset=utf-8", 200
+                except Exception as exc:
+                    body, typ, status = f"Panel: {type(exc).__name__}: {exc}\n".encode(), "text/plain", 500
         else:
-            body, typ, status = b"not found\n", "text/plain", 404
+            try:
+                root = self.web_dist.resolve()
+                target = (root / path.lstrip("/")).resolve()
+                target.relative_to(root)
+                if target.is_file():
+                    body = target.read_bytes()
+                    typ = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+                    if typ.startswith("text/") or typ in ("application/javascript", "image/svg+xml"):
+                        typ += "; charset=utf-8"
+                    status = 200
+                else:
+                    body, typ, status = b"not found\n", "text/plain", 404
+            except (OSError, ValueError):
+                body, typ, status = b"not found\n", "text/plain", 404
         self.send_response(status)
         self.send_header("Content-Type", typ)
         self.send_header("Content-Length", str(len(body)))
@@ -1534,6 +1733,8 @@ def main():
     parser.add_argument("--port", type=int, default=8775)
     parser.add_argument("--url", default=URL)
     parser.add_argument("--reserve", type=int, default=100)
+    parser.add_argument("--history-retention-days", type=int, default=90,
+                        help="días de histórico detallado local del dashboard (predeterminado: 90)")
     parser.add_argument("--feed-root", type=Path, default=KIT,
                         help="carpeta bazaar-kit con data/feed_history.jsonl")
     parser.add_argument("--env-file", type=Path, help="archivo .env existente para leer BAZAAR_KEY")
@@ -1545,7 +1746,8 @@ def main():
             if sep and name.strip() == "BAZAAR_KEY":
                 key = value.strip().strip("\"'")
                 break
-    model = Model(Reader(args.url, key), reserve=args.reserve, feed_root=args.feed_root)
+    model = Model(Reader(args.url, key), reserve=args.reserve, feed_root=args.feed_root,
+                  history_retention_days=args.history_retention_days)
     handler = type("Team15Handler", (Handler,), {"model": model})
     with ThreadingHTTPServer(("127.0.0.1", args.port), handler) as server:
         print(f"Mesa de trades en http://127.0.0.1:{args.port}", flush=True)

@@ -82,15 +82,18 @@ def build(venues: list[dict], boards: dict[str, list[dict]], own_offers: list[di
         }
 
     offers = [present(r) for r in rows]
-    mine = [present(r) for r in own_rows]
+    account_offers = [present(r) for r in own_rows]
+    my_posts = [r for r in account_offers if r["mine"]]
+    incoming = [r for r in account_offers if not r["mine"]]
     own_market = [r for r in offers if r["venue"] == own_venue]
-    my_sales = [r for r in mine if r["kind"] == "Venta"]
-    all_sales = [r for r in mine if r["kind"] == "Venta"]
+    my_sales = [r for r in my_posts if r["kind"] == "Venta"]
     return {"tick": tick, "own_venue": own_venue,
             "own_venue_name": (venue_map.get(own_venue) or {}).get("name") or own_venue or "—",
-            "my_open_offers": mine, "my_active_sales": all_sales,
+            "my_open_offers": my_posts, "my_active_sales": my_sales,
+            "incoming_offers": incoming,
             "own_market_offers": own_market, "all_offers": offers,
-            "summary": {"active_sales": len(my_sales), "my_open_offers": len(mine),
+            "summary": {"active_sales": len(my_sales), "my_open_offers": len(my_posts),
+                        "incoming_offers": len(incoming),
                         "own_market_total": len(own_market),
                         "own_market_by_others": sum(not r["mine"] for r in own_market),
                         "open_offers_total": len(offers),
@@ -164,7 +167,7 @@ def render(data: dict) -> str:
         '<article><small>Ofertas en tu mercado</small><strong>' + _e(summary.get("own_market_total", 0)) + '</strong></article>'
         '<article><small>De otros equipos en tu mercado</small><strong>' + _e(summary.get("own_market_by_others", 0)) + '</strong></article>'
         '</div><div class="market-live-columns"><div class="market-live-block"><h3>Lo que publicas tú</h3>'
-        '<p>Separado por mercado; “ofrece” y “quiere a cambio” se leen desde el lado de quien publicó la oferta.</p>'
+        '<p>Solo publicaciones hechas por Team 15; las ofertas entrantes aparecen en el libro público.</p>'
         + cards(watch.get("my_open_offers") or []) + '</div>'
         '<div class="market-live-block"><h3>Lo que hay publicado en tu mercado · ' + _e(watch.get("own_venue_name") or "v15") + '</h3>'
         '<p>Incluye las ofertas de otros equipos y las tuyas que aparecen en el libro de v15.</p>'

@@ -8,3 +8,8 @@ __pycache__/
 .pytest_cache/
 .venv/
 flagger_state.json*
+dashboard_history.sqlite3
+dashboard_history.sqlite3-wal
+dashboard_history.sqlite3-shm
+team15-dashboard/web/node_modules/
+team15-dashboard/web/tsconfig.tsbuildinfo
