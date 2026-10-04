@@ -1183,6 +1183,7 @@ def render_strategy_health(data: dict) -> str:
     duels = state.get('duels') or {}
     memory = state.get('memory') or {}
     learner = state.get('duel_learning') or {}
+    execution = state.get('execution') or {}
     market = ((data.get('operations') or {}).get('market') or {})
     score = data.get('scoring') or {}
     sessions = []
@@ -1202,8 +1203,13 @@ def render_strategy_health(data: dict) -> str:
         'fresh': 'Evidencia reciente', 'stale': 'Memoria atrasada',
         'database_only': 'Base creada; falta informe', 'not_started': 'Aún no integrada',
     }.get(memory.get('status'), 'Sin confirmar')
-    learner_text = ('Modelo actualizado con ' + fmt(learner.get('duels_done')) + ' duelos'
-                    if learner.get('status') == 'updated' else 'Modelo de duelos sin iniciar')
+    if execution.get('mode') != 'coordinator' and memory.get('last_tick') is not None:
+        memory_text = 'Historial guardado · tick ' + esc(memory['last_tick'])
+    execution_text = ({'duels': 'Duelos en ejecución', 'coordinator': 'Coordinador en ejecución'}
+                      .get(execution.get('mode'), 'Agente operativo detenido')
+                      if execution.get('status') == 'running' else 'Agente operativo detenido')
+    learner_text = ('Informe guardado: ' + fmt(learner.get('duels_done')) + ' duelos'
+                    if learner.get('status') == 'saved_report' else 'Sin informe de aprendizaje')
     return ('<section id="pulso" class="pulse"><div class="pulse-head"><div>'
             '<h2>Seguimiento de la estrategia</h2><p>Resultados confirmados y estado real de los agentes.</p>'
             '</div><span>La API decide el resultado; el historial local explica la ejecución</span></div>'
@@ -1224,11 +1230,13 @@ def render_strategy_health(data: dict) -> str:
             '<a href="#ranking">Ver oportunidades de negociación</a></article>'
             '<article class="pulse-card system-pulse"><div class="pulse-card-head"><h3>Sistema de decisión</h3>'
             '<strong class="system-mark">●</strong></div>'
+            f'<div class="system-line"><span>Proceso operativo</span><b>{execution_text}</b></div>'
             f'<div class="system-line"><span>Memoria del coordinador</span><b>{memory_text}</b></div>'
             f'<div class="system-line"><span>Evidencia reciente</span><b>{fmt(memory.get("events_in_window"))} eventos</b></div>'
             f'<div class="system-line"><span>Aprendizaje de duelos</span><b>{learner_text}</b></div>'
-            '<p class="pulse-note">El laboratorio temporal aún no ha demostrado mejora de decisiones. '
-            'Mantener la política base y evaluar el modelo antes de activarlo.</p></article></div></section>')
+            '<p class="pulse-note">El historial de duelos ajusta aperturas al ejecutar. Cambiar aceptar o esperar requiere '
+            '<code>--learn</code>; el replay temporal aún no ha demostrado mejora. Un informe guardado no confirma '
+            'que el modelo esté activo.</p></article></div></section>')
 
 
 def render(data: dict) -> str:

@@ -390,11 +390,13 @@ def accept_priority(f: dict) -> float:
 
 
 def history_share(history: list, role: str, days: bool) -> Optional[float]:
-    """Mediana del margen de PRECIO capturado / límite en tratos cerrados comparables (mismo rol y mismos temas), o None
+    """Mediana del margen de PRECIO capturado / límite en tratos puntuables comparables (mismo rol y mismos temas), o None
     si hay menos de PARAMS["HISTORY_MIN"] casos: con poca historia no se usa."""
     shares = []
     for h in history or []:
-        if h.get("status") != "deal" or h.get("role") != role or ("days" in (h.get("issues") or [])) != days:
+        if (h.get("session") == 1 or h.get("status") != "deal" or
+                isinstance(h.get("result"), (int, float)) and h["result"] <= 0 or h.get("role") != role or
+                ("days" in (h.get("issues") or [])) != days):
             continue
         if h.get("price") is None or not h.get("your_limit"):
             continue
@@ -451,7 +453,7 @@ def duel_candidates(duels: list, tick: int, history: Optional[list] = None) -> l
         traj = rival_trajectory(d)
         safe = f["effective_safe_ticks"]
         if prof and f["rival_price"] is None and not traj:
-            muted = _mute_offer(d, tick, left)
+            muted = _mute_offer(d, tick, left, history)
             if muted:
                 muted["facts"] = f
                 out.append(muted)
@@ -596,7 +598,7 @@ def duel_length(d: dict) -> int:
     return int(d.get("duel_ticks") or PROFILE_PARAMS["DUEL_TICKS"].get(round(_decay(d), 2), 16))
 
 
-def _mute_offer(d: dict, tick: int, left: int) -> Optional[dict]:
+def _mute_offer(d: dict, tick: int, left: int, history: Optional[list] = None) -> Optional[dict]:
     """Rival mudo: abrir pronto y rebajar el ancla por escalones (máximo MUTE_MAX ofertas)."""
     start = d.get("start_tick", d["deadline_tick"] - duel_length(d))
     ours = _our_messages(d)
@@ -604,9 +606,14 @@ def _mute_offer(d: dict, tick: int, left: int) -> Optional[dict]:
         return None
     if ours and tick - max(x["tick"] for x in ours) < PROFILE_PARAMS["MUTE_GAP"]:
         return None
-    price = _own_price(d, max(0.0, realistic_share(d, left) - len(ours) * PROFILE_PARAMS["MUTE_STEP"]))
+    base_share = realistic_share(d, left)
+    share = realistic_share(d, left, history)
+    historical_cap = history_share(history, d["role"], _is_days(d))
+    price = _own_price(d, max(0.0, share - len(ours) * PROFILE_PARAMS["MUTE_STEP"]))
     c = {"type": "duel_say", "duel": d["duel"], "price": price, "du": None, "score": 100,
-         "text": _say_text(price, None), "why": f" ⇒ rival mudo: oferta {len(ours) + 1}"}
+         "text": _say_text(price, None), "why": f" ⇒ rival mudo: oferta {len(ours) + 1}",
+         "memory": {"source": "confirmed_duels", "historical_cap": historical_cap,
+                    "applied": historical_cap is not None and share < base_share}}
     if _is_days(d):
         c["days"] = _best_days(d)
         _maybe_logroll(d, c)

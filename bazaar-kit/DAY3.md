@@ -43,6 +43,42 @@ de política. El runner conserva toda la cohorte al actualizarse tras cada liqui
 correcciones del servidor aunque el número de duelos no cambie. `--learn` continúa opt-in hasta
 que el laboratorio muestre una mejora fuera de la muestra de entrenamiento.
 
+### Qué memoria usa realmente cada agente
+
+`./run.sh day3` ejecuta `memory_coordinator.py`: guarda el feed y las acciones en
+`data/agent_memory.sqlite3`, enriquece el feed que lee el coordinador y añade
+comparables a las candidatas. La política de ventas aprendida por `learning.py`
+requiere además una campaña `--fast-sales` y una versión de política con
+`use_learned_price`; el preset `day3` no activa ninguna de las dos. Por ello,
+una base SQLite con eventos no significa que los precios del coordinador se
+estén reajustando automáticamente.
+
+`./run.sh duels --day3` ejecuta otro proceso, `duel_runner.py`. Al operar lee
+`/api/duels?done=true` y la mediana de acuerdos comparables puede limitar su
+oferta inicial (`HISTORY_MIN`). La memoria SQLite anterior no entra en esa
+decisión. `--learn` conecta el modelo que puede cambiar aceptar/esperar, pero
+queda desactivado en `--day3`. La última prueba temporal real cambió 0
+decisiones tanto en validación como en test; activarlo por defecto no tiene
+evidencia de mejora. El dashboard distingue ahora un informe guardado de un
+proceso en ejecución. En la comprobación del domingo a las 09:14 de Madrid
+no estaba ejecutándose ninguno de los dos agentes; la API seguía pausada
+en tick 1445, sin duelos vivos.
+
+La auditoría detectó que `--profiles` enviaba las aperturas ante rivales mudos
+por una ruta que ignoraba esa mediana histórica. Se corrigió: ahora esa ruta
+aplica el límite de los acuerdos comparables y anota `memory.applied` en la
+acción. También se excluyen los duelos de práctica y los cierres con resultado
+no positivo. Con el histórico disponible hay 10/15 acuerdos útiles como comprador y 8/22 como vendedor para
+precio solo/precio+días, respectivamente; la mediana limita la apertura solo
+si es menos exigente que el ancla base.
+
+Para volver a comprobarlo antes de Duelos III: refrescar el histórico con
+`python3 duel_lab.py fetch`, correr `python3 duel_lab.py replay`, verificar el
+proceso operativo en el dashboard y observar en `data/duels_log.jsonl` las
+decisiones `learned` y las liquidaciones `reconciled`. Si se prueba `--learn`,
+comparar la tasa de cierre, los resultados negativos y las decisiones que
+cambió contra la política base antes de mantenerlo activo.
+
 El preset `./run.sh day3` pasa ahora por `memory_coordinator.py`. Esto importa el feed histórico
 en SQLite, registra decisiones y entrega comparables al coordinador en cada ciclo, manteniendo
 sus límites, valoraciones, protección de páginas y bloqueo. La memoria no reescribe por sí sola

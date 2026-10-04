@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 
@@ -21,8 +22,30 @@ def _json(path):
         return None
 
 
+def _execution(roots) -> dict:
+    """Read the shared execution lock; a saved report is not proof an agent is running."""
+    for root in roots:
+        lock = _json(Path(root) / 'data' / 'agent.lock')
+        if not lock:
+            continue
+        pid = lock.get('pid')
+        if not isinstance(pid, int) or pid <= 0:
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            pass
+        mode = 'duels' if str(lock.get('version') or '').startswith('duels-') else 'coordinator'
+        return {'status': 'running', 'mode': mode, 'pid': pid, 'since': lock.get('since')}
+    return {'status': 'stopped', 'mode': None, 'pid': None, 'since': None}
+
+
 def build(done: list[dict], roots, tick: int | None) -> dict:
     """Separate server outcomes from a local learner's actual integration state."""
+    roots = tuple(roots)
+    execution = _execution(roots)
     sessions = []
     for session in sorted({d.get('session') for d in done if isinstance(d.get('session'), int)}):
         if session == 1:  # practice does not score
@@ -55,14 +78,15 @@ def build(done: list[dict], roots, tick: int | None) -> dict:
 
     learner_path = _latest(roots, 'duel_learning.json')
     learner = _json(learner_path)
-    learner_facts = learner.get('facts') or {} if learner else {}
-    duel_learning = {'status': 'updated' if learner else 'not_started',
+    learner_facts = (learner.get('facts') or {}) if learner else {}
+    duel_learning = {'status': 'saved_report' if learner else 'not_started',
                      'duels_done': learner_facts.get('duels_done'),
                      'deals': learner_facts.get('deals'),
-                     'note': 'Un modelo cargado no demuestra mejora; validar con replay temporal.'}
+                     'note': 'El runner usa el historial confirmado para aperturas. '
+                             'Cambiar aceptar/esperar requiere --learn y mejora validada en replay.'}
     return {'duels': {'source': '/api/duels?done=true' if done else 'unavailable',
                       'sessions': sessions,
                       'settled': sum(s['total'] for s in sessions),
                       'negative': sum(s['negative'] for s in sessions),
                       'no_deal': sum(s['no_deal'] for s in sessions)},
-            'memory': memory, 'duel_learning': duel_learning}
+            'memory': memory, 'duel_learning': duel_learning, 'execution': execution}
