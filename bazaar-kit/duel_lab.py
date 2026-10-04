@@ -4,6 +4,7 @@ confirmados por el servidor y sobre escenarios simulados. No envía nada al serv
     python3 duel_lab.py audit     # qué registra el servidor, qué falta, decisiones que fallaron (hechos / hipótesis)
     python3 duel_lab.py summary   # resumen por situación con n e intervalos
     python3 duel_lab.py replay    # A · replay histórico con separación TEMPORAL (entrena / valida / prueba)
+    python3 duel_lab.py waves     # A · replay por OLEADAS con una aceptación por tick: política anterior frente a la agresiva
     python3 duel_lab.py sim       # B · simulación (supuestos declarados) con semillas de entrenamiento y de prueba DISJUNTAS
     python3 duel_lab.py all
     python3 duel_lab.py fetch     # (solo lectura) descarga los duelos terminados a data/duels_history.json
@@ -94,6 +95,68 @@ def play_duel(d: dict, model=None) -> dict:
         dl.PARAMS.clear()
         dl.PARAMS.update(saved)
         dl.HOOKS.update(hooks)
+
+
+def wave_replay(raw: list, sessions=(3, 4, 5), extra: dict | None = None) -> dict:
+    """Replay por OLEADAS: todos los duelos de una sesión a la vez, tick a tick, con UNA aceptación por tick como en el
+    servidor (las que no caben se difieren). Las ofertas rivales siguen su trayectoria real; no simula respuestas a nuestras
+    ofertas. Captura = excedente TOTAL al aceptar (rondas = 0). Devuelve también las aceptaciones diferidas y perdidas."""
+    saved, hooks = dict(dl.PARAMS), dict(dl.HOOKS)
+    dl.PARAMS.update(PRODUCTION)
+    dl.PARAMS.update(extra or {})
+    dl.PARAMS["LEARN"] = False
+    out = {"captured": 0.0, "closed": 0, "duels": 0, "lost_to_queue": [], "deferred": 0, "ticks_before_deadline": [],
+           "violations": 0, "best": 0.0}
+    try:
+        for ses in sessions:
+            pool = [d for d in raw if d.get("session") == ses and d.get("status") in ("deal", "no_deal") and d.get("deadline_tick")
+                    and any(m["from"] != "you" and m.get("price") is not None for m in d.get("messages") or [])]
+            if not pool:
+                continue
+            out["duels"] += len(pool)
+            for d in pool:
+                ms = [m for m in d["messages"] if m["from"] != "you" and m.get("price") is not None]
+                out["best"] += max(0.0, max(dl.margin(dict(d, status="live"), m["price"], m.get("days")
+                                                      if "days" in (d.get("issues") or []) else None) or 0.0 for m in ms))
+            t0 = min(min(m["tick"] for m in d["messages"] if m["from"] != "you") for d in pool)
+            t1 = max(d["deadline_tick"] for d in pool)
+            done, wanted = {}, {}
+            for t in range(t0, t1):
+                states = []
+                for d in pool:
+                    if d["duel"] in done or t >= d["deadline_tick"]:
+                        continue
+                    st = live_state(d, t)
+                    st["duel"] = d["duel"]
+                    if st["rival_offer"] is not None:
+                        states.append(st)
+                if not states:
+                    continue
+                accs = [c for c in dl.duel_candidates(states, t) if c["type"] == "duel_accept"]
+                for c in accs:
+                    wanted.setdefault(c["duel"], t)
+                if accs:
+                    c = accs[0]                                   # el orden del candidato YA es la prioridad explícita
+                    st = next(x for x in states if x["duel"] == c["duel"])
+                    ro = st["rival_offer"]
+                    days = ro.get("days") if "days" in (st.get("issues") or []) else None
+                    tot, pm = dl.margin(st, ro["price"], days), dl.price_margin(st, ro["price"])
+                    if tot is None or tot <= 0 or pm is None or pm < 0:
+                        out["violations"] += 1
+                    done[c["duel"]] = t
+                    out["captured"] += max(0.0, tot or 0.0)
+                    out["closed"] += 1
+                    out["ticks_before_deadline"].append(st["deadline_tick"] - t)
+                    out["deferred"] += len(accs) - 1
+            out["lost_to_queue"] += [k for k in wanted if k not in done]
+    finally:
+        dl.PARAMS.clear()
+        dl.PARAMS.update(saved)
+        dl.HOOKS.update(hooks)
+    tb = out.pop("ticks_before_deadline")
+    out["mean_ticks_before_deadline"] = round(statistics.mean(tb), 2) if tb else None
+    out["captured"], out["best"] = round(out["captured"], 1), round(out["best"], 1)
+    return out
 
 
 def split_by_time(raw: list, played_only: bool = True, fr=(0.6, 0.8)) -> tuple:
@@ -245,7 +308,7 @@ def fetch() -> int:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["audit", "summary", "replay", "sim", "all", "fetch"])
+    ap.add_argument("cmd", choices=["audit", "summary", "replay", "waves", "sim", "all", "fetch"])
     ap.add_argument("--history", default=str(HISTORY))
     a = ap.parse_args(argv)
     if a.cmd == "fetch":
@@ -268,6 +331,10 @@ def main(argv=None) -> int:
     if a.cmd in ("replay", "all"):
         print("REPLAY HISTÓRICO (separación temporal)")
         print(json.dumps(replay_report(raw), ensure_ascii=False, indent=1))
+    if a.cmd in ("waves", "all"):
+        print("REPLAY POR OLEADAS (una aceptación por tick; anterior frente a agresivo)")
+        for name, ex in (("anterior", {"AGGRESSIVE": False}), ("agresivo", {"AGGRESSIVE": True})):
+            print(f"  {name:9}", json.dumps(wave_replay(raw, extra=ex), ensure_ascii=False))
     if a.cmd in ("sim", "all"):
         print("SIMULACIÓN (semillas de entrenamiento y de prueba disjuntas)")
         print(json.dumps(sim_report(), ensure_ascii=False, indent=1))

@@ -54,6 +54,8 @@ import trading as tr
 from bazaar_sdk import Bazaar, BazaarError
 
 VERSION = "coord-1.0"
+CHAMBERI_PREFIX = "CHA-"
+CHAMBERI_VENUE = "v05"
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "data"
 LEDGER = DATA / "coordinator_ledger.json"
@@ -936,6 +938,10 @@ def candidates(s, led, args, journal):
     exec_sales = sum(int(c.get("cash") or c.get("price") or 0) for c in out
                      if ph_mod.is_sale(c) and not c.get("blockers") and c["type"] != "list")
     pl["last_hour"] = last_hour_gate(out, s, led, args, view, free_cash, counts)
+    if getattr(args, "dealers_only", False):   # --dealers-only: nada con equipos (ni mercado público ni campañas)
+        for c in out:
+            if c["type"] in TEAM_SIDE_TYPES:
+                c["blockers"] = list(c.get("blockers") or []) + ["--dealers-only: no se opera con equipos (solo vendedores y cancelaciones)"]
     fill = perf.realized(led.get("actions", [])).get("median_ticks_to_fill")
     fill_min = (fill * (s["clock"].get("tick_seconds") or 30.0) / 60.0) if fill else None
     ph = ph_mod.state(s["clock"], pcfg, ph_mod.scenarios(free_cash, open_sell_net(s, team), exec_sales), fill_min=fill_min)
@@ -1915,6 +1921,9 @@ def learned_rows(s):
     return LEARN_CACHE["rows"]
 
 
+TEAM_SIDE_TYPES = {"list", "bid", "swap_list", "accept", "team_open", "team_propose", "team_accept"}
+
+
 def balance_reliable(s, led, view, free_cash):
     """¿Son fiables saldo y reservas? Si no, se bloquean las compras (las ventas y cierres seguros siguen)."""
     cash = (s.get("me") or {}).get("cash")
@@ -2580,6 +2589,88 @@ def double_commit(c, s, committed):
     return f"activo(s) {twice} ya comprometido(s) en otra obligación abierta" if twice else None
 
 
+def candidate_chamberi_refs(c, snap=None):
+    refs = set()
+    for value in (c.get("ref"), c.get("give_ref")):
+        if isinstance(value, str) and value.startswith(CHAMBERI_PREFIX):
+            refs.add(value)
+    for side in (c.get("receive"), c.get("deliver")):
+        refs.update(r for r, n in (side or {}).items() if n and isinstance(r, str) and r.startswith(CHAMBERI_PREFIX))
+    offer = c.get("offer_data")
+    if isinstance(c.get("offer"), dict):
+        offer = c["offer"]
+    if isinstance(offer, dict):
+        for side in (offer.get("give"), offer.get("want")):
+            refs.update(r for r in (side or {}).get("cards") or [] if isinstance(r, str) and r.startswith(CHAMBERI_PREFIX))
+            refs.update(t[5:] for t in (side or {}).get("types") or []
+                        if isinstance(t, str) and t.startswith("card:CHA-"))
+            refs.update(a["ref"] for a in (side or {}).get("assets") or []
+                        if isinstance(a, dict) and isinstance(a.get("ref"), str) and a["ref"].startswith(CHAMBERI_PREFIX))
+    if c.get("offer") is not None and not isinstance(c.get("offer"), dict):
+        snap = snap or c.get("_snapshot")
+        if not snap:
+            return refs
+        pools = [(snap.get("board") or {}).get("offers", []), (snap.get("offers") or {}).get("offers", [])]
+        pools += [(b or {}).get("offers", []) for b in (snap.get("boards") or {}).values()]
+        pools += [o for t in (snap.get("threads", {}).get("open") or []) for o in (t.get("standing_offers") or [])]
+        o = next((o for pool in pools for o in pool if o.get("id") == c.get("offer")), None)
+        if o:
+            for side in (o.get("give"), o.get("want")):
+                refs.update(r for r in (side or {}).get("cards") or [] if isinstance(r, str) and r.startswith(CHAMBERI_PREFIX))
+                refs.update(t[5:] for t in (side or {}).get("types") or []
+                            if isinstance(t, str) and t.startswith("card:CHA-"))
+                refs.update(a["ref"] for a in (side or {}).get("assets") or []
+                            if isinstance(a, dict) and isinstance(a.get("ref"), str) and a["ref"].startswith(CHAMBERI_PREFIX))
+    return refs
+
+
+def block_chamberi_candidate(c, venues):
+    refs = candidate_chamberi_refs(c, c.get("_snapshot"))
+    if c.get("type") == "team_open":
+        opp = c.get("opp") or {}
+        refs.update(r for r in (opp.get("receive"), opp.get("deliver"))
+                    if isinstance(r, str) and r.startswith(CHAMBERI_PREFIX))
+    if c.get("type") == "team_propose":
+        offer = c.get("offer") if isinstance(c.get("offer"), dict) else {}
+        for side in (offer.get("give"), offer.get("want")):
+            refs.update(r for r in (side or {}).get("cards") or [] if isinstance(r, str) and r.startswith(CHAMBERI_PREFIX))
+            refs.update(t[5:] for t in (side or {}).get("types") or []
+                        if isinstance(t, str) and t.startswith("card:CHA-"))
+    if not refs:
+        return
+    if c.get("type") in ("dealer_open", "dealer_sell_open", "dealer_accept", "dealer_sell_accept",
+                           "dealer_counter", "dealer_sell_counter", "team_open", "team_propose",
+                           "team_accept"):
+        c.setdefault("blockers", []).append("CHA-* solo puede operarse en el marketplace v05")
+        return
+    if c.get("type") in ("list", "bid", "swap_list", "accept"):
+        if c.get("venue") != CHAMBERI_VENUE:
+            c.setdefault("blockers", []).append(f"CHA-* solo puede operarse en {CHAMBERI_VENUE}")
+        v05 = next((v for v in (venues.get("venues") or []) if v.get("venue") == CHAMBERI_VENUE), None)
+        if not v05 or v05.get("status") != "open":
+            c.setdefault("blockers", []).append(f"{CHAMBERI_VENUE} no está abierto")
+
+
+def private_values_verified(reader, s, refs):
+    assets = [a for a in (s.get("me") or {}).get("assets", []) if a.get("kind") == "card"]
+    counts = tr.counts_of(assets)
+    try:
+        val = tr.Valuation(s["catalog"], (s.get("me") or {}).get("affinity") or {})
+        for ref in refs:
+            raw = reader.call("call", "GET", "/api/me/value", {"card": ref})
+            value = raw.get("your_value")
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                return False
+            expected = val.next_copy(counts, ref)
+            held = counts.get(ref, 0) > 0
+            expected_asset_value = val.copy_value(ref, max(0, counts.get(ref, 1) - 1)) if held else expected
+            if abs(float(value) - expected) > 0.5 and not (held and abs(float(value) - expected_asset_value) <= 0.5):
+                return False
+    except (BazaarError, KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
 def _cards_of(c):
     """Cartas que una candidata adquiere o entrega (para no perseguir la misma por dos vías)."""
     if c["type"] in ("cancel", "team_cancel", "team_close", "dealer_close", "info"):
@@ -2719,6 +2810,30 @@ def pace(reader, gap=WRITE_GAP):
 
 def send(reader, led, s, c, args, journal):
     tick = s["clock"]["tick"]
+    # Hard pin Chamberri market actions to v05 and verify fresh private values.
+    refs = candidate_chamberi_refs(c, s)
+    if c.get("type") in ("dealer_accept", "dealer_sell_accept", "dealer_counter", "dealer_sell_counter",
+                           "dealer_open", "dealer_sell_open") and isinstance(c.get("ref"), str) and c["ref"].startswith(CHAMBERI_PREFIX):
+        print(f"   CHA_VENUE_BLOCK {describe(c)} · operación con vendedor fuera de marketplace {CHAMBERI_VENUE} · NO SE ENVÍA")
+        return None
+    if refs and c.get("type") in ("list", "bid", "swap_list", "accept"):
+        venue = c.get("venue") or "rastro"
+        state = next((v for v in (s.get("venues") or {}).get("venues", [])
+                      if v.get("venue") == CHAMBERI_VENUE), None)
+        if venue != CHAMBERI_VENUE:
+            print(f"   CHA_VENUE_BLOCK {describe(c)} · venue {venue}; solo {CHAMBERI_VENUE} · NO SE ENVÍA")
+            return None
+        if not state or state.get("status") != "open":
+            print(f"   CHA_VENUE_BLOCK {describe(c)} · {CHAMBERI_VENUE} no está abierto · NO SE ENVÍA")
+            return None
+        if not private_values_verified(reader, s, refs):
+            print(f"   CHA_VALUE_BLOCK {describe(c)} · valoración privada no verificada · NO SE ENVÍA")
+            return None
+        if c.get("type") == "accept":
+            stale = revalidate_live(reader, c, s)
+            if stale:
+                print(f"   REVALIDACIÓN {describe(c)} · {'; '.join(stale)} · NO SE ENVÍA")
+                return None
     key = tr.idem_key({**c, "type": c["type"], "tick_scope": c.get("thread")})
     if any(a.get("key") == key and a["status"] in ("intent", "ambiguous", "submitted") for a in led["actions"]):
         print(f"   (ya enviada antes, no se repite: {describe(c)})")
@@ -2738,7 +2853,7 @@ def send(reader, led, s, c, args, journal):
     if twice:
         print(f"   ASSET_EXPOSURE_BLOCK {describe(c)} · {twice} · NO SE ENVÍA")
         return None
-    if c["type"] == "accept" and c.get("offer") is not None:
+    if c["type"] == "accept" and c.get("offer") is not None and not refs:
         stale = revalidate_live(reader, c, s)
         if stale:
             print(f"   REVALIDACIÓN {describe(c)} · {'; '.join(stale)} · NO SE ENVÍA")
@@ -2985,8 +3100,18 @@ def cycle(reader, args, led, journal, execute, cache=None):
     for line in dealer_notices(s, led):
         print(f"   {line}")
     cands, pl, exposure = candidates(s, led, args, journal)
+    # Enforce the Chamberri venue policy while candidates are still visible in
+    # the report; the send() guard repeats live checks immediately before writes.
+    for c in cands:
+        c["_snapshot"] = s
+        block_chamberi_candidate(c, s.get("venues") or {})
+        c.pop("_snapshot", None)  # el snapshot es contexto temporal, no parte serializable del informe
     camp_cands, camp_lines = campaign_candidates(s, led, args, pl, execute)
     cands += camp_cands
+    for c in camp_cands:
+        c["_snapshot"] = s
+        block_chamberi_candidate(c, s.get("venues") or {})
+        c.pop("_snapshot", None)
     deny, deny_margin = deny_cfg(args)
     if deny:  # --deny-teams (opt-in): ni dirigidas a, ni aceptadas de, ni campañas con esos equipos
         n = lplus.apply_deny(cands, deny, deny_margin)
@@ -3269,6 +3394,9 @@ def main():
     g = p.add_argument_group("fases hacia el cierre (opt-in con --phases; sin ello nada cambia)")
     g.add_argument("--phases", action="store_true",
                    help="A operación activa → B transición → C tesorería, según el cierre OFICIAL del servidor (clock.closes)")
+    g.add_argument("--dealers-only", action="store_true",
+                   help="operar SOLO con vendedores (dealers): bloquea publicar, pujar, aceptar o negociar con equipos; "
+                        "las cancelaciones de ofertas propias siguen permitidas")
     g.add_argument("--final-floor", type=int, default=None, metavar="P",
                    help="SUELO inviolable de saldo libre (caja − compromisos) tras cualquier compra/puja/aceptación; "
                         "cálculo acumulado por tick y compras bloqueadas si el saldo no es fiable (perfil last-hour: 150)")

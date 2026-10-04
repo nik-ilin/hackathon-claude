@@ -127,11 +127,19 @@ def main() -> None:
                     help="opt-in: aprendizaje en línea con los duelos TERMINADOS (resultado del servidor): refina accept/wait y el ancla "
                          "de apertura solo con evidencia suficiente; sin ella, política base. Registra la razón de cada decisión")
     ap.add_argument("--day3", action="store_true",
-                    help="preset Duelos III: --days --ladder --profiles --reconcile --verify-accept; "
+                    help="preset Duelos III: --days --ladder --profiles --reconcile --verify-accept --aggressive; "
                          "--learn y --logroll siguen opt-in")
+    ap.add_argument("--aggressive", dest="aggressive", action="store_true", default=None,
+                    help="perfil agresivo (valor esperado sobre el excedente TOTAL, umbrales EARLY 25 %% / MID 10 %%, «bueno» con rival mejorando 45 %% / 32 %%, contraofertas "
+                         "hacia nuestra zona); nunca acepta total ≤ 0 ni precio fuera de límite. --day3 lo activa")
+    ap.add_argument("--no-aggressive", dest="aggressive", action="store_false",
+                    help="con --day3, volver a la política prudente anterior")
     a = ap.parse_args()
     if a.day3:
         a.days = a.ladder = a.profiles = a.reconcile = a.verify_accept = True
+        if a.aggressive is None:
+            a.aggressive = True
+    dl.PARAMS["AGGRESSIVE"] = bool(a.aggressive)
     dl.PARAMS["PLAY_DAYS"] = a.days
     if a.ladder:
         dl.PARAMS["LADDER"] = LADDER
@@ -256,7 +264,8 @@ def reconcile_accepted(b, awaiting: dict, tick: int, stats: dict) -> Optional[li
         pred = w["prediction"] or {}
         real = d.get("result")
         stats["deals" if d.get("status") == "deal" else "no_deals"] += 1
-        log({"event": "reconciled", "tick": tick, "duel": duel_id, "status": d.get("status"), "role": d.get("role"),
+        log({"event": "reconciled", "settled": d.get("status") == "deal", "tick": tick, "duel": duel_id,
+             "status": d.get("status"), "role": d.get("role"),
              "price": d.get("price"), "days": d.get("days"), "deadline_tick": d.get("deadline_tick"),
              "result": real, "rounds": d.get("rounds"), "predicted_result": pred.get("expected_result"),
              "predicted_surplus": pred.get("surplus_total"), "predicted_price_margin": pred.get("price_margin"),
@@ -340,7 +349,7 @@ def run(b, execute, feed_file: Path | None = None, reconcile=False, verify_accep
                                        load_feed_events(LOG), history):
                 cand = step["candidate"]
                 if step["action"] in {"wait", "defer", "already_sent"}:
-                    log({"tick": tick, "duel": step["duel"],
+                    log({"tick": tick, "duel": step["duel"], "brief": step.get("brief"),
                          "action": step["action"], "path": step["path"],
                          "trigger": step["trigger"], "facts": step["facts"],
                          "reason": step["reason"], "feed": step["feed"], "sent": False})
@@ -348,7 +357,7 @@ def run(b, execute, feed_file: Path | None = None, reconcile=False, verify_accep
                 if cand["type"] == "duel_accept" and accepted:
                     continue                 # una aceptación por tick y equipo
                 rec = {"tick": tick, **{k: v for k, v in cand.items() if k != "score"}}
-                rec.update(action=step["action"], path=step["path"],
+                rec.update(brief=step.get("brief"), action=step["action"], path=step["path"],
                            trigger=step["trigger"], facts=step["facts"], feed=step["feed"])
                 if not execute:
                     log({**rec, "sent": False})

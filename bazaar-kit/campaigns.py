@@ -62,26 +62,51 @@ def _single(o: dict):
 
 
 def evidence(s: dict, tick: int, cfg: CampaignConfig) -> list:
-    """Intenciones públicas por equipo identificable (más reciente primero)."""
+    """Intenciones públicas por equipo identificable en cualquier libro visible (más reciente primero).
+
+    El feed y los libros de venues distintos de El Rastro también son evidencia válida para
+    abrir una conversación directa. La conversación/liquidación sigue pasando por el canal
+    de negociación configurado; las restricciones específicas de venue se aplican después,
+    en el coordinador, antes de enviar una acción.
+    """
     team, valid = s["me"]["id"], valid_team_ids(s)
     out = []
+    seen = set()
+
+    def observe(o, maker, observed_tick, source, *, require_open=False):
+        venue = o.get("venue")
+        if maker not in valid or o.get("maker") != maker or o.get("to") not in (None, team):
+            return
+        if not venue or (require_open and o.get("status") != "open"):
+            return
+        oid = o.get("id")
+        if oid is None or oid in seen:
+            return
+        x = _single(o)
+        if not x or (o.get("expires_tick") or 10 ** 9) <= tick:
+            return
+        seen.add(oid)
+        out.append({"team": maker, "side": x[0], "ref": x[1], "price": x[2], "asset": x[3], "offer": oid,
+                    "tick": observed_tick, "venue": venue, "source": source})
+
     for e in (s.get("feed") or {}).get("events", []):
         if e.get("type") != "offer.listed" or e.get("tick", 0) < tick - cfg.evidence_ticks:
             continue
         o = (e.get("payload") or {}).get("offer") or {}
         maker = o.get("maker")
-        if maker != e.get("actor") or maker not in valid or o.get("to") not in (None, team) or o.get("venue") != "rastro":
+        if maker != e.get("actor"):
             continue
-        x = _single(o)
-        if x and (o.get("expires_tick") or 10 ** 9) > tick:
-            out.append({"team": maker, "side": x[0], "ref": x[1], "price": x[2], "asset": x[3], "offer": o.get("id"),
-                        "tick": e.get("tick"), "source": "feed offer.listed"})
+        observe(o, maker, e.get("tick"), "feed offer.listed")
+    # Read current public boards too: feed history may omit older listings, and many
+    # team venues publish there without an equivalent recent Rastro feed event.
+    for venue, board in (s.get("boards") or {}).items():
+        for o in (board or {}).get("offers", []):
+            if o.get("venue") != venue:
+                continue
+            observe(o, o.get("maker"), o.get("created_tick", tick), f"libro público {venue}", require_open=True)
     for o in (s.get("offers") or {}).get("offers", []):
         if o.get("to") == team and o.get("maker") in valid and o.get("status") == "open":
-            x = _single(o)
-            if x:
-                out.append({"team": o["maker"], "side": x[0], "ref": x[1], "price": x[2], "asset": x[3],
-                            "offer": o["id"], "tick": o.get("created_tick", tick), "source": "oferta dirigida a nosotros"})
+            observe(o, o["maker"], o.get("created_tick", tick), "oferta dirigida a nosotros", require_open=True)
     return sorted(out, key=lambda x: -(x["tick"] or 0))
 
 

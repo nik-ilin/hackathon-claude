@@ -66,6 +66,24 @@ PARAMS = {
     "PROBE": False,       # rival plantado con tiempo de sobra: UNA contraoferta a mitad de camino antes de aceptar
     "PROFILES": False,    # reglas por perfil del bot de la casa (Plata, Verde, Oro, Luna, Rojo, Noche) y mudos pronto
     "LOGROLL": False,     # días: conceder los que nos cuestan poco a cambio de precio (necesita PLAY_DAYS)
+    # --- perfil AGRESIVO (duel_runner --day3 lo activa; --no-aggressive lo apaga). Decide por VALOR ESPERADO sobre el excedente
+    #     TOTAL (precio + utilidad firmada de los días): aceptar ahora vale m; esperar H ticks vale (1−p)^H·(m + mejora·H), con p
+    #     la probabilidad por tick de perder la oferta (sube al acercarse el deadline y con la cola de aceptaciones).
+    "AGGRESSIVE": False,
+    "AGG_EARLY_RATIO": 0.25,     # EARLY, rival sin mejora fuerte: aceptar si total/límite ≥ esto (antes 0,30)
+    "AGG_MID_RATIO": 0.10,       # MID, rival sin mejora fuerte: ídem (antes 0,15)
+    "AGG_STALL_RATIO": 0.03,     # rival estancado o empeorando: esperar no añade nada, cerrar desde aquí (antes 0,05 tras contraoferta)
+    "AGG_HORIZON": 2,            # ticks de espera que se valoran (no se apuesta a mejoras lejanas)
+    "AGG_RISK_BASE": 0.05,       # p de perder la oferta por tick… (antes 0,02 como coste)
+    "AGG_RISK_URGENCY": 0.25,    # … + esto / ticks útiles (ticks restantes − cola de aceptaciones por delante)
+    "AGG_MIN_GAIN_FRAC": 0.02,   # no esperar por mejoras esperadas < max(2 P, 2 % del límite) en el horizonte
+    "AGG_ZONE_FRAC": 0.04,       # total negativo con tiempo: contraoferta en nuestra zona, a un 4 % del límite de nuestra reserva
+    "AGG_GOOD_RATIO": 0.32,      # MID con rival que MEJORA FUERTE: aceptar ya si el total ya es «bueno» (antes 0,15 y solo sin mejora fuerte)
+    "AGG_EARLY_GOOD_RATIO": 0.45,  # EARLY con rival que mejora fuerte: solo lo excepcional (antes: esperar SIEMPRE en EARLY)
+    "AGG_PRIOR_RATE_FRAC": 0.02, # primera oferta (tendencia desconocida): mejora a priori por tick = 2 % del límite, no 0
+    "AGG_SPEAK_AT": 8,           # rival mudo / fuera de zona: hablar desde 8 ticks antes (antes 5)
+    "AGG_MAX_OWN": 2,            # como mucho 2 ofertas propias por duelo (cada ronda encoge la tarta)
+    "AGG_OWN_GAP": 2,            # ticks entre ofertas propias
     "LEARN": False,       # aprendizaje en línea (duel_runner --learn): refinar accept/wait y el ancla con la historia confirmada
 }
 # Ganchos del aprendizaje en línea (duel_learning.py). Con PARAMS["LEARN"] y un hook instalado, la decisión base puede
@@ -310,7 +328,7 @@ def analyze(d: dict, tick: int, same_deadline: int = 1) -> dict:
             "configured_safe_ticks": PARAMS["SAFE_TICKS"], "effective_safe_ticks": safe_eff,
             "safe_ticks_note": f"SAFE_TICKS {PARAMS['SAFE_TICKS']} + {max(0, same_deadline - 1)} por duelos con el "
                                f"mismo deadline (una aceptación por tick)", "same_deadline": same_deadline,
-            "our_offer_exists": d.get("your_offer") is not None}
+            "our_offer_exists": d.get("your_offer") is not None, "tick": tick, "queue_ahead": max(0, same_deadline - 1)}
 
 
 def decide(d: dict, f: dict) -> tuple[str, str]:
@@ -362,6 +380,92 @@ def decide(d: dict, f: dict) -> tuple[str, str]:
     return "wait", "fase temprana: sin concesiones innecesarias (en MID se cierra lo razonable)"
 
 
+def agg_p_lose(f: dict) -> float:
+    """Probabilidad por tick de perder una oferta rival si no se acepta (heurística configurable, no medida): base + urgencia
+    sobre los ticks ÚTILES, descontando la cola de aceptaciones por delante (una aceptación por tick)."""
+    useful = max(1, f["ticks_left"] - max(0, f.get("queue_ahead", 0)))
+    p = PARAMS["AGG_RISK_BASE"] + PARAMS["AGG_RISK_URGENCY"] / useful
+    if f["trend"] == "WORSENING":
+        p += 0.25
+    return round(min(0.95, p), 4)
+
+
+def agg_values(f: dict) -> dict:
+    """Valor de aceptar ya frente a esperar AGG_HORIZON ticks, ambos sobre el excedente TOTAL."""
+    m = f["surplus_now"] or 0.0
+    if f["trend"] == "UNKNOWN" or (f["trend"] == "STALLED" and f["phase"] == "EARLY"):
+        # sin trayectoria, o una pausa temprana: no se supone que el rival ya no se moverá (eso aceptaba la 1.ª oferta)
+        rate = PARAMS["AGG_PRIOR_RATE_FRAC"] * abs(f["own_limit"])
+    else:
+        rate = max(0.0, f["recent_improvement_rate"] or 0.0) if f["trend"] in ("STRONG_IMPROVEMENT", "WEAK_IMPROVEMENT") else 0.0
+    h = max(0, min(PARAMS["AGG_HORIZON"], f["ticks_left"] - 1 - max(0, f.get("queue_ahead", 0))))
+    p = agg_p_lose(f)
+    gain = rate * h
+    ev_wait = round(((1 - p) ** h) * (m + gain), 2) if h > 0 else 0.0
+    return {"ev_now": round(m, 2), "ev_wait": ev_wait, "p_lose": p, "horizon": h, "gain": round(gain, 2),
+            "min_gain": round(max(2.0, PARAMS["AGG_MIN_GAIN_FRAC"] * abs(f["own_limit"])), 2)}
+
+
+def reserve_price(d: dict, days: Optional[int]) -> float:
+    """Precio de RESERVA con el día dado: aquel en que el excedente total es 0 (comprador: límite + utilidad de días ≤ 0 → paga
+    menos; vendedor: límite − utilidad de días ≥ 0 → puede cobrar menos)."""
+    lim, du = float(d["your_limit"]), days_utility(d, days)
+    return lim + du if d["role"] == "buyer" else lim - du
+
+
+def zone_price(d: dict, days: Optional[int]) -> int:
+    """Oferta propia DENTRO de nuestra zona: a AGG_ZONE_FRAC del límite de la reserva, siempre con total > 0 y precio en límite."""
+    lim = float(d["your_limit"])
+    r = reserve_price(d, days)
+    pad = max(1.0, PARAMS["AGG_ZONE_FRAC"] * abs(lim))
+    if d["role"] == "buyer":
+        p = int(math.floor(min(lim, r - pad)))
+    else:
+        p = int(math.ceil(max(lim, r + pad)))
+    return max(1, p)
+
+
+def decide_aggressive(d: dict, f: dict) -> tuple:
+    """Perfil agresivo. Nunca acepta con total ≤ 0 ni con el precio fuera de límite (barrera final en duel_candidates)."""
+    m, ratio, left, phase, trend = f["surplus_now"], f["surplus_ratio"], f["ticks_left"], f["phase"], f["trend"]
+    ours = _our_messages(d)
+    can_speak = len(ours) < PARAMS["AGG_MAX_OWN"] and (not ours or f["tick"] - max(x["tick"] for x in ours) >= PARAMS["AGG_OWN_GAP"])
+    if m is None:
+        if left <= PARAMS["AGG_SPEAK_AT"] and can_speak and left > 1:
+            return "open", "sin oferta rival: abrir pronto en nuestra zona (perfil agresivo)"
+        return "wait", "sin oferta rival todavía"
+    if not f.get("days_known", True):
+        return "wait", "formato de your_days_weight no entendido: no se acepta sin conocer el coste de los días"
+    if m <= 0:
+        outside = (f.get("price_margin") or 0) < 0
+        what = (f"precio fuera de límite (margen de precio {f.get('price_margin')})" if outside else
+                f"total {m:.1f} P ≤ 0 (precio {f.get('price_margin'):+.1f}, días {f.get('days_utility'):+.1f})")
+        if left > 1 and can_speak:
+            return "zone", f"{what}: contraoferta hacia nuestra zona de acuerdo"
+        return "expire", f"{what}: se deja vencer POR ECONOMÍA (aceptar daría resultado ≤ 0), no por inacción"
+    v = agg_values(f)
+    f["agg"] = v
+    if phase == "LATE" or left <= 1 + max(0, f.get("queue_ahead", 0)):
+        return "accept", f"cierre: quedan {left} ticks (cola {f.get('queue_ahead', 0)}) y el total es positivo ({m:.1f} P)"
+    if (trend == "WORSENING" or (trend == "STALLED" and phase != "EARLY")) and ratio >= PARAMS["AGG_STALL_RATIO"]:
+        # un plantón temprano suele ser una pausa (Verde cicla): en EARLY no se cierra solo por eso
+        return "accept", f"rival {trend.lower()}: esperar no añade valor; total {m:.1f} P ({ratio:.0%})"
+    strong = trend == "STRONG_IMPROVEMENT"
+    good = PARAMS["AGG_EARLY_GOOD_RATIO"] if phase == "EARLY" else PARAMS["AGG_GOOD_RATIO"]
+    if strong and ratio >= good:
+        return "accept", f"total {m:.1f} P ({ratio:.0%}) ya es bueno (≥ {good:.0%} en {phase}): aceptar aunque el rival mejore"
+    limit_ratio = PARAMS["AGG_EARLY_RATIO"] if phase == "EARLY" else PARAMS["AGG_MID_RATIO"]
+    if not strong and ratio >= limit_ratio:
+        return "accept", f"total {m:.1f} P ({ratio:.0%}) ≥ umbral {phase} {limit_ratio:.0%} y el rival no mejora con fuerza"
+    if v["gain"] < v["min_gain"]:
+        return "accept", f"mejora esperada {v['gain']} P < {v['min_gain']} P: no se espera por poco"
+    if v["ev_now"] >= v["ev_wait"]:
+        return "accept", f"valor de aceptar {v['ev_now']} ≥ valor de esperar {v['ev_wait']} (p pérdida {v['p_lose']}/tick, {v['horizon']} ticks)"
+    if trend == "STALLED" and can_speak and not f["our_offer_exists"]:
+        return "counter", "rival estancado con excedente pequeño: una contraoferta"
+    return "wait", f"esperar: valor {v['ev_wait']} > {v['ev_now']} (mejora {v['gain']} P en {v['horizon']} ticks, p pérdida {v['p_lose']}/tick)"
+
+
 def counter_price(f: dict) -> int:
     """Contraoferta: su precio movido una fracción del excedente de PRECIO a nuestro favor (los días se negocian aparte, en
     el día que elegimos). Nunca nuestro límite."""
@@ -377,6 +481,15 @@ def vanish_risk(f: dict) -> float:
         return 1.0
     base = {"WORSENING": 0.5, "STALLED": 0.2, "UNKNOWN": 0.1}.get(f["trend"], 0.05)
     return min(0.95, base + 0.5 / max(1, f["ticks_left"]))
+
+
+def agg_priority(f: dict, competitors: int) -> float:
+    """Prioridad EXPLÍCITA entre aceptaciones del mismo tick (perfil agresivo): pérdida esperada si esta espera un tick =
+    total × P(perderla), con P = 1 si ya no quedan ticks para todas las aceptaciones con deadline ≤ el suyo. Desempates:
+    deadline más próximo y más excedente. El orden de iteración no decide nada."""
+    s = max(0.0, f["surplus_now"] or 0.0)
+    p = 1.0 if f["ticks_left"] <= competitors else agg_p_lose(f)
+    return round(500 + s * p + s / 100.0 - f["ticks_left"] / 1000.0, 4)
 
 
 def accept_priority(f: dict) -> float:
@@ -420,6 +533,14 @@ def realistic_share(d: dict, left: int, history: Optional[list] = None) -> float
     return round(share, 4)
 
 
+def brief_line(d: dict, f: dict, action: str, reason: str) -> str:
+    """Línea breve y accionable para el log: duelo, rol, precio, días, total, ticks, tendencia, riesgo, decisión y razón."""
+    v = f.get("agg") or {}
+    risk = f"p_pérdida {v['p_lose']}/tick" if v else f"riesgo {f.get('risk_cost')}"
+    return (f"#{d.get('duel')} {d.get('role')} precio {f.get('rival_price')} días {f.get('days')} total "
+            f"{f.get('surplus_now')} quedan {f.get('ticks_left')} {f.get('trend')} {risk} ⇒ {action.upper()}: {reason}")
+
+
 def duel_candidates(duels: list, tick: int, history: Optional[list] = None) -> list:
     """Candidatas para el tick, con el mismo espíritu que las del coordinador: dicts con `type`, `duel`, `score`, `du`
     (excedente), `why` y `facts`. type ∈ {"duel_accept", "duel_say"}. Ordenar por `score`; UNA aceptación por tick.
@@ -448,7 +569,7 @@ def duel_candidates(duels: list, tick: int, history: Optional[list] = None) -> l
         queue = sum(1 for x in in_limit if x <= deadline)
         f = analyze(d if days_duel else dict(d, rival_offer={**(d.get("rival_offer") or {}), "days": None}),
                     tick, max(by_deadline.get(deadline, 1), queue))
-        action, reason = decide(d, f)
+        action, reason = decide_aggressive(d, f) if PARAMS["AGGRESSIVE"] else decide(d, f)
         prof = rival_profile(d) if PARAMS["PROFILES"] else None
         traj = rival_trajectory(d)
         safe = f["effective_safe_ticks"]
@@ -463,8 +584,13 @@ def duel_candidates(duels: list, tick: int, history: Optional[list] = None) -> l
             profile_accept, _ = _profile_rule(
                 prof, d, pm, f["own_limit"], traj, f["recent_improvement_rate"] or 0,
                 f["trend"] == "STALLED", left, safe)
-            action, reason = (("accept", f"perfil {prof}: aceptar según política del perfil")
-                              if profile_accept else ("wait", f"perfil {prof}: esperar según política del perfil"))
+            if PARAMS["AGGRESSIVE"]:
+                # el perfil solo puede ADELANTAR un cierre (Rojo/Noche/salto); nunca retrasar una aceptación agresiva
+                if profile_accept and action != "accept":
+                    action, reason = "accept", f"perfil {prof}: cerrar ya según el perfil del rival"
+            else:
+                action, reason = (("accept", f"perfil {prof}: aceptar según política del perfil")
+                                  if profile_accept else ("wait", f"perfil {prof}: esperar según política del perfil"))
         if (PARAMS["PROBE"] and action == "wait" and f["trend"] == "STALLED" and
                 f["rival_price"] is not None and f["surplus_now"] is not None and f["surplus_now"] > 0 and
                 d.get("your_offer") is None and left > safe + 2):
@@ -489,7 +615,8 @@ def duel_candidates(duels: list, tick: int, history: Optional[list] = None) -> l
         if action == "accept" and not ((f["surplus_now"] or 0) > 0 and (f.get("price_margin") or 0) >= 0 and f.get("days_known", True)):
             action, reason = "wait", "no se acepta: excedente total ≤ 0, precio fuera de límite o coste de días desconocido"
         f.update(action=action, reason=reason)
-        NOTES[d["duel"]] = {"action": action, "reason": reason, "learned": learned}
+        f["brief"] = brief_line(d, f, action, reason)
+        NOTES[d["duel"]] = {"action": action, "reason": reason, "learned": learned, "brief": f["brief"]}
         if learned is not None:
             f["learned"] = learned
         why = (f"duelo {d['duel']} fase={f['phase']} {f['role']} límite {f['own_limit']:.0f} rival {f['rival_price']} "
@@ -497,7 +624,7 @@ def duel_candidates(duels: list, tick: int, history: Optional[list] = None) -> l
                f"{f['recent_improvement_rate']} esperado {f['expected_extra_gain']} riesgo {f['risk_cost']} quedan "
                f"{left} ⇒ {action.upper()}: {reason}")
         if action == "accept":
-            score = accept_priority(f)      # excedente neto × riesgo de perder la oferta; ver accept_priority
+            score = agg_priority(f, sum(1 for x in in_limit if x <= deadline)) if PARAMS["AGGRESSIVE"] else accept_priority(f)
             out.append({"type": "duel_accept", "duel": d["duel"], "du": f["surplus_now"], "score": score, "learned": learned,
                         "prediction": {"surplus_total": f["surplus_now"], "price_margin": f["price_margin"],
                                        "days_utility": f["days_utility"], "expected_result": f["expected_result"],
@@ -508,6 +635,18 @@ def duel_candidates(duels: list, tick: int, history: Optional[list] = None) -> l
         ours = None
         if action == "counter":
             ours = counter_price(f)
+        elif action == "zone":
+            day = _best_days(d) if days_duel else None
+            ours = zone_price(d, day)
+            if margin(d, ours, day) is None or margin(d, ours, day) <= 0:
+                ours = None                      # nunca proponer algo que nos dejaría total ≤ 0
+        elif action == "open" and PARAMS["AGGRESSIVE"]:
+            # ancla realista y, si ya hablamos, más cerca de nuestro límite (la segunda oferta parte la distancia)
+            share = realistic_share(d, min(left, PARAMS["SPEAK_AT"]), history) * (0.5 ** len(_our_messages(d)))
+            day = _best_days(d) if days_duel else None
+            ours = _own_price(d, share)
+            if days_duel and (margin(d, ours, day) or 0) <= 0:
+                ours = zone_price(d, day)          # con días caros, el ancla de precio sola podría dejarnos en negativo
         elif action == "open":
             share = realistic_share(d, left, history)
             if PARAMS["LEARN"] and HOOKS["open_share"] is not None:

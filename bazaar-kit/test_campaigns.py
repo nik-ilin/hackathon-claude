@@ -20,9 +20,9 @@ CFG = cp.CampaignConfig()
 GAIN = 13.0 + 0.25 * 39  # LAT-03 completa la página de la prueba (3 cartas de 13 P)
 
 
-def listed(eid, tick, maker, give, want, oid):
-    o = offer(oid, give, want, maker=maker, exp=tick + 40)
-    return {"id": eid, "tick": tick, "type": "offer.listed", "actor": maker, "payload": {"venue": "rastro", "offer": o}}
+def listed(eid, tick, maker, give, want, oid, venue="rastro"):
+    o = offer(oid, give, want, maker=maker, exp=tick + 40, venue=venue)
+    return {"id": eid, "tick": tick, "type": "offer.listed", "actor": maker, "payload": {"venue": venue, "offer": o}}
 
 
 def world(assets=None, events=(), cash=200, threads=()):
@@ -68,6 +68,17 @@ class Discovery(unittest.TestCase):
         board_only = world()
         board_only["board"]["offers"] = [offer(600, {"assets": [asset(73, "LAT-03")]}, {"cash": 9}, maker="m3950d43b")]
         self.assertEqual(cp.evidence(board_only, 50, CFG), [], "un alias del tablón nunca se contacta")
+
+    def test_public_offers_on_other_venues_are_campaign_evidence(self):
+        feed = world(events=[listed(1, 49, "t18", {"assets": [asset(70, "LAT-03")]}, {"cash": 14}, 500,
+                                    venue="v05")])
+        board = world()
+        board_offer = offer(501, {"assets": [asset(71, "LAT-03")]}, {"cash": 13}, maker="t13",
+                            venue="v10", exp=90)
+        board["boards"] = {"v10": {"offers": [board_offer]}}
+        found = cp.evidence(feed, 50, CFG) + cp.evidence(board, 50, CFG)
+        self.assertEqual({(x["team"], x["ref"], x["venue"]) for x in found},
+                         {("t18", "LAT-03", "v05"), ("t13", "LAT-03", "v10")})
 
     def test_directly_acceptable_offers_are_left_to_the_market_module(self):
         s = world(events=[listed(1, 48, "t18", {"assets": [asset(70, "LAT-03")]}, {"cash": 14}, 500)])

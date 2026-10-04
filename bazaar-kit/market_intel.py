@@ -235,10 +235,13 @@ class History:
                         "refs": [i.get("ref") for i in cards], "parties": s.get("parties")})
         self.rows += new
         if self.path and new:
-            with open(self.path, "a", encoding="utf-8") as f:
-                for r in new:
-                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
-            self._prune()
+            try:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    for r in new:
+                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                self._prune()
+            except OSError as e:   # disco lento (p. ej. carpeta sincronizada): el historial es opcional, el ciclo sigue
+                print(f"   HISTORIAL no se pudo guardar ({type(e).__name__}: {e}); se sigue en memoria")
         return len(new)
 
     def _prune(self):
@@ -681,6 +684,16 @@ def plan(snap: dict, cfg: IntelConfig, *, pendings: list = (), spent: int = 0, a
     for o in raw:
         if o.get("id") in seen or o.get("venue") not in venues:
             continue
+        offer_refs = {r for side in (o.get("give") or {}, o.get("want") or {})
+                      for r in (side.get("cards") or []) if isinstance(r, str)}
+        offer_refs.update(t[5:] for side in (o.get("give") or {}, o.get("want") or {})
+                          for t in (side.get("types") or []) if isinstance(t, str) and t.startswith("card:"))
+        offer_refs.update(a.get("ref") for side in (o.get("give") or {}, o.get("want") or {})
+                          for a in (side.get("assets") or []) if isinstance(a, dict) and a.get("ref"))
+        if any(r.startswith("CHA-") for r in offer_refs) and o.get("venue") != "v05":
+            out["rejected"].append({"offer": o.get("id"), "venue": o.get("venue"),
+                                    "why": "CHA-* solo puede operarse en v05"})
+            continue
         seen.add(o.get("id"))
         p, why = tr.parse_offer(o, team=team, tick=tick, own_venue=None, my_assets=me["assets"],
                                 locked=res.locked_assets, max_cards=4)
@@ -757,7 +770,9 @@ def plan(snap: dict, cfg: IntelConfig, *, pendings: list = (), spent: int = 0, a
         if not free_ids:
             continue
         best = None
-        for v in usable.values():
+        venue_choices = ([usable["v05"]] if ref.startswith("CHA-") and "v05" in usable else
+                         ([] if ref.startswith("CHA-") else list(usable.values())))
+        for v in venue_choices:
             if not v.allows(val.cards[ref], level):
                 continue
             last = last_of("list", ref=ref)
@@ -801,7 +816,9 @@ def plan(snap: dict, cfg: IntelConfig, *, pendings: list = (), spent: int = 0, a
         if not st.missing or buying.get(ref) or st.gain_if_bought < cfg.margin + 1:
             continue
         cands = []
-        for v in usable.values():
+        venue_choices = ([usable["v05"]] if ref.startswith("CHA-") and "v05" in usable else
+                         ([] if ref.startswith("CHA-") else list(usable.values())))
+        for v in venue_choices:
             if not v.allows(val.cards[ref], level):
                 continue
             last = last_of("bid", ref=ref)

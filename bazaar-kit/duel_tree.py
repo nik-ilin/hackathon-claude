@@ -139,6 +139,7 @@ def plan(live: list[dict], tick: int, events: Iterable[dict] = (),
         facts = decision_facts(by_id.get(duel_id, {}), tick,
                                same_deadline.get(by_id.get(duel_id, {}).get("deadline_tick"), 1))
         out.append({"duel": duel_id, "action": action, "candidate": candidate, "learned": candidate.get("learned"),
+                    "brief": (candidate.get("facts") or {}).get("brief"),
                     "path": path, "trigger": _trigger(action, facts), "facts": facts,
                     "reason": candidate.get("why", ""),
                     "feed": evidence})
@@ -150,7 +151,7 @@ def plan(live: list[dict], tick: int, events: Iterable[dict] = (),
         facts = decision_facts(duel, tick,
                                same_deadline.get(duel.get("deadline_tick"), 1))
         note = duels.NOTES.get(duel_id) or {}
-        out.append({"duel": duel_id, "action": "wait", "candidate": None, "learned": note.get("learned"),
+        out.append({"duel": duel_id, "action": "wait", "candidate": None, "learned": note.get("learned"), "brief": note.get("brief"),
                     "path": path, "trigger": reason, "facts": facts,
                     "reason": note.get("reason") or reason, "feed": evidence})
     return out

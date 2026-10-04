@@ -117,3 +117,16 @@ hipótesis. El modelo (por rol · rival · fase, con decaimiento, agrupación y 
 base: esperar en vez de aceptar si la mejora esperada tiene cota inferior > 0, o cerrar ya si el rival no mejora; con evidencia
 insuficiente devuelve la base y lo dice en la razón. Nunca toca límites, la regla total > 0, una aceptación por tick ni el mercado.
 Laboratorio: `python3 duel_lab.py audit|summary|replay|sim|all|fetch` (separación temporal, semillas disjuntas, sin enviar nada).
+
+## Perfil agresivo de Duelos III (`--day3` lo activa; `--no-aggressive` lo apaga)
+
+Decide sobre el excedente TOTAL (margen de precio + utilidad firmada de días): aceptar vale `m`; esperar `H` ticks vale
+`(1−p)^H·(m + mejora·H)`, con `p = 0,05 + 0,25 / ticks útiles` (+0,25 si el rival empeora). Umbrales: EARLY 25 % y MID 10 % si el rival no
+mejora con fuerza; con mejora fuerte, aceptar si el total ya es «bueno» (45 % EARLY, 32 % MID). Primera oferta y pausas tempranas
+usan una mejora a priori (2 % del límite/tick), no 0. Rival estancado o empeorando en MID/LATE: cerrar desde el 3 %. LATE o cola
+de aceptaciones que alcanza el deadline: cerrar cualquier total positivo. Total ≤ 0 con tiempo: contraoferta en nuestra zona
+(reserva ± 4 % del límite, con nuestro mejor día); sin tiempo: `expire`, «se deja vencer POR ECONOMÍA». Los perfiles de rival solo
+pueden adelantar un cierre. Prioridad entre aceptaciones del mismo tick: total × P(perderla), explícita (`agg_priority`).
+Medición: `python3 duel_lab.py waves` (replay por oleadas, una aceptación por tick). Con los duelos de las sesiones 3–5 el perfil
+cierra ~1,7 ticks antes y captura ~15 % menos en replay: los bots de la casa siguen mejorando hasta el final; el replay no modela
+ofertas que desaparecen ni colisiones de cola reales (p. ej. 11295, 50,8 P perdidos por diferir en el último tick).
