@@ -343,6 +343,20 @@ class Runner(unittest.TestCase):
         self.assertTrue(learner.update([dict(first[0], result=25.0)]))
         self.assertFalse(learner.update([dict(first[0], result=25.0)]))
 
+    def test_live_model_excludes_unscored_practice(self):
+        learner = L.Learner()
+        self.assertTrue(learner.update([done(1, session=1), done(2, session=3)]))
+        self.assertEqual(learner.snapshot()["facts"]["duels_done"], 1)
+
+    def test_failed_history_fetch_retries_next_tick(self):
+        api = Mock()
+        confirmed = done(7, status="deal", price=71, result=29.0)
+        api.duels.side_effect = [runner.BazaarError("network"), {"duels": [confirmed]}]
+        history, at, refreshed = runner.refresh_history(api, [], None, 100)
+        self.assertEqual((history, at, refreshed), ([], None, False))
+        history, at, refreshed = runner.refresh_history(api, history, at, 101)
+        self.assertEqual((len(history), at, refreshed), (1, 101, True))
+
 
 if __name__ == "__main__":
     unittest.main()

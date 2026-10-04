@@ -4,6 +4,42 @@ Este documento es un procedimiento, no una orden de ejecutar. `./run.sh day3`, `
 `./run.sh celestina --leads` y `./run.sh duels --day3` son **solo lectura** sin `--execute`. Los procesos con
 `--execute` escriben en la API. Cargar la `.env` legítima del equipo solo en el checkout operativo; no imprimir claves.
 
+## Actualización del domingo: Chamberí y puntuación
+
+Chamberí (`CHA`) ya está publicado: 12 referencias, 10 para completar su página. No perseguir la página desde cero
+con compras a precio de lista: el valor de la última carta sólo se materializa si ya están las otras nueve y el
+trato queda por debajo de la valoración privada. El equipo empezó esta ventana sin CHA; el dashboard debe confirmar
+el inventario actual antes de cada operación. La salida de Chamberí sí crea una oportunidad de **mercado**: localizar
+un equipo que necesite una referencia concreta y otro con copia libre; pedirles que publiquen ofertas en v15 y medir
+la liquidación y el valor que ambos crean. En la lectura del tick 1554 había 49 ofertas abiertas y cero parejas que
+cruzasen; t04 buscaba CHA-06/07/08 por 20 P, una demanda unilateral y con caducidad, no puntos ya capturados.
+
+La caja era 635 P después de la asignación dominical, pero la valoración esperada de los sobres a precio de lista
+seguía por debajo de su coste: barrio 17,98 frente a 26, plata 100,29 frente a 150, oro 328,49 frente a 420 P
+(estimación estratégica, sujeta al inventario). Comprar sólo si un descuento negociado o una necesidad de página
+verificada invierte ese balance. El efectivo final no puntúa, pero tampoco convierte una compra negativa en buena.
+
+**Revisión posterior (ticks 1613–1653):** `/api/me` mostró cero sobres sin abrir y 45 cartas, incluidas CHA-10 y
+CHA-09. El historial privado de caja y valor de colección aísla ambas compras: CHA-10 por 60 P añadió 63 P de valor
+(+3 P netos observados); CHA-09 por 61 P añadió 63 P (+2 P). Una venta de MAL-07 a t03 por 9 P en el tick 1647
+redujo el valor de colección 6,9 P (+2,1 P netos observados). El dashboard enseña 41 liquidaciones propias del feed,
+pero sólo tres tienen muestras privadas antes/después y un único trato en el intervalo: las otras 38 quedan **sin
+valoración aislada**, no como buenas ni malas. Ninguno de estos excedentes equivale por sí mismo a puntos del ranking.
+
+Con el inventario del tick 1623, el modelo de valoración reprodujo el valor privado del servidor (1699,75 frente a
+1699,8 P). En 5.000 simulaciones por tipo, el EV bruto de colección fue 13,49 P para barrio (precio 26), 78,06 P
+para plata (150) y 288,51 P para oro (420); probabilidad estimada de al menos un duplicado: 98,2 %, 99,9 % y 99,9 %.
+Estos EV no incluyen reventa; incluso la estimación estratégica anterior, más generosa, quedaba por debajo de los
+precios. Mejor negociar una carta concreta por debajo de su valor privado, con contraparte o escalera verificable,
+que consumir 420 P en un oro esperando suerte. Recalcular tras nuevas adquisiciones y no sumar estos EV al score.
+
+El score descendió de 23,91 a 21,11 mientras los tratos seguían en 61 y los acumulados privados nuevos en cero:
+negociación y mercado cayeron proporcionalmente al entrar la ronda dominical. Es dilución por ponderación, no pérdida
+observada de una operación nueva. La sección «Qué movió el score» del dashboard distingue estos intervalos de nuevos
+duelos, dealers, tratos entre terceros y ajustes de mercado; `/api/strategy` exporta los últimos 20 impactos y el
+histórico detallado de duelos para los agentes. El histórico enseña precio, días, rival y resultado publicado; `result`
+es excedente del duelo, no puntos directos de leaderboard, y la práctica no cuenta.
+
 ## Por qué estas prioridades
 
 La presentación *Payday* de Luis Morales aclara los 100 puntos: 30 negociación, 22,5 Market Test, 7,5 valor de
@@ -42,6 +78,42 @@ base. Esto no prueba que el módulo esté roto: prueba que todavía no hay evide
 de política. El runner conserva toda la cohorte al actualizarse tras cada liquidación y detecta
 correcciones del servidor aunque el número de duelos no cambie. `--learn` continúa opt-in hasta
 que el laboratorio muestre una mejora fuera de la muestra de entrenamiento.
+
+### Qué memoria usa realmente cada agente
+
+`./run.sh day3` ejecuta `memory_coordinator.py`: guarda el feed y las acciones en
+`data/agent_memory.sqlite3`, enriquece el feed que lee el coordinador y añade
+comparables a las candidatas. La política de ventas aprendida por `learning.py`
+requiere además una campaña `--fast-sales` y una versión de política con
+`use_learned_price`; el preset `day3` no activa ninguna de las dos. Por ello,
+una base SQLite con eventos no significa que los precios del coordinador se
+estén reajustando automáticamente.
+
+`./run.sh duels --day3` ejecuta otro proceso, `duel_runner.py`. Al operar lee
+`/api/duels?done=true` y la mediana de acuerdos comparables puede limitar su
+oferta inicial (`HISTORY_MIN`). La memoria SQLite anterior no entra en esa
+decisión. `--learn` conecta el modelo que puede cambiar aceptar/esperar, pero
+queda desactivado en `--day3`. La última prueba temporal real cambió 0
+decisiones tanto en validación como en test; activarlo por defecto no tiene
+evidencia de mejora. El dashboard distingue ahora un informe guardado de un
+proceso en ejecución. En la comprobación del domingo a las 09:14 de Madrid
+no estaba ejecutándose ninguno de los dos agentes; la API seguía pausada
+en tick 1445, sin duelos vivos.
+
+La auditoría detectó que `--profiles` enviaba las aperturas ante rivales mudos
+por una ruta que ignoraba esa mediana histórica. Se corrigió: ahora esa ruta
+aplica el límite de los acuerdos comparables y anota `memory.applied` en la
+acción. También se excluyen los duelos de práctica y los cierres con resultado
+no positivo. Con el histórico disponible hay 10/15 acuerdos útiles como comprador y 8/22 como vendedor para
+precio solo/precio+días, respectivamente; la mediana limita la apertura solo
+si es menos exigente que el ancla base.
+
+Para volver a comprobarlo antes de Duelos III: refrescar el histórico con
+`python3 duel_lab.py fetch`, correr `python3 duel_lab.py replay`, verificar el
+proceso operativo en el dashboard y observar en `data/duels_log.jsonl` las
+decisiones `learned` y las liquidaciones `reconciled`. Si se prueba `--learn`,
+comparar la tasa de cierre, los resultados negativos y las decisiones que
+cambió contra la política base antes de mantenerlo activo.
 
 El preset `./run.sh day3` pasa ahora por `memory_coordinator.py`. Esto importa el feed histórico
 en SQLite, registra decisiones y entrega comparables al coordinador en cada ciclo, manteniendo

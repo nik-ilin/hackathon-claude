@@ -40,7 +40,7 @@ class OperationsTests(unittest.TestCase):
 
     def test_capital_and_market_signal_do_not_claim_broker_liveness(self):
         result = operations.build(duels=[], duel_error=None, tick=100, cash=500,
-                                  offers=[{"status": "open", "give": {"cash": 90}}], reserve=100,
+                                  offers=[{"status": "open", "maker": "t15", "give": {"cash": 90}}], reserve=100,
                                   venues=[{"venue": "v15", "owner": "t15", "status": "open",
                                            "rules": {"mechanism": "board"}}],
                                   feed_health={"status": "fresh"}, verified=True)
@@ -50,6 +50,17 @@ class OperationsTests(unittest.TestCase):
         self.assertEqual(result["queue"][0]["topic"], "market")
         self.assertIn('Mesa de mando', render_operations({"operations": result}))
         self.assertEqual(strategy_export({"operations": result})["operations"]["source_tick"], 100)
+
+    def test_incoming_counterparty_bid_does_not_reserve_team_cash(self):
+        result = operations.capital_watch(360, [
+            {"status": "open", "maker": "banco", "to": "t15", "give": {"cash": 113}},
+            {"status": "open", "maker": "t15", "to": None, "give": {"cash": 40}},
+            {"status": "open", "maker": "t15", "to": None, "give": {"assets": [{"ref": "LAT-11"}]},
+             "want": {"cash": 248}},
+        ])
+        self.assertEqual(result["open_bid_commitments"], 40)
+        self.assertEqual(result["uncommitted_cash"], 320)
+        self.assertEqual(result["spendable_after_reserve"], 220)
 
     def test_public_only_view_does_not_invent_missing_cards_or_cash_value(self):
         view = render_dashboard_overview({"verified": False, "catalog_rows": [

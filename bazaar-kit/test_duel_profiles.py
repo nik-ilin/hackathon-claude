@@ -92,6 +92,13 @@ class Profiles(Params):
         self.assertEqual(kinds(dl.duel_candidates([duel("Rival Oro", prices=[95, 95, 95])], 2)), [])
         self.assertEqual(kinds(dl.duel_candidates([duel("Rival Oro", prices=[95, 95, 75])], 2)), ["duel_accept"])
 
+    def test_profile_early_threshold_uses_net_days_value(self):
+        self.flags(PLAY_DAYS=True)
+        d = duel("Rival Plata", role="buyer", limit=100, prices=[5], days=9, weight=10, deadline=16)
+        self.assertEqual(dl.price_margin(d, 5), 95)
+        self.assertEqual(dl.margin(d, 5, 9), 5)
+        self.assertNotIn("duel_accept", kinds(dl.duel_candidates([d], 0)))
+
     def test_mixed_rival_accepted_when_it_worsens(self):
         self.assertEqual(kinds(dl.duel_candidates([duel("Rival Noche", prices=[80, 82])], 1)), ["duel_accept"])
         self.assertEqual(kinds(dl.duel_candidates([duel("Rival Noche", prices=[82, 80])], 1)), [])
@@ -116,6 +123,21 @@ class Profiles(Params):
         self.assertEqual(dl.duel_candidates([d], 13), [])                # MUTE_MAX
         self.flags(PROFILES=False)
         self.assertEqual(dl.duel_candidates([duel("Rival Sol")], 3), [])  # sin flag: espera a SPEAK_AT
+
+    def test_mute_opening_uses_confirmed_history_and_excludes_practice(self):
+        d = duel("Rival Sol", role="buyer", limit=100)
+        scored = [dict(session=2, status="deal", role="buyer", issues=["price"],
+                       your_limit=100, price=92) for _ in range(dl.PARAMS["HISTORY_MIN"])]
+        practice = [dict(session=1, status="deal", role="buyer", issues=["price"],
+                         your_limit=100, price=98) for _ in range(dl.PARAMS["HISTORY_MIN"])]
+        losing = [dict(session=2, status="deal", result=-2, role="buyer", issues=["price"],
+                       your_limit=100, price=98) for _ in range(dl.PARAMS["HISTORY_MIN"])]
+        base = dl.duel_candidates([d], 3)[0]
+        learned = dl.duel_candidates([d], 3, scored + practice + losing)[0]
+        self.assertGreater(learned["price"], base["price"])
+        self.assertEqual(learned["memory"]["historical_cap"], 0.08)
+        self.assertTrue(learned["memory"]["applied"])
+        self.assertIsNone(dl.duel_candidates([d], 3, practice + losing)[0]["memory"]["historical_cap"])
 
     def test_only_one_accept_per_tick_in_plan(self):
         wave = [duel("Rival Rojo", prices=[80], duel=i) for i in range(3)]

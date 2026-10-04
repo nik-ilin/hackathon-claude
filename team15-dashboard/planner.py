@@ -76,12 +76,15 @@ def catalog_matrix(catalog: dict, counts: Counter, val, verified: bool,
             released = bool(set_data.get('released', card.get('released', True)))
             held = int(counts.get(ref, 0)) if verified else observed.get(ref, 0)
             can_value = verified and released and val.unit(ref) is not None
-            loss = -val.delta(counts, Counter(), Counter({ref: 1}))[0] if can_value and held else None
+            loss, loss_notes = val.delta(counts, Counter(), Counter({ref: 1})) if can_value and held else (None, [])
+            loss = -loss if loss is not None else None
             gain = val.delta(counts, Counter({ref: 1}), Counter())[0] if can_value else None
             rows.append({'ref': ref, 'set': set_data.get('name') or set_data.get('id'),
                          'rarity': card.get('rarity'), 'released': released,
                          'stock': held, 'free': free.get(ref, 0),
                          'sell_floor': math.ceil(loss + margin) if loss is not None else None,
+                         'sell_value_loss': round(loss, 2) if loss is not None else None,
+                         'sell_breaks_page': any('ROMPERÍA la página' in note for note in loss_notes),
                          'buy_ceiling': max(0, math.floor(gain - margin)) if gain is not None else None,
                          'held_by': sorted(r['team'] for r in rivals.get('teams', [])
                                            if r.get('team') != 't15' and ref in (r.get('held') or [])),

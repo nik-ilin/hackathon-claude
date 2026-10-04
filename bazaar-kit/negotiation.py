@@ -442,14 +442,26 @@ class DealerPolicy:
 #   chato   0.35 / 0.85 / 0.30   impaciente y astuto     -> pocas rondas, pasos grandes
 #   pilar   0.60 / 0.75 / 0.15   recíproca (cede 1:1 en 20 observaciones del feed)
 #   picaros 0.40 / 0.70 / 0.30   impaciente; ofertas con truco -> validar siempre los assets
+#   4 oct 13:00: Captura rango real (intel/REPORT.md) t15=0.20 vs t18/t01/t14=0.50. La fórmula de next_price
+#   (línea ~624: p = last_ours + gap_frac * (ask - last_ours)) confirma el mecanismo: gap_frac alto converge
+#   rápido hacia SU precio = poca captura. Se baja gap_frac solo en abuela/pilar (paciencia 0.85/0.60, ALTA:
+#   aguantan más rondas sin romper el hilo) para capturar más rango sin arriesgar el cierre. NO se toca
+#   chato/picaros (paciencia 0.35/0.40, BAJA): con menos margen de ronda, estrechar la concesión ahí es más
+#   probable que rompa hilos que gane captura, y picaros ya se tocó hoy (ver nota debajo). banco no se toca
+#   (sin observaciones propias, y sin caja para operar con él hoy).
 DEALER_TRAITS = {
-    "abuela":  dict(open_frac=0.45, gap_frac=0.30, max_counteroffers=3, max_ticks=8,
+    "abuela":  dict(open_frac=0.45, gap_frac=0.20, max_counteroffers=3, max_ticks=8,
                     sell_open_mult=2.4, sell_gap_frac=0.25, sell_step=1),
     "chato":   dict(open_frac=0.55, gap_frac=0.40, max_counteroffers=2, max_ticks=5,
                     sell_open_mult=1.8, sell_gap_frac=0.40, sell_step=4),
-    "pilar":   dict(open_frac=0.50, gap_frac=0.35, max_counteroffers=3, max_ticks=6,
+    "pilar":   dict(open_frac=0.50, gap_frac=0.22, max_counteroffers=3, max_ticks=6,
                     sell_open_mult=2.2, sell_gap_frac=0.30, sell_step=2),
-    "picaros": dict(open_frac=0.50, gap_frac=0.40, max_counteroffers=2, max_ticks=5,
+    # 4 oct: max_counteroffers/max_ticks subidos de 2/5 a 3/7 (no toca open_frac/gap_frac, solo da una ronda
+    # más antes de rendirse). Tras subir --per-card/--max-spend hoy, picaros es el dealer con más hilos nuevos
+    # y el ratio de cierre global bajó (25/91 -> 25/95: los 4 hilos nuevos no cerraron ninguno); confianza MEDIA,
+    # sin log por-hilo que separe "agotamos rondas" de "el dealer nunca llegó a nuestro suelo", pero el riesgo es
+    # bajo porque no cambia la agresividad de precio, solo la paciencia.
+    "picaros": dict(open_frac=0.50, gap_frac=0.40, max_counteroffers=3, max_ticks=7,
                     sell_open_mult=2.0, sell_gap_frac=0.35, sell_step=3),
     # Don Ernesto (banco): paciencia 0.95 / astucia 0.95 / rigor 1.0 -> no se le gana por desgaste; una propuesta y
     # como mucho DOS contraofertas, luego se reevalúa. Sin observaciones propias todavía: valores prudentes, no medidos.

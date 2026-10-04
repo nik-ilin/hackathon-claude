@@ -10,6 +10,7 @@ import argparse
 import html
 import importlib.util
 import json
+import mimetypes
 import os
 import statistics
 import sys
@@ -27,11 +28,16 @@ sys.path.append(str(KIT))  # los módulos locales (radio.py, scoring.py) deben g
 import dashboard as public_dashboard
 
 import charts
+import duel_history
 import history
+import market_activity
 import operations
 import scoring
 import strategy_health
+import strategy_v3
+import trade_history
 from planner import build_rank
+from history_store import HistoryStore
 
 # El kit también tiene radio.py; cargar el módulo del panel por ruta evita que
 # una importación previa del kit sustituya sus funciones en un proceso largo.
@@ -127,7 +133,7 @@ def settled_by_dealer(stores, team: str) -> dict:
 
 class Model:
     def __init__(self, reader: Reader, team: str = "t15", reserve: int = 100,
-                 feed_root: Path = KIT):
+                 feed_root: Path = KIT, history_retention_days: int = 90):
         self.reader, self.team, self.reserve = reader, team, reserve
         self.public = public_dashboard.Builder(reader, team=team, root=feed_root)
         self.history_path = Path(feed_root) / "data" / "score_history.jsonl"
@@ -140,6 +146,8 @@ class Model:
         self._dealer_cache = None
         self.done_cache = []
         self.done_at = 0.0
+        self.dashboard_history = HistoryStore(Path(feed_root) / "data" / "dashboard_history.sqlite3",
+                                              retention_days=history_retention_days)
 
     def _dealers(self) -> dict:
         if self._dealer_cache is None:
@@ -233,6 +241,24 @@ class Model:
                           rivals, listing_teams, reserve=self.reserve,
                           market_refs={ref: {"fair": card.fair, "confidence": card.confidence}
                                        for ref, card in public.oracle.cards.items()})
+        rank['unopened_packs'] = [{k: a.get(k) for k in ('id', 'ref', 'your_value')}
+                                  for a in (me.get('assets') or []) if a.get('kind') == 'pack']
+        rank['liquidation_targets'] = []
+        if rank.get('verified'):
+            for row in rank.get('catalog_rows') or []:
+                loss, floor = row.get('sell_value_loss'), row.get('sell_floor')
+                wants = row.get('wanted_by') or []
+                if (row.get('stock', 0) and wants and not row.get('sell_breaks_page')
+                        and isinstance(loss, (int, float)) and isinstance(floor, (int, float))):
+                    rank['liquidation_targets'].append({
+                        'ref': row['ref'], 'loss': loss, 'floor': floor, 'ask': floor + 2,
+                        'floor_surplus': round(floor - loss, 2), 'stock': row['stock'],
+                        'breaks_page': bool(row.get('sell_breaks_page')),
+                        'demanders': wants, 'sold_median': row.get('sold_median'),
+                        'sold_count': row.get('sold_count', 0),
+                    })
+            rank['liquidation_targets'].sort(
+                key=lambda r: (r['floor'], r['sold_median'] is None, -len(r['demanders'])))
         enrich_catalog_market(rank.get('catalog_rows') or [], self.catalog or {}, public.oracle.cards)
         holdings = {r['ref']: r.get('stock') for r in (rank.get('catalog_rows') or [])
                     if r.get('ref') and r.get('stock')}
@@ -244,6 +270,8 @@ class Model:
         rank["warnings"] = warnings + public.errors + rank["warnings"]
         rank["board_count"] = sum(map(len, boards.values()))
         rank["venue_count"] = len(boards)
+        rank["market_activity"] = market_activity.build(
+            venues, boards, own_offers, self.team, int(public.clock.get("tick") or 0) or None)
         rank["built_at"] = time.time()
         rank["clock"] = public.clock
         rank["live"] = bool(me)
@@ -265,6 +293,7 @@ class Model:
                 warnings.append('Historial de duelos: lectura privada no disponible; se conserva la última muestra.')
         rank['strategy_health'] = strategy_health.build(
             self.done_cache, (self.public.root, KIT), tick_now)
+        rank['duel_history'] = self.done_cache
         rank["ladder"] = scoring.ladder_block(self._dealers(), settled_by_dealer(self.public.stores, self.team),
                                               me.get("unlocked") or [])
         if tick_now:
@@ -274,12 +303,17 @@ class Model:
                                               rank.get("score") or {}, public.leaderboard,
                                               cash=rank.get("cash"),
                                               collection_value=rank.get("collection_value"),
-                                              team=self.team))
+                                              team=self.team, round_number=public.clock.get("round")))
             except OSError as exc:
                 warnings.append(f"Historia: {type(exc).__name__}")
         rank["history"] = history.load(self.history_path)
         rank["history_summary"] = history.summary(rank["history"], self.team)
+        rank["impact_events"] = history.impact_events(rank["history"])
+        rank['trade_history'] = trade_history.ledger(
+            trade_history.settlements(self.public.stores, self.team), rank['history'], self.team)
+        rank['trade_summary'] = trade_history.summary(rank['trade_history'])
         rank["rank_race"] = history.rank_race(rank["history"], self.team)
+        rank["rank_race_all"] = history.rank_race_all(rank["history"], self.team)
         if rank["feed_health"].get("status") != "fresh":
             rank["warnings"].append(
                 "El almacén del feed no está al día: los precios, los rivales y el playbook se calculan sobre él. "
@@ -289,6 +323,10 @@ class Model:
                                 if row.get("team") == self.team), None)
             if public_team:
                 rank["score"] = {"score": public_team.get("score")}
+        try:
+            self.dashboard_history.record(rank)
+        except (OSError, ValueError, TypeError) as exc:
+            rank["warnings"].append(f"Histórico detallado del dashboard: {type(exc).__name__}")
         return rank
 
 
@@ -544,6 +582,18 @@ def render_rank_strategy(data: dict) -> str:
 
 
 
+def _last_complete_leaderboard(data: dict, team: str = "t15") -> tuple[list[dict], int | None]:
+    """Recover one coherent last-known public board when the live feed is partial."""
+    for sample in reversed(data.get("history") or []):
+        rivals = sample.get("rivals") or {}
+        if team in rivals and len(rivals) >= 3:
+            rows = [{"team": name, "score": score} for name, score in rivals.items()
+                    if isinstance(score, (int, float))]
+            if team in {row["team"] for row in rows}:
+                return rows, sample.get("tick")
+    return [], None
+
+
 def strategy_export(data: dict) -> dict:
     """Agent-friendly, evidence-preserving strategy payload."""
     rows = data.get('catalog_rows') or []
@@ -553,6 +603,10 @@ def strategy_export(data: dict) -> dict:
     missing = [r for r in released if r.get('stock') == 0]
     sold_values = [r['sold_median'] for r in sold]
     leaderboard_rows = (data.get('leaderboard') or {}).get('teams') or []
+    ranking_source, ranking_tick = "live", data.get("tick")
+    if not leaderboard_rows:
+        leaderboard_rows, ranking_tick = _last_complete_leaderboard(data)
+        ranking_source = "history" if leaderboard_rows else "unavailable"
     board_sorted = sorted([r for r in leaderboard_rows if isinstance(r.get('score'), (int, float))], key=lambda r: r.get('score', 0), reverse=True)
     rank_index = next((i for i, r in enumerate(board_sorted, 1) if r.get('team') == 't15'), None)
     current_score = next((r.get('score') for r in board_sorted if r.get('team') == 't15'), data.get('score', {}).get('score'))
@@ -560,6 +614,8 @@ def strategy_export(data: dict) -> dict:
     leader_score = board_sorted[0].get('score') if board_sorted else None
     ranking = {
         'position': rank_index, 'teams_count': len(board_sorted), 'score': current_score,
+        'source': ranking_source, 'observed_tick': ranking_tick,
+        'private_score': (data.get('score') or {}).get('score'),
         'gap_to_next_position': round(next_score - current_score, 2) if next_score is not None and current_score is not None else None,
         'gap_to_leader': round(leader_score - current_score, 2) if leader_score is not None and current_score is not None else None,
         'leaderboard_order': [{'team': r.get('team'), 'score': r.get('score')} for r in board_sorted],
@@ -594,19 +650,30 @@ def strategy_export(data: dict) -> dict:
             'scarcity_ratio_minted_to_print_run': round(scarcity_ratio, 4) if scarcity_ratio is not None else None,
             'sold_median': row.get('sold_median'), 'sold_count': len(row.get('sold_prices') or []),
             'sold_prices': row.get('sold_prices') or [],
-            'sell_floor': row.get('sell_floor'), 'buy_ceiling': row.get('buy_ceiling'),
+            'sell_floor': row.get('sell_floor'), 'sell_value_loss': row.get('sell_value_loss'),
+            'sell_breaks_page': row.get('sell_breaks_page'), 'buy_ceiling': row.get('buy_ceiling'),
         })
     return {
         'schema': 'team15.strategy.v2', 'schema_compatibility': 'team15.strategy.v1 fields retained', 'team': 't15', 'tick': data.get('tick'),
         'generated_at': data.get('built_at'), 'verified_private_data': bool(data.get('verified')),
         'freshness': {'snapshot_tick': data.get('tick'), 'built_at': data.get('built_at'), 'status': 'live' if data.get('live') else 'public_only', 'cache_max_age_seconds': 12},
         'ranking': ranking,
-        'scoring': data.get('scoring') or {},
+        'leaderboard_history': data.get('rank_race_all') or {},
+        'scoring': (scoring.scoring_block(data.get('score') or {}, {'teams': board_sorted}, 't15')
+                    if board_sorted else data.get('scoring') or {}),
         'ladder': data.get('ladder') or {},
-        'peers': data.get('peers') or {},
+        'peers': scoring.peers_block({'teams': board_sorted}, 't15') if board_sorted else data.get('peers') or {},
         'feed_health': data.get('feed_health') or {},
         'operations': data.get('operations') or {},
+        'market_activity': data.get('market_activity') or {},
         'strategy_health': data.get('strategy_health') or {},
+        'score_impacts': (data.get('impact_events') or [])[-20:],
+        'duel_history': duel_history.rows(data.get('duel_history') or []),
+        'duel_analysis': duel_history.analysis(data.get('duel_history') or []),
+        'trade_history': data.get('trade_history') or [],
+        'trade_summary': data.get('trade_summary') or {},
+        'unopened_packs': data.get('unopened_packs') or [],
+        'liquidation_targets': data.get('liquidation_targets') or [],
         'opportunities': opportunities,
         'kpis': {
             'published_cards': len(released), 'catalog_cards': len(rows),
@@ -933,6 +1000,7 @@ def render_trend(data: dict) -> str:
     rows = data.get('history') or []
     summary = data.get('history_summary') or {}
     race = data.get('rank_race') or {}
+    race_all = data.get('rank_race_all') or {}
     peers = data.get('peers') or {}
     if summary.get('status') != 'ok':
         return ('<section id="tendencia" class="monitor"><div class="section-head"><div>'
@@ -975,10 +1043,22 @@ def render_trend(data: dict) -> str:
                           caption='Lo que paga la escalera es la cuota del rango capturada. '
                                   'Sube regateando mejor, no cerrando más tratos.'),
     ]
-    if race.get('series'):
-        cards.append(charts.line_chart(race['series'], title='Carrera con los vecinos',
-                                       caption='El de arriba y el de abajo son los que mueven el puesto. '
-                                               'Elegidos por el estado actual, no por el inicial.'))
+    if race_all.get('scores'):
+        names = race_all.get('teams') or list(race_all['scores'])
+        palette = ['#91a3aa', '#758b94', '#aab8bd', '#627c85']
+        colors = {name: palette[i % len(palette)] for i, name in enumerate(names)}
+        colors['t15'] = '#087c7c'
+        cards.append(charts.line_chart(race_all['scores'], width=820, height=250,
+                                       colors=colors, highlight='t15',
+                                       title='Carrera de score · todos los equipos',
+                                       caption=f'{len(names)} equipos; Team 15 resaltado. '
+                                               'El score público puede retrasarse frente al desglose privado.'))
+        cards.append(charts.line_chart(race_all['positions'], width=820, height=250,
+                                       lo=1, hi=max(2, len(names)), invert=True,
+                                       value_fmt='{:.0f}', colors=colors, highlight='t15',
+                                       title='Puesto histórico · todos los equipos',
+                                       caption='Escala completa del puesto; arriba es mejor. '
+                                               f'Posición pública más reciente de Team 15: {esc(race_all.get("position") or "—")} de {len(names)}.'))
 
     parts = ['<section id="tendencia" class="monitor"><div class="section-head"><div>',
              '<h2>Trayectoria</h2>',
@@ -986,29 +1066,33 @@ def render_trend(data: dict) -> str:
              'en <code>bazaar-kit/data/score_history.jsonl</code>.</p>',
              '</div></div><div class="charts">', *cards, '</div>']
 
-    moves = [m for m in history.deltas(rows, 'score', window=0) if m['delta']]
-    if moves:
-        parts += ['<table class="attrib"><caption>Qué movió los puntos</caption><thead><tr>',
-                  '<th>ticks</th><th>score</th><th>tratos</th><th>por trato</th><th>caja</th><th>colección</th>',
-                  '</tr></thead><tbody>']
-        for m in list(reversed(moves))[:8]:
-            cls = 'up' if m['delta'] > 0 else 'down'
-            ppd = m.get('points_per_deal')
+    impacts = list(reversed(data.get('impact_events') or []))[:8]
+    if impacts:
+        parts += ['<div class="impact-head"><div><h3>Qué movió el score</h3>',
+                  '<p>Lecturas entre ticks; la etiqueta describe la evidencia disponible, no atribuye una causa única.</p></div>',
+                  '<span>Últimos 8 cambios</span></div><div class="impact-grid">']
+        for event in impacts:
+            delta = event['delta']
+            amount = delta['score'] or 0
+            cls = 'positive' if amount > 0 else 'negative'
+            if event['label'] in ('Ponderación de ronda', 'Cambio de ronda'):
+                cls = 'round-shift'
+            drivers = []
+            for key, label in (('negotiating', 'Negociación'), ('market', 'Mercado'),
+                               ('duel_points', 'Duelos raw'), ('ladder_points', 'Dealers raw'),
+                               ('neg_points', 'Tratos raw'), ('mm_points', 'Terceros raw'),
+                               ('deals', 'Tratos')):
+                value = delta.get(key)
+                if isinstance(value, (int, float)) and value:
+                    drivers.append(f'<span>{label} <b>{value:+.2f}</b></span>')
             parts.append(
-                f'<tr><td>{esc(m["from_tick"])} → {esc(m["to_tick"])}</td>'
-                f'<td class="{cls}">{m["delta"]:+.2f}</td>'
-                f'<td>{esc(m.get("delta_deals") or "—")}</td>'
-                f'<td class="{cls if ppd else ""}">{(f"{ppd:+.2f}" if ppd else "—")}</td>'
-                f'<td>{esc(m.get("delta_cash") or "—")}</td>'
-                f'<td>{esc(m.get("delta_collection_value") or "—")}</td></tr>')
-        parts.append('</tbody></table>')
-        best = summary.get('best_deal')
-        if best and best.get('points_per_deal'):
-            parts.append('<p class="chart-note">Mejor intervalo: '
-                         f'{esc(best["from_tick"])} → {esc(best["to_tick"])}, '
-                         f'{best["delta"]:+.2f} puntos en {esc(best.get("delta_deals"))} trato(s) = '
-                         f'{best["points_per_deal"]:+.2f} por trato. '
-                         'La atribución junta todo lo que pasó en el intervalo: no aísla una causa.</p>')
+                f'<article class="impact-card {cls}"><div class="impact-top">'
+                f'<span class="impact-type">{esc(event["label"])}</span>'
+                f'<strong>{amount:+.2f}</strong></div>'
+                f'<div class="impact-ticks">tick {esc(event["from_tick"])} → {esc(event["to_tick"])}</div>'
+                f'<div class="impact-drivers">{"".join(drivers) or "Sin desglose disponible"}</div>'
+                f'<p>{esc(event["basis"])}</p></article>')
+        parts.append('</div>')
     parts.append('</section>')
     return ''.join(parts)
 
@@ -1057,8 +1141,32 @@ header{border-radius:18px;background:var(--card);box-shadow:var(--card-shadow);p
 @media(max-width:1040px){.pulse-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.system-pulse{grid-column:1/-1}}
 @media(max-width:700px){.pulse-head{display:block}.pulse-head>span{display:block;text-align:left;margin-top:5px}.pulse-grid{grid-template-columns:1fr}.system-pulse{grid-column:auto}}
 @media(max-width:620px){header{padding:18px;border-radius:15px}.command-deck{border-radius:17px}.pulse-card{padding:18px;border-radius:16px}.pulse-head{padding:0 3px}.ops,.monitor{border-radius:16px}.session-row>div:first-child{display:block}.session-row span{display:block;text-align:left;margin-top:2px}}
+.impact-head{display:flex;justify-content:space-between;align-items:end;gap:14px;margin:22px 0 12px}.impact-head h3{margin:0 0 4px}.impact-head p{margin:0;color:var(--muted);font-size:12px}.impact-head>span{font-size:11px;color:var(--muted);white-space:nowrap}.impact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.impact-card{background:#f7faf9;border:1px solid var(--line);border-left:4px solid var(--teal);padding:13px 15px;border-radius:12px}.impact-card.negative{border-left-color:var(--red)}.impact-card.round-shift{border-left-color:#8196a2;background:#f5f7f8}.impact-top{display:flex;justify-content:space-between;gap:9px;align-items:baseline}.impact-top strong{font-size:23px;font-variant-numeric:tabular-nums}.impact-card.positive .impact-top strong{color:var(--teal)}.impact-card.negative .impact-top strong{color:var(--red)}.impact-card.round-shift .impact-top strong{color:#536b77}.impact-type{font-weight:700;font-size:13px}.impact-ticks{font-size:11px;color:var(--muted);margin:3px 0 9px}.impact-drivers{display:flex;gap:5px;flex-wrap:wrap}.impact-drivers span{background:#e8f0f0;border-radius:20px;padding:3px 7px;font-size:10px}.impact-card p{font-size:11px;color:var(--muted);margin:10px 0 0;line-height:1.4}
+.duel-history-count{font-size:12px;color:var(--muted);font-weight:700}.duel-legend{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0}.duel-legend span{font-size:11px;padding:4px 9px;border-radius:20px;background:#f1f5f4}.duel-legend span:before{content:"";display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px;background:var(--teal)}.duel-legend .negative:before{background:var(--red)}.duel-legend .missed:before{background:#d39d50}.duel-legend .practice:before{background:#aebbc1}.duel-plot,.duel-table-wrap{overflow:auto;border:1px solid var(--line);border-radius:12px}.duel-plot{background:linear-gradient(#f7faf9,#fff);padding:5px}.duel-plot svg{display:block}.duel-plot rect.positive{fill:var(--teal)}.duel-plot rect.negative{fill:var(--red)}.duel-plot rect.missed{fill:#d39d50}.duel-plot rect.practice{fill:#aebbc1}.duel-plot rect.flat{fill:#718b94}.duel-plot rect:hover{opacity:.65}.duel-table{border-collapse:collapse;width:100%;font-size:11px}.duel-table th,.duel-table td{text-align:left;white-space:nowrap;border-bottom:1px solid #e9efee;padding:8px 10px;font-variant-numeric:tabular-nums}.duel-table th{position:sticky;top:0;background:#eff5f4;color:var(--ink-2)}.duel-table .result{font-weight:800}.duel-table .negative .result{color:var(--red)}.duel-table .positive .result{color:var(--teal)}.duel-table .practice{color:#74848a}.duel-table-wrap{max-height:520px}
+@media(max-width:700px){.impact-grid{grid-template-columns:1fr}.impact-head{display:block}.impact-head>span{display:block;margin-top:7px}}
 """
 
+
+CSS += """
+.duel-detail summary{cursor:pointer;color:var(--teal);font-weight:700;white-space:nowrap}.duel-detail>div{max-width:440px;white-space:normal;background:#f7faf9;padding:12px;border:1px solid var(--line);border-radius:9px;line-height:1.4}.duel-detail p{margin:4px 0 8px}.duel-detail ol{padding-left:18px;margin:8px 0;max-height:250px;overflow:auto}.duel-detail li{padding:5px 0;border-top:1px solid var(--line)}.duel-detail small{display:block;color:var(--muted)}
+.duel-insight-grid,.trade-history-kpis{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:18px 0}.duel-insight-grid article,.trade-history-kpis article{background:#f5f9f8;border:1px solid var(--line);border-radius:13px;padding:13px 15px}.duel-insight-grid small,.trade-history-kpis small{display:block;color:var(--muted);font-size:11px}.duel-insight-grid strong,.trade-history-kpis strong{display:block;font-size:25px;line-height:1.1;margin:6px 0;font-variant-numeric:tabular-nums}.duel-insight-grid span,.trade-history-kpis span{font-size:11px;color:var(--muted);line-height:1.35;display:block}.duel-analysis-columns{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin:20px 0}.duel-analysis-columns h3{font-size:15px}.duel-splits{display:grid;grid-template-columns:1fr 1fr;gap:7px}.duel-split,.duel-rival{border:1px solid var(--line);border-radius:10px;padding:9px 11px;display:grid;gap:3px}.duel-split b,.duel-rival span{font-size:11px}.duel-split strong{font-size:18px}.duel-split span,.duel-rival small{font-size:10px;color:var(--muted)}.duel-rivals{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.duel-rival b{font-size:14px}.duel-review-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px}.duel-review-head h3{margin-bottom:3px}.duel-review-head p,.duel-review-head>span{font-size:11px;color:var(--muted)}.duel-review-list{display:flex;gap:7px;overflow:auto;padding:4px 0 9px}.duel-review{min-width:165px;text-align:left;background:#f8f5ef;border:1px solid #e7d7b8;border-radius:10px;padding:8px 10px;cursor:pointer;display:grid;gap:4px;color:var(--ink)}.duel-review span{font-size:10px}.duel-review strong{font-size:12px}.duel-controls{display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin:18px 0 11px}.duel-controls label{font-size:10px;color:var(--muted);display:grid;gap:4px}.duel-controls select{padding:7px;border:1px solid var(--line);border-radius:8px;background:#fff;min-width:105px;color:var(--ink)}.duel-controls .duel-review-only{display:flex;align-items:center;padding:8px;gap:5px;font-size:11px}.duel-controls>span{font-size:11px;color:var(--muted)}.duel-table tr.focused{background:#fff1d8}
+.trade-net-chart{display:flex;align-items:center;gap:7px;overflow:auto;border:1px solid var(--line);border-radius:12px;padding:10px;min-height:115px}.trade-net-bar{display:flex;flex-direction:column;justify-content:end;align-items:center;height:103px;min-width:23px}.trade-net-bar span{width:16px;border-radius:4px 4px 0 0;background:var(--teal)}.trade-net-bar.bad span{background:var(--red)}.trade-net-bar small{font-size:9px;color:var(--muted)}.trade-history-scroll{max-height:540px;overflow:auto;border:1px solid var(--line);border-radius:12px}.trade-history-table{border-collapse:collapse;width:100%;font-size:11px}.trade-history-table th,.trade-history-table td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}.trade-history-table th{position:sticky;top:0;background:#eff5f4}.trade-history-table .good td:nth-child(8){color:var(--teal);font-weight:800}.trade-history-table .bad td:nth-child(8){color:var(--red);font-weight:800}.trade-history-table details{max-width:400px;white-space:normal}.trade-history-table summary{cursor:pointer;color:var(--teal)}
+@media(max-width:800px){.duel-analysis-columns{grid-template-columns:1fr}.duel-insight-grid,.trade-history-kpis{grid-template-columns:1fr 1fr}}
+@media(max-width:540px){.duel-insight-grid,.trade-history-kpis,.duel-splits{grid-template-columns:1fr}}
+.charts .chart:has(.chart-keys .key:nth-child(8)){grid-column:1/-1}.chart-keys{max-height:105px;overflow:auto}.chart-keys .key{white-space:nowrap}.chart svg .tick{font-variant-numeric:tabular-nums}
+.liquidation-tag{font-size:11px;color:var(--red);font-weight:700}.liquidation-lead{padding:13px 16px;background:#eff6f5;border-left:4px solid var(--teal);display:grid;gap:4px;font-size:12px}.liquidation-lead span{color:var(--muted)}.liquidation-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:13px 0}.liquidation-card{display:grid;grid-template-columns:1.3fr .8fr .8fr .8fr;gap:9px;align-items:center;padding:13px;border:1px solid var(--line);border-radius:12px;background:#fff}.liquidation-card h3{margin:0;font-size:15px}.liquidation-card>div:first-child span{font-size:10px;color:var(--muted);display:block;margin-top:4px}.liquidation-card small{display:block;font-size:9px;color:var(--muted)}.liquidation-card>div b{font-size:14px;white-space:nowrap}.liquidation-card p{grid-column:1/-1;margin:1px 0 0;font-size:10px;color:var(--muted);line-height:1.4}.liquidation-card p b{color:var(--teal)}
+@media(max-width:850px){.liquidation-grid{grid-template-columns:1fr}}@media(max-width:520px){.liquidation-card{grid-template-columns:1fr 1fr}.liquidation-card>div:first-child,.liquidation-card p{grid-column:1/-1}}
+
+"""
+
+CSS += """
+.market-live{border-color:#c6d9d7;background:linear-gradient(145deg,#fff 0%,#f3f8f7 100%)}.market-live .section-head{align-items:center}.market-live h2{margin:2px 0 4px}.market-live-badge{display:inline-flex;padding:7px 12px;border:1px solid #c6d9d7;border-radius:999px;background:#eaf3f1;color:#176966;font-size:12px;font-weight:800}.market-live-headline{display:flex;justify-content:space-between;gap:12px;align-items:center;margin:12px 0;padding:13px 16px;border-left:4px solid var(--teal);border-radius:8px;background:#edf6f4}.market-live-headline b{font-size:15px}.market-live-headline span{font-size:11px;color:var(--muted)}.market-live-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin:12px 0 18px}.market-live-kpis article{padding:13px;border:1px solid var(--line);border-radius:12px;background:#fff}.market-live-kpis small{display:block;color:var(--muted);font-size:11px}.market-live-kpis strong{display:block;margin-top:6px;font-size:25px;font-variant-numeric:tabular-nums}.market-live details{margin:10px 0;border:1px solid var(--line);border-radius:11px;background:#fff;overflow:hidden}.market-live details summary{padding:12px 14px;cursor:pointer;font-weight:750;color:var(--ink);background:#f7faf9}.market-table-scroll{overflow:auto;max-height:460px}.market-table{min-width:850px;width:100%;border-collapse:collapse;font-size:12px}.market-table th,.market-table td{padding:9px 11px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.market-table th{position:sticky;top:0;z-index:1;background:#edf4f3;color:#53636a;font-size:10px;text-transform:uppercase;letter-spacing:.04em}.market-table td small{display:block;margin-top:4px;color:var(--muted);font-size:10px}.market-empty{margin:0;padding:17px;color:var(--muted);font-size:12px}.market-live details[open] summary{border-bottom:1px solid var(--line)}@media(max-width:720px){.market-live-kpis{grid-template-columns:1fr 1fr}.market-live-headline{align-items:flex-start;flex-direction:column}}
+.market-live-columns{display:grid;grid-template-columns:1fr 1fr;gap:14px}.market-live-block{min-width:0;padding:15px;border:1px solid var(--line);border-radius:14px;background:rgba(255,255,255,.75)}.market-live-block h3{margin:0 0 4px;font-size:16px}.market-live-block>p{min-height:30px;margin:0 0 12px;color:var(--muted);font-size:11px;line-height:1.4}.market-venue-group+.market-venue-group{margin-top:13px;padding-top:12px;border-top:1px solid var(--line)}.market-venue-title{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin:0 0 8px}.market-venue-title b{font-size:12px}.market-venue-title span{font-size:10px;color:var(--muted)}.market-offer-list{display:grid;gap:8px}.market-offer-card{padding:11px;border:1px solid var(--line);border-radius:11px;background:#fff}.market-offer-top,.market-offer-foot{display:flex;justify-content:space-between;align-items:center;gap:8px}.market-offer-id{font-size:9px;font-weight:800;letter-spacing:.06em;color:var(--muted)}.market-kind,.market-owner-badge{display:inline-block;margin-left:5px;padding:3px 7px;border-radius:999px;background:#eaf3f1;color:#176966;font-size:9px;font-weight:800}.market-owner-badge{background:#fff2d6;color:#885b06}.market-maker{font-size:10px;color:var(--muted);text-align:right}.market-exchange{display:grid;grid-template-columns:minmax(0,1fr) 22px minmax(0,1fr);align-items:center;gap:8px;margin:11px 0}.market-exchange>div{min-width:0;padding:9px;border-radius:8px;background:#f5f8f7}.market-exchange small{display:block;margin-bottom:4px;color:var(--muted);font-size:9px;font-weight:700;letter-spacing:.04em}.market-exchange b{display:block;overflow-wrap:anywhere;font-size:13px}.market-arrow{text-align:center;color:var(--teal);font-weight:800}.market-offer-foot{padding-top:7px;border-top:1px solid #edf0ef;color:var(--muted);font-size:9px}.market-live details[open] summary{border-bottom:1px solid var(--line)}@media(max-width:900px){.market-live-columns{grid-template-columns:1fr}}@media(max-width:520px){.market-live-kpis{grid-template-columns:1fr 1fr}.market-live-headline{align-items:flex-start;flex-direction:column}.market-offer-top,.market-offer-foot{align-items:flex-start;flex-direction:column}.market-maker{text-align:left}.market-exchange{grid-template-columns:1fr 18px 1fr}}
+"""
+
+CSS += """
+.quick-listings-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin:13px 0 6px;padding-top:11px;border-top:1px solid var(--line)}.quick-listings-head b{font-size:12px}.quick-listings-head>span{font-size:10px;font-weight:750;color:var(--teal)}.quick-listing{display:grid;gap:4px;padding:7px 0;border-bottom:1px solid #e9efeb}.quick-listing>span{display:flex;justify-content:space-between;align-items:baseline;gap:8px}.quick-listing>span b{font-size:10px;color:var(--ink-2)}.quick-listing small{font-size:9px;color:var(--muted)}.quick-listing strong{font-size:10px;color:var(--ink);overflow-wrap:anywhere}.quick-listing strong i{font-style:normal;color:var(--teal);padding:0 3px}.quick-listing-empty,.quick-listings-more{margin:4px 0;color:var(--muted);font-size:10px;line-height:1.4}.market-copy-button{align-self:flex-start;margin-top:10px;padding:8px 11px;border:1px solid #b9d4cb;border-radius:9px;background:#f0f7f3;color:#205f4d;font-size:11px;font-weight:750;cursor:pointer}.market-copy-button:hover{background:#e5f1eb}.market-copy-button:focus-visible{outline:3px solid #c8a75e;outline-offset:2px}.market-copy-status{min-height:14px;margin-top:3px;color:#28634f;font-size:10px}.market-pulse>a{display:inline-block;margin-top:8px}
+"""
 
 def render_operations(data: dict) -> str:
     op = data.get('operations') or {}
@@ -1183,7 +1291,10 @@ def render_strategy_health(data: dict) -> str:
     duels = state.get('duels') or {}
     memory = state.get('memory') or {}
     learner = state.get('duel_learning') or {}
+    execution = state.get('execution') or {}
     market = ((data.get('operations') or {}).get('market') or {})
+    market_activity_data = data.get('market_activity') or {}
+    my_open_offers = market_activity_data.get('my_open_offers') or []
     score = data.get('scoring') or {}
     sessions = []
     for row in duels.get('sessions') or []:
@@ -1202,8 +1313,118 @@ def render_strategy_health(data: dict) -> str:
         'fresh': 'Evidencia reciente', 'stale': 'Memoria atrasada',
         'database_only': 'Base creada; falta informe', 'not_started': 'Aún no integrada',
     }.get(memory.get('status'), 'Sin confirmar')
-    learner_text = ('Modelo actualizado con ' + fmt(learner.get('duels_done')) + ' duelos'
-                    if learner.get('status') == 'updated' else 'Modelo de duelos sin iniciar')
+    if execution.get('mode') != 'coordinator' and memory.get('last_tick') is not None:
+        memory_text = 'Historial guardado · tick ' + esc(memory['last_tick'])
+    execution_text = ({'duels': 'Duelos en ejecución', 'coordinator': 'Coordinador en ejecución'}
+                      .get(execution.get('mode'), 'Agente operativo detenido')
+                      if execution.get('status') == 'running' else 'Agente operativo detenido')
+    learner_text = ('Informe guardado: ' + fmt(learner.get('duels_done')) + ' duelos'
+                    if learner.get('status') == 'saved_report' else 'Sin informe de aprendizaje')
+    listing_rows = []
+    for offer in my_open_offers[:3]:
+        gives = [str(value) for value in offer.get('gives') or []]
+        wants = [str(value) for value in offer.get('wants') or []]
+        if offer.get('cash_give'):
+            gives.append(fmt(offer['cash_give']) + ' P')
+        if offer.get('cash_want'):
+            wants.append(fmt(offer['cash_want']) + ' P')
+        listing_rows.append(
+            '<div class="quick-listing"><span><b>' + esc(offer.get('venue_name') or offer.get('venue') or 'Mercado sin identificar')
+            + '</b><small>' + esc(offer.get('venue') or '—') + ' · ' + esc(offer.get('kind') or 'Oferta') + '</small></span>'
+            '<strong>' + esc(' + '.join(gives) or 'Nada indicado') + ' <i>→</i> '
+            + esc(' + '.join(wants) or 'Nada indicado') + '</strong></div>')
+    listing_detail = (''.join(listing_rows) if listing_rows else
+                      '<p class="quick-listing-empty">No tienes publicaciones abiertas detectadas en este tick.</p>')
+    own_market_id = market_activity_data.get('own_venue') or '—'
+    own_market_name = market_activity_data.get('own_venue_name') or 'Mercado Team 15'
+    own_market_offers = market_activity_data.get('own_market_offers') or []
+    incoming_offers = market_activity_data.get('incoming_offers') or []
+    catalog_by_ref = {row.get('ref'): row for row in data.get('catalog_rows') or [] if row.get('ref')}
+    def share_side(cards, cash):
+        values = [str(value) for value in cards or []]
+        if cash:
+            values.append(fmt(cash) + ' P')
+        return ' + '.join(values) or '—'
+    def opportunity_note(offer):
+        refs = (offer.get('gives') or []) + (offer.get('wants') or [])
+        card = catalog_by_ref.get(refs[0]) if len(refs) == 1 else None
+        if not card:
+            return 'No single-card private comparison is available.'
+        if offer.get('kind') == 'Venta' and not offer.get('mine'):
+            ask = offer.get('cash_want')
+            cap = card.get('buy_ceiling')
+            if isinstance(ask, (int, float)) and isinstance(cap, (int, float)):
+                return (f'Ask is {fmt(ask - cap)} P above our {fmt(cap)} P private buy cap; '
+                        f'not profitable for Team 15 at this price. '
+                        f'Observed sale median {fmt(card.get("sold_median"))} P '
+                        f'(n={fmt(card.get("sold_count", 0))}).')
+            return 'Private buy cap is unavailable; verify before offering.'
+        if offer.get('kind') == 'Venta' and offer.get('mine'):
+            ask = offer.get('cash_want')
+            floor = card.get('sell_floor')
+            if isinstance(ask, (int, float)) and isinstance(floor, (int, float)):
+                verdict = f'{fmt(ask - floor)} P above' if ask >= floor else f'{fmt(floor - ask)} P below'
+                note = f'Our ask is {verdict} the {fmt(floor)} P private sale floor.'
+                if card.get('sell_breaks_page'):
+                    note += ' Selling risks breaking a collection page.'
+                return note
+        if offer.get('kind') == 'Compra':
+            ref = next(iter(offer.get('wants') or []), None)
+            card = catalog_by_ref.get(ref) if ref else None
+            bid = offer.get('cash_give')
+            if card and isinstance(bid, (int, float)):
+                floor = card.get('sell_floor')
+                if offer.get('mine'):
+                    cap = card.get('buy_ceiling')
+                    if isinstance(cap, (int, float)):
+                        return (f'Our bid is {fmt(bid)} P vs a {fmt(cap)} P private buy cap; '
+                                + ('within value.' if bid <= cap else f'{fmt(bid-cap)} P over cap.'))
+                if isinstance(floor, (int, float)):
+                    if (card.get('free') or 0) <= 0:
+                        return (f'We have no free copy; bid is {fmt(bid)} P vs a {fmt(floor)} P floor '
+                                'and selling would remove a held card.')
+                    if bid < floor:
+                        return f'Bid is {fmt(floor-bid)} P below our {fmt(floor)} P private sale floor.'
+                    return f'Bid meets our {fmt(floor)} P floor and a free copy is available.'
+        return 'Compare the cards, price and collection impact before accepting.'
+
+    def market_offer_line(offer):
+        who = 'Team 15' if offer.get('mine') else 'Another team'
+        expiry = f' · {offer["ticks_left"]} ticks left' if offer.get('ticks_left') is not None else ''
+        base = (f'• {who} · {offer.get("kind") or "Offer"}: '
+                f'{share_side(offer.get("gives"), offer.get("cash_give"))} → '
+                f'{share_side(offer.get("wants"), offer.get("cash_want"))}{expiry}')
+        return base + '\n  Why it matters: ' + opportunity_note(offer)
+
+    team_buy_posts = [offer for offer in my_open_offers if offer.get('kind') == 'Compra']
+    share_lines = [f'🏪 EL DUENDE · TEAM 15 · MARKET {own_market_id}', f'📍 {own_market_name}',
+                   f'🕒 Snapshot tick {data.get("tick") or "—"}', '',
+                   f'📌 PUBLIC OFFERS ON {own_market_id} ({len(own_market_offers)}):']
+    if own_market_offers:
+        share_lines.extend(market_offer_line(offer) for offer in own_market_offers)
+    else:
+        share_lines.append('• No active public offers at the latest refresh.')
+    share_lines += ['', f'🛒 WHAT TEAM 15 IS BUYING ({len(team_buy_posts)} active buy requests):']
+    if team_buy_posts:
+        share_lines.extend(market_offer_line(offer) for offer in team_buy_posts)
+    else:
+        share_lines.append('• No active Team 15 buy requests.')
+    share_lines += ['', f'📨 OFFERS ADDRESSED TO TEAM 15 ({len(incoming_offers)}):']
+    if incoming_offers:
+        share_lines.extend(market_offer_line(offer) for offer in incoming_offers)
+    else:
+        share_lines.append('• No incoming offers addressed to us.')
+    share_lines += ['', f'🧾 OUR OPEN LISTINGS ACROSS MARKETS ({len(my_open_offers)}):']
+    if my_open_offers:
+        for offer in my_open_offers:
+            place = offer.get('venue_name') or offer.get('venue') or 'Market unknown'
+            expiry = f' · expires in {offer["ticks_left"]} ticks' if offer.get('ticks_left') is not None else ''
+            share_lines.append(f'• {place} ({offer.get("venue") or "—"}) · {offer.get("kind") or "Offer"}: '
+                               f'{share_side(offer.get("gives"), offer.get("cash_give"))} → '
+                               f'{share_side(offer.get("wants"), offer.get("cash_want"))}{expiry}')
+    else:
+        share_lines.append('• No Team 15 listings currently open.')
+    copy_message = '\n'.join(share_lines)
     return ('<section id="pulso" class="pulse"><div class="pulse-head"><div>'
             '<h2>Seguimiento de la estrategia</h2><p>Resultados confirmados y estado real de los agentes.</p>'
             '</div><span>La API decide el resultado; el historial local explica la ejecución</span></div>'
@@ -1219,16 +1440,23 @@ def render_strategy_health(data: dict) -> str:
             f'<strong>{fmt(score.get("market"))}<small> / 30</small></strong></div>'
             f'<div class="market-hero"><b>{fmt(market.get("trades"))}</b><span>tratos de terceros en '
             f'{esc(market.get("venue") or "nuestro venue")}</span></div>'
+            '<div class="quick-listings-head"><b>Mis publicaciones</b><span>' + fmt(len(my_open_offers)) + ' abiertas</span></div>'
+            + listing_detail + (f'<p class="quick-listings-more">+{len(my_open_offers) - 3} más en el detalle</p>' if len(my_open_offers) > 3 else '')
+            + '<button class="market-copy-button" type="button" data-copy-market="' + esc(copy_message) + '">'
+            '📋 Copiar estado del mercado</button><span class="market-copy-status" aria-live="polite"></span>'
+            + '<a href="#mercado-vivo">Ver todas y sus mercados</a>'
             f'<p class="pulse-note">Valor creado entre terceros: {fmt(score.get("mm_points"))} P. '
             'Invitar parejas con demanda real a publicar y cerrar aquí; el tráfico bruto no puntúa.</p>'
             '<a href="#ranking">Ver oportunidades de negociación</a></article>'
             '<article class="pulse-card system-pulse"><div class="pulse-card-head"><h3>Sistema de decisión</h3>'
             '<strong class="system-mark">●</strong></div>'
+            f'<div class="system-line"><span>Proceso operativo</span><b>{execution_text}</b></div>'
             f'<div class="system-line"><span>Memoria del coordinador</span><b>{memory_text}</b></div>'
             f'<div class="system-line"><span>Evidencia reciente</span><b>{fmt(memory.get("events_in_window"))} eventos</b></div>'
             f'<div class="system-line"><span>Aprendizaje de duelos</span><b>{learner_text}</b></div>'
-            '<p class="pulse-note">El laboratorio temporal aún no ha demostrado mejora de decisiones. '
-            'Mantener la política base y evaluar el modelo antes de activarlo.</p></article></div></section>')
+            '<p class="pulse-note">El historial de duelos ajusta aperturas al ejecutar. Cambiar aceptar o esperar requiere '
+            '<code>--learn</code>; el replay temporal aún no ha demostrado mejora. Un informe guardado no confirma '
+            'que el modelo esté activo.</p></article></div></section>')
 
 
 def render(data: dict) -> str:
@@ -1241,7 +1469,7 @@ def render(data: dict) -> str:
              '<header><div><h1>Mesa de mando · Team 15</h1><p class="sub">Puntos, duelos, caja y mercado para decidir durante el último día.</p></div>',
              '<div class="status"><span class="flag ', 'live' if live else 'warn', '">',
              'Equipo conectado' if live else 'Sólo feed público', '</span><span class="clock">Tick ', esc(tick), '</span></div></header>',
-             '<nav class="jump" aria-label="Secciones"><a href="#pulso">Seguimiento</a><a href="#operacion">Operación</a><a href="#monitor">Puntos</a><a href="#tendencia">Trayectoria</a><a href="#guide">Ventas</a><a href="#radio">Señales</a><a href="#ranking">Oportunidades</a><a href="#estrategia-ranking">Ranking</a><a href="#catalogo">Catálogo</a></nav>', render_command_deck(data), render_strategy_health(data), render_operations(data), render_monitor(data), render_trend(data), render_dashboard_overview(data), render_rank_strategy(data)]
+             '<nav class="jump" aria-label="Secciones"><a href="#pulso">Seguimiento</a><a href="#duelos-historico">Duelos cerrados</a><a href="#compras-ventas">Compras y ventas</a><a href="#mercado-vivo">Mercado en vivo</a><a href="#estrategia-ventas">Liquidación</a><a href="#operacion">Operación</a><a href="#monitor">Puntos</a><a href="#tendencia">Trayectoria</a><a href="#guide">Ventas</a><a href="#radio">Señales</a><a href="#ranking">Oportunidades</a><a href="#estrategia-ranking">Ranking</a><a href="#catalogo">Catálogo</a></nav>', render_command_deck(data), market_activity.render(data), render_strategy_health(data), render_operations(data), render_monitor(data), render_trend(data), duel_history.render(data.get('duel_history') or []), trade_history.render(data.get('trade_history') or [], data.get('unopened_packs') or []), render_dashboard_overview(data), render_rank_strategy(data)]
     for warning in data.get("warnings") or []:
         parts.append('<div class="warning">' + esc(warning) + '</div>')
     guide = data.get("sale_guide") or []
@@ -1273,6 +1501,35 @@ def render(data: dict) -> str:
             parts.append('<span class="label">Ningún equipo pidió esta carta en el feed reciente.</span>')
         parts.append('</div></article>')
     parts.append('</div></section>')
+    targets = data.get('liquidation_targets') or []
+    parts += ['<section id="estrategia-ventas" class="monitor liquidation"><div class="section-head"><div>',
+              '<h2>Liquidación de cartas para subir</h2>',
+              '<p class="sub">Propuestas agresivas solo para cartas cuyo precio cubre el valor privado perdido. '
+              'El interés del feed no es una puja ni garantiza que acepten.</p></div>',
+              '<span class="liquidation-tag">No tocar bajo el suelo</span></div>']
+    if targets:
+        parts += ['<div class="liquidation-lead"><b>Regla de ataque</b><span>Abrir en el objetivo; si el rival regatea, '
+                  'conceder como máximo hasta el suelo privado. Nunca sacrificar páginas completadas ni aceptar '
+                  'precio por debajo del suelo.</span></div><div class="liquidation-grid">']
+        for item in targets[:8]:
+            median = (f'{fmt(item["sold_median"])} P · n={esc(item["sold_count"])}'
+                      if item.get('sold_median') is not None else 'Sin venta comparable observada')
+            buyers = ', '.join(item.get('demanders') or [])
+            parts.append(
+                f'<article class="liquidation-card"><div><h3>{esc(item["ref"])}</h3>'
+                f'<span>{esc(len(item["demanders"]))} equipos la buscan: {esc(buyers)}</span></div>'
+                f'<div><small>Objetivo de apertura</small><b>{fmt(item["ask"])} P</b></div>'
+                f'<div><small>Suelo rentable</small><b>{fmt(item["floor"])} P</b></div>'
+                f'<div><small>Valor perdido</small><b>{fmt(item["loss"])} P</b></div>'
+                f'<p>Última mediana vendida: {median}. El suelo conserva al menos '
+                f'+{fmt(item["floor_surplus"])} P de excedente privado si la valoración sigue vigente.</p></article>')
+        parts.append('</div><p class="chart-note">El precio objetivo suma 2 P de margen al suelo. '
+                     'Los puntos de leaderboard por oferta concreta no son públicos; el score solo confirma el resultado '
+                     'agregado tras liquidar.</p>')
+    else:
+        parts.append('<p>No hay cartas con interés observado que cumplan el suelo privado y la protección de página. '
+                     'Vender un singleton sin cubrir su valor puede bajar el score.</p>')
+    parts.append('</section>')
     summary = data.get('radio_summary') or {}
     counts = summary.get('by_verdict') or {}
     parts += ['<section id="radio" class="radio"><div class="section-head"><div>',
@@ -1378,6 +1635,10 @@ def render(data: dict) -> str:
               "if(tickPrev&&tickNow>tickPrev){const jump=document.querySelector('.jump');const note=document.createElement('span');note.className='refresh-diff';note.textContent='+'+(tickNow-tickPrev)+' ticks nuevos';jump.appendChild(note)}"
               "sessionStorage.setItem('t15.last_tick',String(tickNow));"
               "pause.addEventListener('change',()=>sessionStorage.setItem('t15.pause',pause.checked?'1':'0'));",
+              "document.querySelectorAll('.market-copy-button').forEach(b=>b.addEventListener('click',async()=>{const status=b.nextElementSibling;"
+              "const text=b.dataset.copyMarket||'';try{await navigator.clipboard.writeText(text);status.textContent='Copied — ready to paste into WhatsApp.'}"
+              "catch(e){const area=document.createElement('textarea');area.value=text;area.style.position='fixed';area.style.opacity='0';document.body.appendChild(area);"
+              "area.select();const ok=document.execCommand('copy');area.remove();status.textContent=ok?'Copied — ready to paste into WhatsApp.':'Copy unavailable; select and copy from browser.'}}));",
               CATALOG_JS,
               "setInterval(()=>{if(!pause.checked)location.reload()},15000);",
               '</script></body></html>']
@@ -1386,9 +1647,12 @@ def render(data: dict) -> str:
 
 class Handler(BaseHTTPRequestHandler):
     model: Model = None
+    web_dist = HERE / "web" / "dist"
 
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        request = urllib.parse.urlsplit(self.path)
+        path = urllib.parse.unquote(request.path)
+        status = 200
         if path == "/healthz":
             body, typ, status = b"ok\n", "text/plain", 200
         elif path == "/api/strategy":
@@ -1397,13 +1661,61 @@ class Handler(BaseHTTPRequestHandler):
                 body, typ, status = payload, "application/json; charset=utf-8", 200
             except Exception as exc:
                 body, typ, status = json.dumps({"error": f"{type(exc).__name__}: {exc}"}).encode(), "application/json; charset=utf-8", 500
-        elif path in ("/", "/index.html"):
+        elif path == "/api/v3/history":
+            try:
+                query = urllib.parse.parse_qs(request.query)
+                section = (query.get("section") or ["score"])[0]
+                ref = (query.get("ref") or [None])[0]
+                limit = int((query.get("limit") or [800])[0])
+                payload = self.model.dashboard_history.series(section, ref=ref, limit=limit)
+                body, typ, status = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode(), "application/json; charset=utf-8", 200
+            except (ValueError, TypeError) as exc:
+                body, typ, status = json.dumps({"error": str(exc)}, ensure_ascii=False).encode(), "application/json; charset=utf-8", 400
+            except Exception as exc:
+                body, typ, status = json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False).encode(), "application/json; charset=utf-8", 500
+        elif path.startswith("/api/v3/"):
+            section = path.removeprefix("/api/v3/")
+            try:
+                snapshot = self.model.snapshot()
+                exported = strategy_v3.export(snapshot, strategy_export)
+                if section not in exported["sections"]:
+                    body, typ, status = json.dumps({"error": "Sección v3 desconocida"}).encode(), "application/json; charset=utf-8", 404
+                else:
+                    envelope = {"schema": exported["schema"], "section": section,
+                                "snapshot": exported["snapshot"], "sources": exported["sources"],
+                                "data": exported["sections"][section]}
+                    body, typ, status = json.dumps(envelope, ensure_ascii=False, allow_nan=False).encode(), "application/json; charset=utf-8", 200
+            except Exception as exc:
+                body, typ, status = json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False).encode(), "application/json; charset=utf-8", 500
+        elif path == "/legacy":
             try:
                 body, typ, status = render(self.model.snapshot()).encode(), "text/html; charset=utf-8", 200
             except Exception as exc:
                 body, typ, status = f"Panel: {type(exc).__name__}: {exc}\n".encode(), "text/plain", 500
+        elif path in ("/", "/index.html"):
+            index = self.web_dist / "index.html"
+            if index.is_file():
+                body, typ, status = index.read_bytes(), "text/html; charset=utf-8", 200
+            else:
+                try:
+                    body, typ, status = render(self.model.snapshot()).encode(), "text/html; charset=utf-8", 200
+                except Exception as exc:
+                    body, typ, status = f"Panel: {type(exc).__name__}: {exc}\n".encode(), "text/plain", 500
         else:
-            body, typ, status = b"not found\n", "text/plain", 404
+            try:
+                root = self.web_dist.resolve()
+                target = (root / path.lstrip("/")).resolve()
+                target.relative_to(root)
+                if target.is_file():
+                    body = target.read_bytes()
+                    typ = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+                    if typ.startswith("text/") or typ in ("application/javascript", "image/svg+xml"):
+                        typ += "; charset=utf-8"
+                    status = 200
+                else:
+                    body, typ, status = b"not found\n", "text/plain", 404
+            except (OSError, ValueError):
+                body, typ, status = b"not found\n", "text/plain", 404
         self.send_response(status)
         self.send_header("Content-Type", typ)
         self.send_header("Content-Length", str(len(body)))
@@ -1421,6 +1733,8 @@ def main():
     parser.add_argument("--port", type=int, default=8775)
     parser.add_argument("--url", default=URL)
     parser.add_argument("--reserve", type=int, default=100)
+    parser.add_argument("--history-retention-days", type=int, default=90,
+                        help="días de histórico detallado local del dashboard (predeterminado: 90)")
     parser.add_argument("--feed-root", type=Path, default=KIT,
                         help="carpeta bazaar-kit con data/feed_history.jsonl")
     parser.add_argument("--env-file", type=Path, help="archivo .env existente para leer BAZAAR_KEY")
@@ -1432,7 +1746,8 @@ def main():
             if sep and name.strip() == "BAZAAR_KEY":
                 key = value.strip().strip("\"'")
                 break
-    model = Model(Reader(args.url, key), reserve=args.reserve, feed_root=args.feed_root)
+    model = Model(Reader(args.url, key), reserve=args.reserve, feed_root=args.feed_root,
+                  history_retention_days=args.history_retention_days)
     handler = type("Team15Handler", (Handler,), {"model": model})
     with ThreadingHTTPServer(("127.0.0.1", args.port), handler) as server:
         print(f"Mesa de trades en http://127.0.0.1:{args.port}", flush=True)

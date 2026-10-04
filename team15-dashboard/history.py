@@ -19,15 +19,17 @@ from typing import Iterable, Optional
 FIELDS = ("score", "negotiating", "market", "rank", "cash", "collection_value",
           "deals", "album_filled", "pages_complete", "ladder_points", "duel_points",
           "neg_points", "mm_points")
+IMPACT_FIELDS = ("score", "negotiating", "market", "duel_points", "ladder_points",
+                 "neg_points", "mm_points", "deals", "cash", "collection_value")
 
 
 def sample(tick: int, t_hours: Optional[float], score: dict, leaderboard: dict,
-           cash=None, collection_value=None, team: str = "t15") -> dict:
+           cash=None, collection_value=None, team: str = "t15", round_number: int | None = None) -> dict:
     """Una fila. `score` es `me["score"]`; lo que falte se completa del leaderboard público,
     que trae `negotiating`, `market`, `deals`, `album_filled` y `pages_complete` de todos."""
     rows = {r.get("team"): r for r in (leaderboard or {}).get("teams") or []}
     mine = rows.get(team) or {}
-    out = {"tick": int(tick), "t_hours": t_hours, "team": team}
+    out = {"tick": int(tick), "t_hours": t_hours, "team": team, "round": round_number}
     for key in FIELDS:
         value = (score or {}).get(key)
         if value is None:
@@ -106,6 +108,49 @@ def deltas(rows: list[dict], key: str = "score", window: int = 1) -> list[dict]:
     return out
 
 
+def impact_events(rows: list[dict]) -> list[dict]:
+    """Observed component moves. Round averaging is identified separately from deal losses."""
+    out = []
+    for before, after in zip(rows, rows[1:]):
+        if not isinstance(before.get("score"), (int, float)) or not isinstance(after.get("score"), (int, float)):
+            continue
+        change = {}
+        for key in IMPACT_FIELDS:
+            a, b = before.get(key), after.get(key)
+            change[key] = round(b - a, 3) if isinstance(a, (int, float)) and isinstance(b, (int, float)) else None
+        if change["score"] in (None, 0):
+            continue
+        round_changed = (before.get("round") is not None and after.get("round") is not None
+                         and before["round"] != after["round"])
+        raw_unchanged = all(change[k] in (None, 0) for k in
+                            ("duel_points", "ladder_points", "neg_points", "mm_points", "deals"))
+        neg, market = change["negotiating"], change["market"]
+        proportional_drop = bool(
+            before.get("negotiating") and before.get("market")
+            and change["score"] < 0 and isinstance(neg, (int, float)) and neg < 0
+            and isinstance(market, (int, float)) and market < 0
+            and abs(neg / before["negotiating"] - market / before["market"]) < 0.025)
+        if raw_unchanged and proportional_drop:
+            label, basis = "Ponderación de ronda", "Ambos componentes bajaron en proporción similar sin nuevos tratos ni cambios privados observados."
+        elif round_changed and raw_unchanged:
+            label, basis = "Cambio de ronda", "Cambió la ronda sin nuevos tratos ni cambios privados observados."
+        elif change["mm_points"] not in (None, 0):
+            label, basis = "Tratos de terceros", "Cambió el valor creado en nuestro venue."
+        elif change["duel_points"] not in (None, 0):
+            label, basis = "Duelos", "Cambió el acumulado privado de duelos."
+        elif change["ladder_points"] not in (None, 0):
+            label, basis = "Dealers", "Cambió el acumulado privado de la escalera."
+        elif change["neg_points"] not in (None, 0) or change["deals"] not in (None, 0):
+            label, basis = "Negociación", "Coincide con liquidaciones; puede haber varias entre muestras."
+        elif change["market"] not in (None, 0):
+            label, basis = "Market Test o ajuste", "Cambió el componente de mercado sin valor nuevo entre terceros."
+        else:
+            label, basis = "Ajuste observado", "No hay un motor único confirmado entre estas dos muestras."
+        out.append({"from_tick": before["tick"], "to_tick": after["tick"],
+                    "round": after.get("round"), "label": label, "basis": basis, "delta": change})
+    return out
+
+
 def rank_race(rows: list[dict], team: str = "t15", around: int = 1) -> dict:
     """Nuestra serie y la de los rivales inmediatos, que son los que deciden el puesto.
 
@@ -128,6 +173,29 @@ def rank_race(rows: list[dict], team: str = "t15", around: int = 1) -> dict:
                 out[t].append((r["tick"], float(value)))
     return {"series": out, "neighbours": [t for t in picked if t != team],
             "position": i + 1, "teams": len(names)}
+
+
+def rank_race_all(rows: list[dict], team: str = "t15") -> dict:
+    """Complete score and position histories for every team in the public snapshots."""
+    if not rows:
+        return {"scores": {}, "positions": {}, "teams": []}
+    names = sorted({name for row in rows for name, score in (row.get("rivals") or {}).items()
+                    if isinstance(score, (int, float))})
+    scores = {name: [] for name in names}
+    positions = {name: [] for name in names}
+    for row in rows:
+        snapshot = row.get("rivals") or {}
+        values = {name: value for name, value in snapshot.items() if isinstance(value, (int, float))}
+        ordered = sorted(values, key=lambda name: (-values[name], name))
+        place = {name: i + 1 for i, name in enumerate(ordered)}
+        for name in names:
+            value = values.get(name)
+            if value is not None:
+                scores[name].append((row["tick"], float(value)))
+                positions[name].append((row["tick"], float(place[name])))
+    names.sort(key=lambda name: -(scores[name][-1][1] if scores[name] else -1))
+    return {"scores": scores, "positions": positions, "teams": names,
+            "position": names.index(team) + 1 if team in names else None}
 
 
 def summary(rows: list[dict], team: str = "t15") -> dict:

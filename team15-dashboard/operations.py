@@ -8,10 +8,14 @@ def _number(value):
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
-def _cash_commitments(offers: list[dict]) -> int:
+def _cash_commitments(offers: list[dict], team: str = "t15") -> int:
     total = 0
     for offer in offers:
         if not isinstance(offer, dict) or offer.get("status") != "open":
+            continue
+        # /api/me/offers also includes incoming offers. Cash offered by a
+        # counterparty is reserved on their side, not ours.
+        if offer.get("maker") != team:
             continue
         cash = _number((offer.get("give") or {}).get("cash"))
         if cash is not None:
@@ -66,11 +70,11 @@ def duel_watch(duels: list[dict], tick: int | None) -> dict:
             "accepts_per_tick": 1, "note": "La oferta puede cambiar; releer antes de aceptar."}
 
 
-def capital_watch(cash, offers: list[dict], reserve: int = 100) -> dict:
+def capital_watch(cash, offers: list[dict], reserve: int = 100, team: str = "t15") -> dict:
     cash = _number(cash)
     if cash is None:
         return {"status": "private_data_unavailable", "cash": None}
-    committed = _cash_commitments(offers)
+    committed = _cash_commitments(offers, team)
     free = max(0, cash - committed)
     venue_need = 250 + 20 + 20 + max(0, reserve)
     return {"status": "ok", "cash": cash, "open_bid_commitments": committed,
@@ -122,7 +126,7 @@ def build(*, duels: list[dict] | None, duel_error: str | None, tick: int | None,
           cash, offers: list[dict], reserve: int, venues: list[dict],
           feed_health: dict, verified: bool, team: str = "t15") -> dict:
     duel = duel_watch(duels or [], tick) if duels is not None else {"status": "unavailable", "error": duel_error or "Sin clave o lectura", "live": None, "rows": []}
-    capital = capital_watch(cash, offers, reserve)
+    capital = capital_watch(cash, offers, reserve, team)
     market = market_watch(venues, team)
     return {"duels": duel, "capital": capital, "market": market,
             "queue": decision_queue(duel, capital, market, feed_health, verified),

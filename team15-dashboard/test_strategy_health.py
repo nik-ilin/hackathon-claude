@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,6 +28,21 @@ class StrategyHealthTest(unittest.TestCase):
             (data / 'agent_memory_report.json').write_text(json.dumps({'tick': 60, 'stored_events': 12}))
             self.assertEqual(strategy_health.build([], [tmp], 100)['memory']['status'], 'fresh')
             self.assertEqual(strategy_health.build([], [tmp], 101)['memory']['status'], 'stale')
+
+    def test_saved_memory_and_model_do_not_mean_an_agent_is_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / 'data'
+            data.mkdir()
+            (data / 'agent_memory_report.json').write_text(json.dumps({'tick': 100, 'stored_events': 8}))
+            (data / 'duel_learning.json').write_text(json.dumps({'facts': {'duels_done': 12}}))
+            report = strategy_health.build([], [tmp], 100)
+            self.assertEqual(report['execution']['status'], 'stopped')
+            self.assertEqual(report['duel_learning']['status'], 'saved_report')
+            (data / 'agent.lock').write_text(json.dumps({'pid': os.getpid(), 'version': 'duels-1.1'}))
+            report = strategy_health.build([], [tmp], 100)
+            self.assertEqual(report['execution']['mode'], 'duels')
+            (data / 'agent.lock').write_text(json.dumps({'pid': 999999999, 'version': 'duels-1.1'}))
+            self.assertEqual(strategy_health.build([], [tmp], 100)['execution']['status'], 'stopped')
 
 
 if __name__ == '__main__':
