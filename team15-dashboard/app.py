@@ -237,6 +237,22 @@ class Model:
                                        for ref, card in public.oracle.cards.items()})
         rank['unopened_packs'] = [{k: a.get(k) for k in ('id', 'ref', 'your_value')}
                                   for a in (me.get('assets') or []) if a.get('kind') == 'pack']
+        rank['liquidation_targets'] = []
+        if rank.get('verified'):
+            for row in rank.get('catalog_rows') or []:
+                loss, floor = row.get('sell_value_loss'), row.get('sell_floor')
+                wants = row.get('wanted_by') or []
+                if (row.get('stock', 0) and wants and not row.get('sell_breaks_page')
+                        and isinstance(loss, (int, float)) and isinstance(floor, (int, float))):
+                    rank['liquidation_targets'].append({
+                        'ref': row['ref'], 'loss': loss, 'floor': floor, 'ask': floor + 2,
+                        'floor_surplus': round(floor - loss, 2), 'stock': row['stock'],
+                        'breaks_page': bool(row.get('sell_breaks_page')),
+                        'demanders': wants, 'sold_median': row.get('sold_median'),
+                        'sold_count': row.get('sold_count', 0),
+                    })
+            rank['liquidation_targets'].sort(
+                key=lambda r: (r['floor'], r['sold_median'] is None, -len(r['demanders'])))
         enrich_catalog_market(rank.get('catalog_rows') or [], self.catalog or {}, public.oracle.cards)
         holdings = {r['ref']: r.get('stock') for r in (rank.get('catalog_rows') or [])
                     if r.get('ref') and r.get('stock')}
@@ -289,6 +305,7 @@ class Model:
             trade_history.settlements(self.public.stores, self.team), rank['history'], self.team)
         rank['trade_summary'] = trade_history.summary(rank['trade_history'])
         rank["rank_race"] = history.rank_race(rank["history"], self.team)
+        rank["rank_race_all"] = history.rank_race_all(rank["history"], self.team)
         if rank["feed_health"].get("status") != "fresh":
             rank["warnings"].append(
                 "El almacén del feed no está al día: los precios, los rivales y el playbook se calculan sobre él. "
@@ -603,13 +620,15 @@ def strategy_export(data: dict) -> dict:
             'scarcity_ratio_minted_to_print_run': round(scarcity_ratio, 4) if scarcity_ratio is not None else None,
             'sold_median': row.get('sold_median'), 'sold_count': len(row.get('sold_prices') or []),
             'sold_prices': row.get('sold_prices') or [],
-            'sell_floor': row.get('sell_floor'), 'buy_ceiling': row.get('buy_ceiling'),
+            'sell_floor': row.get('sell_floor'), 'sell_value_loss': row.get('sell_value_loss'),
+            'sell_breaks_page': row.get('sell_breaks_page'), 'buy_ceiling': row.get('buy_ceiling'),
         })
     return {
         'schema': 'team15.strategy.v2', 'schema_compatibility': 'team15.strategy.v1 fields retained', 'team': 't15', 'tick': data.get('tick'),
         'generated_at': data.get('built_at'), 'verified_private_data': bool(data.get('verified')),
         'freshness': {'snapshot_tick': data.get('tick'), 'built_at': data.get('built_at'), 'status': 'live' if data.get('live') else 'public_only', 'cache_max_age_seconds': 12},
         'ranking': ranking,
+        'leaderboard_history': data.get('rank_race_all') or {},
         'scoring': data.get('scoring') or {},
         'ladder': data.get('ladder') or {},
         'peers': data.get('peers') or {},
@@ -622,6 +641,7 @@ def strategy_export(data: dict) -> dict:
         'trade_history': data.get('trade_history') or [],
         'trade_summary': data.get('trade_summary') or {},
         'unopened_packs': data.get('unopened_packs') or [],
+        'liquidation_targets': data.get('liquidation_targets') or [],
         'opportunities': opportunities,
         'kpis': {
             'published_cards': len(released), 'catalog_cards': len(rows),
@@ -948,6 +968,7 @@ def render_trend(data: dict) -> str:
     rows = data.get('history') or []
     summary = data.get('history_summary') or {}
     race = data.get('rank_race') or {}
+    race_all = data.get('rank_race_all') or {}
     peers = data.get('peers') or {}
     if summary.get('status') != 'ok':
         return ('<section id="tendencia" class="monitor"><div class="section-head"><div>'
@@ -990,10 +1011,22 @@ def render_trend(data: dict) -> str:
                           caption='Lo que paga la escalera es la cuota del rango capturada. '
                                   'Sube regateando mejor, no cerrando más tratos.'),
     ]
-    if race.get('series'):
-        cards.append(charts.line_chart(race['series'], title='Carrera con los vecinos',
-                                       caption='El de arriba y el de abajo son los que mueven el puesto. '
-                                               'Elegidos por el estado actual, no por el inicial.'))
+    if race_all.get('scores'):
+        names = race_all.get('teams') or list(race_all['scores'])
+        palette = ['#91a3aa', '#758b94', '#aab8bd', '#627c85']
+        colors = {name: palette[i % len(palette)] for i, name in enumerate(names)}
+        colors['t15'] = '#087c7c'
+        cards.append(charts.line_chart(race_all['scores'], width=820, height=250,
+                                       colors=colors, highlight='t15',
+                                       title='Carrera de score · todos los equipos',
+                                       caption=f'{len(names)} equipos; Team 15 resaltado. '
+                                               'El score público puede retrasarse frente al desglose privado.'))
+        cards.append(charts.line_chart(race_all['positions'], width=820, height=250,
+                                       lo=1, hi=max(2, len(names)), invert=True,
+                                       value_fmt='{:.0f}', colors=colors, highlight='t15',
+                                       title='Puesto histórico · todos los equipos',
+                                       caption='Escala completa del puesto; arriba es mejor. '
+                                               f'Posición pública más reciente de Team 15: {esc(race_all.get("position") or "—")} de {len(names)}.'))
 
     parts = ['<section id="tendencia" class="monitor"><div class="section-head"><div>',
              '<h2>Trayectoria</h2>',
@@ -1088,8 +1121,11 @@ CSS += """
 .trade-net-chart{display:flex;align-items:center;gap:7px;overflow:auto;border:1px solid var(--line);border-radius:12px;padding:10px;min-height:115px}.trade-net-bar{display:flex;flex-direction:column;justify-content:end;align-items:center;height:103px;min-width:23px}.trade-net-bar span{width:16px;border-radius:4px 4px 0 0;background:var(--teal)}.trade-net-bar.bad span{background:var(--red)}.trade-net-bar small{font-size:9px;color:var(--muted)}.trade-history-scroll{max-height:540px;overflow:auto;border:1px solid var(--line);border-radius:12px}.trade-history-table{border-collapse:collapse;width:100%;font-size:11px}.trade-history-table th,.trade-history-table td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}.trade-history-table th{position:sticky;top:0;background:#eff5f4}.trade-history-table .good td:nth-child(8){color:var(--teal);font-weight:800}.trade-history-table .bad td:nth-child(8){color:var(--red);font-weight:800}.trade-history-table details{max-width:400px;white-space:normal}.trade-history-table summary{cursor:pointer;color:var(--teal)}
 @media(max-width:800px){.duel-analysis-columns{grid-template-columns:1fr}.duel-insight-grid,.trade-history-kpis{grid-template-columns:1fr 1fr}}
 @media(max-width:540px){.duel-insight-grid,.trade-history-kpis,.duel-splits{grid-template-columns:1fr}}
-"""
+.charts .chart:has(.chart-keys .key:nth-child(8)){grid-column:1/-1}.chart-keys{max-height:105px;overflow:auto}.chart-keys .key{white-space:nowrap}.chart svg .tick{font-variant-numeric:tabular-nums}
+.liquidation-tag{font-size:11px;color:var(--red);font-weight:700}.liquidation-lead{padding:13px 16px;background:#eff6f5;border-left:4px solid var(--teal);display:grid;gap:4px;font-size:12px}.liquidation-lead span{color:var(--muted)}.liquidation-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:13px 0}.liquidation-card{display:grid;grid-template-columns:1.3fr .8fr .8fr .8fr;gap:9px;align-items:center;padding:13px;border:1px solid var(--line);border-radius:12px;background:#fff}.liquidation-card h3{margin:0;font-size:15px}.liquidation-card>div:first-child span{font-size:10px;color:var(--muted);display:block;margin-top:4px}.liquidation-card small{display:block;font-size:9px;color:var(--muted)}.liquidation-card>div b{font-size:14px;white-space:nowrap}.liquidation-card p{grid-column:1/-1;margin:1px 0 0;font-size:10px;color:var(--muted);line-height:1.4}.liquidation-card p b{color:var(--teal)}
+@media(max-width:850px){.liquidation-grid{grid-template-columns:1fr}}@media(max-width:520px){.liquidation-card{grid-template-columns:1fr 1fr}.liquidation-card>div:first-child,.liquidation-card p{grid-column:1/-1}}
 
+"""
 
 def render_operations(data: dict) -> str:
     op = data.get('operations') or {}
@@ -1280,7 +1316,7 @@ def render(data: dict) -> str:
              '<header><div><h1>Mesa de mando · Team 15</h1><p class="sub">Puntos, duelos, caja y mercado para decidir durante el último día.</p></div>',
              '<div class="status"><span class="flag ', 'live' if live else 'warn', '">',
              'Equipo conectado' if live else 'Sólo feed público', '</span><span class="clock">Tick ', esc(tick), '</span></div></header>',
-             '<nav class="jump" aria-label="Secciones"><a href="#pulso">Seguimiento</a><a href="#duelos-historico">Duelos cerrados</a><a href="#compras-ventas">Compras y ventas</a><a href="#operacion">Operación</a><a href="#monitor">Puntos</a><a href="#tendencia">Trayectoria</a><a href="#guide">Ventas</a><a href="#radio">Señales</a><a href="#ranking">Oportunidades</a><a href="#estrategia-ranking">Ranking</a><a href="#catalogo">Catálogo</a></nav>', render_command_deck(data), render_strategy_health(data), render_operations(data), render_monitor(data), render_trend(data), duel_history.render(data.get('duel_history') or []), trade_history.render(data.get('trade_history') or [], data.get('unopened_packs') or []), render_dashboard_overview(data), render_rank_strategy(data)]
+             '<nav class="jump" aria-label="Secciones"><a href="#pulso">Seguimiento</a><a href="#duelos-historico">Duelos cerrados</a><a href="#compras-ventas">Compras y ventas</a><a href="#estrategia-ventas">Liquidación</a><a href="#operacion">Operación</a><a href="#monitor">Puntos</a><a href="#tendencia">Trayectoria</a><a href="#guide">Ventas</a><a href="#radio">Señales</a><a href="#ranking">Oportunidades</a><a href="#estrategia-ranking">Ranking</a><a href="#catalogo">Catálogo</a></nav>', render_command_deck(data), render_strategy_health(data), render_operations(data), render_monitor(data), render_trend(data), duel_history.render(data.get('duel_history') or []), trade_history.render(data.get('trade_history') or [], data.get('unopened_packs') or []), render_dashboard_overview(data), render_rank_strategy(data)]
     for warning in data.get("warnings") or []:
         parts.append('<div class="warning">' + esc(warning) + '</div>')
     guide = data.get("sale_guide") or []
@@ -1312,6 +1348,35 @@ def render(data: dict) -> str:
             parts.append('<span class="label">Ningún equipo pidió esta carta en el feed reciente.</span>')
         parts.append('</div></article>')
     parts.append('</div></section>')
+    targets = data.get('liquidation_targets') or []
+    parts += ['<section id="estrategia-ventas" class="monitor liquidation"><div class="section-head"><div>',
+              '<h2>Liquidación de cartas para subir</h2>',
+              '<p class="sub">Propuestas agresivas solo para cartas cuyo precio cubre el valor privado perdido. '
+              'El interés del feed no es una puja ni garantiza que acepten.</p></div>',
+              '<span class="liquidation-tag">No tocar bajo el suelo</span></div>']
+    if targets:
+        parts += ['<div class="liquidation-lead"><b>Regla de ataque</b><span>Abrir en el objetivo; si el rival regatea, '
+                  'conceder como máximo hasta el suelo privado. Nunca sacrificar páginas completadas ni aceptar '
+                  'precio por debajo del suelo.</span></div><div class="liquidation-grid">']
+        for item in targets[:8]:
+            median = (f'{fmt(item["sold_median"])} P · n={esc(item["sold_count"])}'
+                      if item.get('sold_median') is not None else 'Sin venta comparable observada')
+            buyers = ', '.join(item.get('demanders') or [])
+            parts.append(
+                f'<article class="liquidation-card"><div><h3>{esc(item["ref"])}</h3>'
+                f'<span>{esc(len(item["demanders"]))} equipos la buscan: {esc(buyers)}</span></div>'
+                f'<div><small>Objetivo de apertura</small><b>{fmt(item["ask"])} P</b></div>'
+                f'<div><small>Suelo rentable</small><b>{fmt(item["floor"])} P</b></div>'
+                f'<div><small>Valor perdido</small><b>{fmt(item["loss"])} P</b></div>'
+                f'<p>Última mediana vendida: {median}. El suelo conserva al menos '
+                f'+{fmt(item["floor_surplus"])} P de excedente privado si la valoración sigue vigente.</p></article>')
+        parts.append('</div><p class="chart-note">El precio objetivo suma 2 P de margen al suelo. '
+                     'Los puntos de leaderboard por oferta concreta no son públicos; el score solo confirma el resultado '
+                     'agregado tras liquidar.</p>')
+    else:
+        parts.append('<p>No hay cartas con interés observado que cumplan el suelo privado y la protección de página. '
+                     'Vender un singleton sin cubrir su valor puede bajar el score.</p>')
+    parts.append('</section>')
     summary = data.get('radio_summary') or {}
     counts = summary.get('by_verdict') or {}
     parts += ['<section id="radio" class="radio"><div class="section-head"><div>',

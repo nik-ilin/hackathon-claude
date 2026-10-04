@@ -175,6 +175,29 @@ def rank_race(rows: list[dict], team: str = "t15", around: int = 1) -> dict:
             "position": i + 1, "teams": len(names)}
 
 
+def rank_race_all(rows: list[dict], team: str = "t15") -> dict:
+    """Complete score and position histories for every team in the public snapshots."""
+    if not rows:
+        return {"scores": {}, "positions": {}, "teams": []}
+    names = sorted({name for row in rows for name, score in (row.get("rivals") or {}).items()
+                    if isinstance(score, (int, float))})
+    scores = {name: [] for name in names}
+    positions = {name: [] for name in names}
+    for row in rows:
+        snapshot = row.get("rivals") or {}
+        values = {name: value for name, value in snapshot.items() if isinstance(value, (int, float))}
+        ordered = sorted(values, key=lambda name: (-values[name], name))
+        place = {name: i + 1 for i, name in enumerate(ordered)}
+        for name in names:
+            value = values.get(name)
+            if value is not None:
+                scores[name].append((row["tick"], float(value)))
+                positions[name].append((row["tick"], float(place[name])))
+    names.sort(key=lambda name: -(scores[name][-1][1] if scores[name] else -1))
+    return {"scores": scores, "positions": positions, "teams": names,
+            "position": names.index(team) + 1 if team in names else None}
+
+
 def summary(rows: list[dict], team: str = "t15") -> dict:
     """Lo que se lee de un vistazo: desde dónde venimos, la tendencia y el mejor trato."""
     if len(rows) < 2:
