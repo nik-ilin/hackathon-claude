@@ -62,7 +62,7 @@ _NEWS_DB = os.environ.get("NEWS_DB", "")
 # --allow-last-copy SAL-07/--pilar-last-copy/--deny-margin que el preset ya tenía. Solo se añaden aquí
 # los flags propios de la ejecución desatendida (--execute, --max-spend, --allow-concurrent, etc.) que
 # no tiene sentido meter en el preset compartido.
-BASE = ["./run.sh", "t15", "--execute", "--max-spend", "200", "--allow-concurrent",
+BASE = ["./run.sh", "t15", "--execute", "--max-spend", "400", "--allow-concurrent",
         "--page-campaign", "none", "--news-margin", "2", "--fever-wait", "1",
         "--v10-commission", "--max-posts", "3"]
 if _NEWS_DB and Path(_NEWS_DB).is_file():
