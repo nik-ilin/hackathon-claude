@@ -19,6 +19,20 @@ seguía por debajo de su coste: barrio 17,98 frente a 26, plata 100,29 frente a 
 (estimación estratégica, sujeta al inventario). Comprar sólo si un descuento negociado o una necesidad de página
 verificada invierte ese balance. El efectivo final no puntúa, pero tampoco convierte una compra negativa en buena.
 
+**Revisión posterior (ticks 1613–1653):** `/api/me` mostró cero sobres sin abrir y 45 cartas, incluidas CHA-10 y
+CHA-09. El historial privado de caja y valor de colección aísla ambas compras: CHA-10 por 60 P añadió 63 P de valor
+(+3 P netos observados); CHA-09 por 61 P añadió 63 P (+2 P). Una venta de MAL-07 a t03 por 9 P en el tick 1647
+redujo el valor de colección 6,9 P (+2,1 P netos observados). El dashboard enseña 41 liquidaciones propias del feed,
+pero sólo tres tienen muestras privadas antes/después y un único trato en el intervalo: las otras 38 quedan **sin
+valoración aislada**, no como buenas ni malas. Ninguno de estos excedentes equivale por sí mismo a puntos del ranking.
+
+Con el inventario del tick 1623, el modelo de valoración reprodujo el valor privado del servidor (1699,75 frente a
+1699,8 P). En 5.000 simulaciones por tipo, el EV bruto de colección fue 13,49 P para barrio (precio 26), 78,06 P
+para plata (150) y 288,51 P para oro (420); probabilidad estimada de al menos un duplicado: 98,2 %, 99,9 % y 99,9 %.
+Estos EV no incluyen reventa; incluso la estimación estratégica anterior, más generosa, quedaba por debajo de los
+precios. Mejor negociar una carta concreta por debajo de su valor privado, con contraparte o escalera verificable,
+que consumir 420 P en un oro esperando suerte. Recalcular tras nuevas adquisiciones y no sumar estos EV al score.
+
 El score descendió de 23,91 a 21,11 mientras los tratos seguían en 61 y los acumulados privados nuevos en cero:
 negociación y mercado cayeron proporcionalmente al entrar la ronda dominical. Es dilución por ponderación, no pérdida
 observada de una operación nueva. La sección «Qué movió el score» del dashboard distingue estos intervalos de nuevos

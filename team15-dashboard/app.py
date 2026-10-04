@@ -32,6 +32,7 @@ import history
 import operations
 import scoring
 import strategy_health
+import trade_history
 from planner import build_rank
 
 # El kit también tiene radio.py; cargar el módulo del panel por ruta evita que
@@ -234,6 +235,8 @@ class Model:
                           rivals, listing_teams, reserve=self.reserve,
                           market_refs={ref: {"fair": card.fair, "confidence": card.confidence}
                                        for ref, card in public.oracle.cards.items()})
+        rank['unopened_packs'] = [{k: a.get(k) for k in ('id', 'ref', 'your_value')}
+                                  for a in (me.get('assets') or []) if a.get('kind') == 'pack']
         enrich_catalog_market(rank.get('catalog_rows') or [], self.catalog or {}, public.oracle.cards)
         holdings = {r['ref']: r.get('stock') for r in (rank.get('catalog_rows') or [])
                     if r.get('ref') and r.get('stock')}
@@ -282,6 +285,9 @@ class Model:
         rank["history"] = history.load(self.history_path)
         rank["history_summary"] = history.summary(rank["history"], self.team)
         rank["impact_events"] = history.impact_events(rank["history"])
+        rank['trade_history'] = trade_history.ledger(
+            trade_history.settlements(self.public.stores, self.team), rank['history'], self.team)
+        rank['trade_summary'] = trade_history.summary(rank['trade_history'])
         rank["rank_race"] = history.rank_race(rank["history"], self.team)
         if rank["feed_health"].get("status") != "fresh":
             rank["warnings"].append(
@@ -612,6 +618,10 @@ def strategy_export(data: dict) -> dict:
         'strategy_health': data.get('strategy_health') or {},
         'score_impacts': (data.get('impact_events') or [])[-20:],
         'duel_history': duel_history.rows(data.get('duel_history') or []),
+        'duel_analysis': duel_history.analysis(data.get('duel_history') or []),
+        'trade_history': data.get('trade_history') or [],
+        'trade_summary': data.get('trade_summary') or {},
+        'unopened_packs': data.get('unopened_packs') or [],
         'opportunities': opportunities,
         'kpis': {
             'published_cards': len(released), 'catalog_cards': len(rows),
@@ -1074,6 +1084,10 @@ header{border-radius:18px;background:var(--card);box-shadow:var(--card-shadow);p
 
 CSS += """
 .duel-detail summary{cursor:pointer;color:var(--teal);font-weight:700;white-space:nowrap}.duel-detail>div{max-width:440px;white-space:normal;background:#f7faf9;padding:12px;border:1px solid var(--line);border-radius:9px;line-height:1.4}.duel-detail p{margin:4px 0 8px}.duel-detail ol{padding-left:18px;margin:8px 0;max-height:250px;overflow:auto}.duel-detail li{padding:5px 0;border-top:1px solid var(--line)}.duel-detail small{display:block;color:var(--muted)}
+.duel-insight-grid,.trade-history-kpis{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:18px 0}.duel-insight-grid article,.trade-history-kpis article{background:#f5f9f8;border:1px solid var(--line);border-radius:13px;padding:13px 15px}.duel-insight-grid small,.trade-history-kpis small{display:block;color:var(--muted);font-size:11px}.duel-insight-grid strong,.trade-history-kpis strong{display:block;font-size:25px;line-height:1.1;margin:6px 0;font-variant-numeric:tabular-nums}.duel-insight-grid span,.trade-history-kpis span{font-size:11px;color:var(--muted);line-height:1.35;display:block}.duel-analysis-columns{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin:20px 0}.duel-analysis-columns h3{font-size:15px}.duel-splits{display:grid;grid-template-columns:1fr 1fr;gap:7px}.duel-split,.duel-rival{border:1px solid var(--line);border-radius:10px;padding:9px 11px;display:grid;gap:3px}.duel-split b,.duel-rival span{font-size:11px}.duel-split strong{font-size:18px}.duel-split span,.duel-rival small{font-size:10px;color:var(--muted)}.duel-rivals{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.duel-rival b{font-size:14px}.duel-review-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px}.duel-review-head h3{margin-bottom:3px}.duel-review-head p,.duel-review-head>span{font-size:11px;color:var(--muted)}.duel-review-list{display:flex;gap:7px;overflow:auto;padding:4px 0 9px}.duel-review{min-width:165px;text-align:left;background:#f8f5ef;border:1px solid #e7d7b8;border-radius:10px;padding:8px 10px;cursor:pointer;display:grid;gap:4px;color:var(--ink)}.duel-review span{font-size:10px}.duel-review strong{font-size:12px}.duel-controls{display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin:18px 0 11px}.duel-controls label{font-size:10px;color:var(--muted);display:grid;gap:4px}.duel-controls select{padding:7px;border:1px solid var(--line);border-radius:8px;background:#fff;min-width:105px;color:var(--ink)}.duel-controls .duel-review-only{display:flex;align-items:center;padding:8px;gap:5px;font-size:11px}.duel-controls>span{font-size:11px;color:var(--muted)}.duel-table tr.focused{background:#fff1d8}
+.trade-net-chart{display:flex;align-items:center;gap:7px;overflow:auto;border:1px solid var(--line);border-radius:12px;padding:10px;min-height:115px}.trade-net-bar{display:flex;flex-direction:column;justify-content:end;align-items:center;height:103px;min-width:23px}.trade-net-bar span{width:16px;border-radius:4px 4px 0 0;background:var(--teal)}.trade-net-bar.bad span{background:var(--red)}.trade-net-bar small{font-size:9px;color:var(--muted)}.trade-history-scroll{max-height:540px;overflow:auto;border:1px solid var(--line);border-radius:12px}.trade-history-table{border-collapse:collapse;width:100%;font-size:11px}.trade-history-table th,.trade-history-table td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}.trade-history-table th{position:sticky;top:0;background:#eff5f4}.trade-history-table .good td:nth-child(8){color:var(--teal);font-weight:800}.trade-history-table .bad td:nth-child(8){color:var(--red);font-weight:800}.trade-history-table details{max-width:400px;white-space:normal}.trade-history-table summary{cursor:pointer;color:var(--teal)}
+@media(max-width:800px){.duel-analysis-columns{grid-template-columns:1fr}.duel-insight-grid,.trade-history-kpis{grid-template-columns:1fr 1fr}}
+@media(max-width:540px){.duel-insight-grid,.trade-history-kpis,.duel-splits{grid-template-columns:1fr}}
 """
 
 
@@ -1266,7 +1280,7 @@ def render(data: dict) -> str:
              '<header><div><h1>Mesa de mando · Team 15</h1><p class="sub">Puntos, duelos, caja y mercado para decidir durante el último día.</p></div>',
              '<div class="status"><span class="flag ', 'live' if live else 'warn', '">',
              'Equipo conectado' if live else 'Sólo feed público', '</span><span class="clock">Tick ', esc(tick), '</span></div></header>',
-             '<nav class="jump" aria-label="Secciones"><a href="#pulso">Seguimiento</a><a href="#duelos-historico">Duelos cerrados</a><a href="#operacion">Operación</a><a href="#monitor">Puntos</a><a href="#tendencia">Trayectoria</a><a href="#guide">Ventas</a><a href="#radio">Señales</a><a href="#ranking">Oportunidades</a><a href="#estrategia-ranking">Ranking</a><a href="#catalogo">Catálogo</a></nav>', render_command_deck(data), render_strategy_health(data), render_operations(data), render_monitor(data), render_trend(data), duel_history.render(data.get('duel_history') or []), render_dashboard_overview(data), render_rank_strategy(data)]
+             '<nav class="jump" aria-label="Secciones"><a href="#pulso">Seguimiento</a><a href="#duelos-historico">Duelos cerrados</a><a href="#compras-ventas">Compras y ventas</a><a href="#operacion">Operación</a><a href="#monitor">Puntos</a><a href="#tendencia">Trayectoria</a><a href="#guide">Ventas</a><a href="#radio">Señales</a><a href="#ranking">Oportunidades</a><a href="#estrategia-ranking">Ranking</a><a href="#catalogo">Catálogo</a></nav>', render_command_deck(data), render_strategy_health(data), render_operations(data), render_monitor(data), render_trend(data), duel_history.render(data.get('duel_history') or []), trade_history.render(data.get('trade_history') or [], data.get('unopened_packs') or []), render_dashboard_overview(data), render_rank_strategy(data)]
     for warning in data.get("warnings") or []:
         parts.append('<div class="warning">' + esc(warning) + '</div>')
     guide = data.get("sale_guide") or []
