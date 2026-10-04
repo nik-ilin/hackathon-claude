@@ -29,6 +29,7 @@ import dashboard as public_dashboard
 import charts
 import duel_history
 import history
+import market_activity
 import operations
 import scoring
 import strategy_health
@@ -264,6 +265,8 @@ class Model:
         rank["warnings"] = warnings + public.errors + rank["warnings"]
         rank["board_count"] = sum(map(len, boards.values()))
         rank["venue_count"] = len(boards)
+        rank["market_activity"] = market_activity.build(
+            venues, boards, own_offers, self.team, int(public.clock.get("tick") or 0) or None)
         rank["built_at"] = time.time()
         rank["clock"] = public.clock
         rank["live"] = bool(me)
@@ -634,6 +637,7 @@ def strategy_export(data: dict) -> dict:
         'peers': data.get('peers') or {},
         'feed_health': data.get('feed_health') or {},
         'operations': data.get('operations') or {},
+        'market_activity': data.get('market_activity') or {},
         'strategy_health': data.get('strategy_health') or {},
         'score_impacts': (data.get('impact_events') or [])[-20:],
         'duel_history': duel_history.rows(data.get('duel_history') or []),
@@ -1127,6 +1131,10 @@ CSS += """
 
 """
 
+CSS += """
+.market-live{border-color:#c6d9d7;background:linear-gradient(145deg,#fff 0%,#f3f8f7 100%)}.market-live .section-head{align-items:center}.market-live h2{margin:2px 0 4px}.market-live-badge{display:inline-flex;padding:7px 12px;border:1px solid #c6d9d7;border-radius:999px;background:#eaf3f1;color:#176966;font-size:12px;font-weight:800}.market-live-headline{display:flex;justify-content:space-between;gap:12px;align-items:center;margin:12px 0;padding:13px 16px;border-left:4px solid var(--teal);border-radius:8px;background:#edf6f4}.market-live-headline b{font-size:15px}.market-live-headline span{font-size:11px;color:var(--muted)}.market-live-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin:12px 0 18px}.market-live-kpis article{padding:13px;border:1px solid var(--line);border-radius:12px;background:#fff}.market-live-kpis small{display:block;color:var(--muted);font-size:11px}.market-live-kpis strong{display:block;margin-top:6px;font-size:25px;font-variant-numeric:tabular-nums}.market-live details{margin:10px 0;border:1px solid var(--line);border-radius:11px;background:#fff;overflow:hidden}.market-live details summary{padding:12px 14px;cursor:pointer;font-weight:750;color:var(--ink);background:#f7faf9}.market-table-scroll{overflow:auto;max-height:460px}.market-table{min-width:850px;width:100%;border-collapse:collapse;font-size:12px}.market-table th,.market-table td{padding:9px 11px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.market-table th{position:sticky;top:0;z-index:1;background:#edf4f3;color:#53636a;font-size:10px;text-transform:uppercase;letter-spacing:.04em}.market-table td small{display:block;margin-top:4px;color:var(--muted);font-size:10px}.market-empty{margin:0;padding:17px;color:var(--muted);font-size:12px}.market-live details[open] summary{border-bottom:1px solid var(--line)}@media(max-width:720px){.market-live-kpis{grid-template-columns:1fr 1fr}.market-live-headline{align-items:flex-start;flex-direction:column}}
+"""
+
 def render_operations(data: dict) -> str:
     op = data.get('operations') or {}
     duel, capital, market = (op.get('duels') or {}), (op.get('capital') or {}), (op.get('market') or {})
@@ -1316,7 +1324,7 @@ def render(data: dict) -> str:
              '<header><div><h1>Mesa de mando · Team 15</h1><p class="sub">Puntos, duelos, caja y mercado para decidir durante el último día.</p></div>',
              '<div class="status"><span class="flag ', 'live' if live else 'warn', '">',
              'Equipo conectado' if live else 'Sólo feed público', '</span><span class="clock">Tick ', esc(tick), '</span></div></header>',
-             '<nav class="jump" aria-label="Secciones"><a href="#pulso">Seguimiento</a><a href="#duelos-historico">Duelos cerrados</a><a href="#compras-ventas">Compras y ventas</a><a href="#estrategia-ventas">Liquidación</a><a href="#operacion">Operación</a><a href="#monitor">Puntos</a><a href="#tendencia">Trayectoria</a><a href="#guide">Ventas</a><a href="#radio">Señales</a><a href="#ranking">Oportunidades</a><a href="#estrategia-ranking">Ranking</a><a href="#catalogo">Catálogo</a></nav>', render_command_deck(data), render_strategy_health(data), render_operations(data), render_monitor(data), render_trend(data), duel_history.render(data.get('duel_history') or []), trade_history.render(data.get('trade_history') or [], data.get('unopened_packs') or []), render_dashboard_overview(data), render_rank_strategy(data)]
+             '<nav class="jump" aria-label="Secciones"><a href="#pulso">Seguimiento</a><a href="#duelos-historico">Duelos cerrados</a><a href="#compras-ventas">Compras y ventas</a><a href="#mercado-vivo">Mercado en vivo</a><a href="#estrategia-ventas">Liquidación</a><a href="#operacion">Operación</a><a href="#monitor">Puntos</a><a href="#tendencia">Trayectoria</a><a href="#guide">Ventas</a><a href="#radio">Señales</a><a href="#ranking">Oportunidades</a><a href="#estrategia-ranking">Ranking</a><a href="#catalogo">Catálogo</a></nav>', render_command_deck(data), market_activity.render(data), render_strategy_health(data), render_operations(data), render_monitor(data), render_trend(data), duel_history.render(data.get('duel_history') or []), trade_history.render(data.get('trade_history') or [], data.get('unopened_packs') or []), render_dashboard_overview(data), render_rank_strategy(data)]
     for warning in data.get("warnings") or []:
         parts.append('<div class="warning">' + esc(warning) + '</div>')
     guide = data.get("sale_guide") or []
