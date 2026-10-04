@@ -38,7 +38,8 @@ case "${1:-}" in
             --deny-teams t05,t14,t12,t10,t18 --deny-margin 15 \
             --ladder-fill --ladder-calibrated --dealer-sell-dups --dedupe-bids \
             --pilar-sell SAL,LAV:1.25 --pilar-last-copy --allow-last-copy SAL-07 \
-            --news-sell --chato-mirror on --fever-priority "$@" ;;
+            --news-sell --chato-mirror on --fever-priority \
+            --dealer-banco --ernesto "$@" ;;
   broker) exec python3 starter_broker.py ;;
   market-broker) shift; exec python3 market_broker.py "$@" ;;
   duels) shift; exec python3 duel_runner.py "$@" ;;
