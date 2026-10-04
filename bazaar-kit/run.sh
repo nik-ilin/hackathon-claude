@@ -33,7 +33,7 @@ case "${1:-}" in
   coord)  shift; exec python3 coordinator.py "$@" ;;
   market) shift; exec python3 market_agent.py "$@" ;;
   celestina) shift; exec python3 celestina.py "$@" ;;
-  t15)    shift; exec python3 coordinator.py --reserve 5 --per-card 95 --margin 2 \
+  t15)    shift; exec python3 coordinator.py --reserve 5 --per-card 150 --margin 2 \
             --no-rival-venues --duende-venue rastro \
             --deny-teams t05,t14,t12,t10,t18 --deny-margin 15 \
             --ladder-fill --ladder-calibrated --dealer-sell-dups --dedupe-bids \
