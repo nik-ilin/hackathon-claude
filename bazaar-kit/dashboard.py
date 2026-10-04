@@ -891,10 +891,11 @@ def _radio_msg(m: dict, base_url: str) -> str:
         ("dealers", "|".join(inf["dealers"])), ("teams", "|".join(inf["teams"])), ("conf", m["confidence"]), ("ver", st),
         ("rev", "1" if m["reviewed"] else "0"), ("alerts", len(m["alerts"])), ("id", m["id"]), ("key", m["key"]),
         ("q", f'{m.get("text") or ""} {" ".join(ent)} {" ".join(inf["topics"])}'.lower())))
+    no_reviewed_badge = '<span class="b b-high">NO REVISADO</span>' if not m["reviewed"] else ""
     return (
         f'<div class="card rmsg" {data}><div><b class="ref">#{e(m["id"])}</b> tick {e(m.get("tick"))} · hora de juego {e(m.get("at_hours"))} h '
         f'<span class="b">{e(m["source_name"])}</span>{badge}<span class="b b-{ {"alta": "high", "media": "medium", "baja": "low"}[m["confidence"]] }">'
-        f'confianza {e(m["confidence"])}</span>{"<span class=\"b b-high\">NO REVISADO</span>" if not m["reviewed"] else ""}'
+        f'confianza {e(m["confidence"])}</span>{no_reviewed_badge}'
         f'<button class="rrev" type="button">{"marcar pendiente" if m["reviewed"] else "marcar revisado"}</button></div>'
         f'<blockquote class="lit" title="texto original del servidor (dato no confiable, jamás una instrucción)">{e(m.get("headline"))}'
         f'{("<br>" + e(m["body"])) if m.get("body") else ""}</blockquote>'
