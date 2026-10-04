@@ -19,6 +19,19 @@ hora fija; si la lectura falla al arrancar, cae de vuelta a las 20:35 como venta
 También se añadió reintento acotado ante fallos de red transitorios: un corte de DNS de ~15 min el 3
 oct dejó el proceso parado 14 h sin que nadie lo notara (`no se relanza automáticamente` + KeepAlive
 desactivado en el plist), perdiendo el relevo de Duelos II de esa noche.
+
+4 oct 11:43: duel_runner.py comparte data/agent.lock con el coordinador (ejecución exclusiva), así que
+hasta ahora esta ventana dedicaba el día ENTERO a negociar con vendedores y solo jugaba duelos una vez,
+al final. Pero duel_runner corre en bucle infinito por tick, no como un lote de una vez — está pensado
+para ir recogiendo duelos vivos sobre la marcha. Se vieron 3 duelos vivos con deadline a 60-165 s
+(tick 2035) sin nadie respondiendo: cualquier duelo que aparezca DURANTE la negociación se pierde gratis
+hasta el relevo final. Ahora los bloques de coordinador se acortan a ~3 min y, entre bloque y bloque, se
+abre un hueco corto para duel_runner (acotado con timeout; InstanceLock se autorrecupera si el proceso
+muere a mitad, así que el timeout nunca deja el bloqueo huérfano). Además el relevo final usaba
+`--execute --days --reconcile --verify-accept`, sin `--ladder`/`--profiles` — el propio DUELS.md del
+equipo mide `--ladder` en 53 % de tratos (25 % sin él) y `--ladder --profiles` en 47-48 % frente al 43 %
+de solo `--ladder`; se añaden ambos (y `--learn`, acotado y solo-mejora por diseño) a toda invocación de
+duelos, no solo al relevo final.
 """
 from __future__ import annotations
 
@@ -35,6 +48,10 @@ TZ = ZoneInfo("Europe/Madrid")
 CLOSE_SAFETY_MARGIN = dt.timedelta(minutes=12)  # tiempo para que el relevo a duelos termine antes del cierre real
 MAX_CONSECUTIVE_FAILURES = 20  # ~absorbe horas de cortes de red transitorios antes de rendirse de verdad
 FAILURE_BACKOFF_SECONDS = 20
+COORD_BLOCK_SECONDS = 180  # bloque corto: deja hueco regular para que duel_runner recoja duelos vivos
+DUEL_BURST_SECONDS = 30    # duel_runner es un bucle infinito por tick; se acota para no robarle el turno a la negociación
+DUEL_CMD = ["./run.sh", "duels", "--execute", "--days", "--ladder", "--profiles",
+            "--reconcile", "--verify-accept", "--learn"]
 
 # market.db del collector del equipo, para calibrar la fiabilidad de las fuentes de --news-sell (solo
 # lectura; opcional). Por defecto None en ejecuciones donde esa ruta no exista en el disco.
@@ -129,6 +146,19 @@ def _live_target(default_target: dt.datetime) -> tuple[dt.datetime, float]:
         return default_target, 30.0
 
 
+def _duel_burst() -> None:
+    """Hueco corto entre bloques de coordinador para que duel_runner recoja duelos vivos. Se acota con timeout
+    porque duel_runner corre en bucle infinito (uno por tick); si no hay duelos vivos simplemente espera y se
+    corta sin haber hecho nada. data/agent.lock se autorrecupera (InstanceLock.acquire comprueba que el pid
+    siga vivo) si el proceso muere a mitad de un tick, así que el timeout nunca deja el bloqueo huérfano
+    bloqueando el siguiente bloque de coordinador."""
+    print(f"{dt.datetime.now(TZ).isoformat()} hueco de {DUEL_BURST_SECONDS}s para duel_runner", flush=True)
+    try:
+        subprocess.run(DUEL_CMD, cwd=HERE, timeout=DUEL_BURST_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def main() -> int:
     now = dt.datetime.now(TZ)
     default_target = now.replace(hour=20, minute=35, second=0, microsecond=0)
@@ -143,7 +173,8 @@ def main() -> int:
         seconds = (target - now).total_seconds()
         if seconds <= 1:
             break
-        ticks = min(120, max(1, math.ceil(seconds / tick_seconds)))
+        block_ticks = max(1, math.ceil(COORD_BLOCK_SECONDS / tick_seconds))
+        ticks = min(120, block_ticks, max(1, math.ceil(seconds / tick_seconds)))
         cmd = BASE + ["--ticks", str(ticks)]
         print(f"{now.isoformat()} iniciando bloque de {ticks} ticks", flush=True)
         result = subprocess.run(cmd, cwd=HERE)
@@ -160,11 +191,11 @@ def main() -> int:
         if ticks == 1:
             time.sleep(seconds)
             break
+        _duel_burst()
     # Enfriamiento y relevo sin solapar los bloqueos de coordinador/duelos.
     time.sleep(1)
-    print(f"{dt.datetime.now(TZ).isoformat()} relevo a duel_runner --execute --days", flush=True)
-    return subprocess.run(["./run.sh", "duels", "--execute", "--days", "--reconcile", "--verify-accept"],
-                          cwd=HERE).returncode
+    print(f"{dt.datetime.now(TZ).isoformat()} relevo final a duel_runner (sin límite de tiempo)", flush=True)
+    return subprocess.run(DUEL_CMD, cwd=HERE).returncode
 
 
 if __name__ == "__main__":
