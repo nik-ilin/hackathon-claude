@@ -74,6 +74,7 @@ def build(venues: list[dict], boards: dict[str, list[dict]], own_offers: list[di
             "kind": _kind(row.get("give"), row.get("want")),
             "gives": give_cards, "wants": want_cards,
             "cash_give": give_cash, "cash_want": want_cash,
+            "fee_bps": venue.get("fee_bps"), "fee_per_card": venue.get("fee_per_card"),
             "expires_tick": expires,
             "ticks_left": max(0, int(expires) - int(tick)) if expires is not None and tick is not None else None,
             "thread": row.get("thread"),
@@ -106,26 +107,44 @@ def render(data: dict) -> str:
     def money(value):
         return f"{int(value):,} P".replace(",", " ") if value else "—"
 
-    def cards(values):
-        return ", ".join(_e(v) for v in values) if values else "—"
+    def side_text(values, cash):
+        items = [_e(v) for v in values]
+        if cash:
+            items.append(money(cash))
+        return " + ".join(items) if items else "Nada indicado"
 
-    def table(rows, *, mine=False):
+    def cards(rows):
         if not rows:
             return '<p class="market-empty">No hay ofertas abiertas en esta vista.</p>'
-        body = []
+        grouped = {}
         for row in rows:
-            expiry = f"tick { _e(row['expires_tick']) } · quedan {_e(row['ticks_left'])}" if row.get("expires_tick") is not None else "Sin caducidad publicada"
-            addressed = f" · dirigida a {_e(row['to'])}" if row.get("to") else " · pública"
-            body.append(
-                '<tr><td><b>#' + _e(row.get("id")) + '</b><small>' + _e(row.get("kind")) + '</small></td>'
-                '<td><b>' + _e(row.get("venue_name")) + '</b><small>' + _e(row.get("venue")) + '</small></td>'
-                '<td><b>' + _e(row.get("maker")) + '</b><small>' + addressed + '</small></td>'
-                '<td>' + cards(row.get("gives") or []) + '<small>Entrega · ' + money(row.get("cash_give")) + '</small></td>'
-                '<td>' + cards(row.get("wants") or []) + '<small>Pide · ' + money(row.get("cash_want")) + '</small></td>'
-                '<td>' + _e(expiry) + ('<small>Tuya</small>' if row.get("mine") else '') + '</td></tr>')
-        return ('<div class="market-table-scroll"><table class="market-table"><thead><tr>'
-                '<th>Oferta</th><th>Mercado</th><th>Publica</th><th>Entrega</th><th>Solicita</th><th>Caducidad</th>'
-                '</tr></thead><tbody>' + ''.join(body) + '</tbody></table></div>')
+            grouped.setdefault((row.get("venue"), row.get("venue_name")), []).append(row)
+        sections = []
+        for (venue_id, venue_name), venue_rows in grouped.items():
+            body = []
+            for row in venue_rows:
+                expiry = (f"Tick {_e(row['expires_tick'])} · {_e(row['ticks_left'])} ticks restantes"
+                          if row.get("expires_tick") is not None else "Sin caducidad publicada")
+                addressed = (f"Dirigida a {_e(row['to'])}" if row.get("to") else "Pública")
+                bps, per = row.get("fee_bps"), row.get("fee_per_card")
+                fee = (f"{bps / 100:g}% + {per} P/carta" if isinstance(bps, (int, float)) and isinstance(per, (int, float))
+                       else "Comisión no indicada")
+                mine_badge = '<span class="market-owner-badge">TUYA</span>' if row.get("mine") else ''
+                body.append(
+                    '<article class="market-offer-card"><div class="market-offer-top">'
+                    '<div><span class="market-offer-id">OFERTA #' + _e(row.get("id")) + '</span>'
+                    '<span class="market-kind">' + _e(row.get("kind")) + '</span>' + mine_badge + '</div>'
+                    '<span class="market-maker">Publica <b>' + _e(row.get("maker")) + '</b> · ' + _e(addressed) + '</span></div>'
+                    '<div class="market-exchange"><div><small>OFRECE</small><b>'
+                    + side_text(row.get("gives") or [], row.get("cash_give")) + '</b></div>'
+                    '<span class="market-arrow" aria-hidden="true">→</span><div><small>QUIERE A CAMBIO</small><b>'
+                    + side_text(row.get("wants") or [], row.get("cash_want")) + '</b></div></div>'
+                    '<div class="market-offer-foot"><span>' + _e(row.get("kind")) + ' · Comisión: ' + _e(fee)
+                    + '</span><span>' + _e(expiry) + '</span></div></article>')
+            sections.append('<div class="market-venue-group"><div class="market-venue-title"><b>' + _e(venue_name)
+                            + '</b><span>' + _e(venue_id) + ' · ' + _e(len(venue_rows)) + ' oferta(s)</span></div>'
+                            + '<div class="market-offer-list">' + ''.join(body) + '</div></div>')
+        return ''.join(sections)
 
     if sales:
         headline = f"Sí: tienes {len(sales)} oferta(s) de venta abierta(s)."
@@ -144,8 +163,11 @@ def render(data: dict) -> str:
         '<article><small>Tus ofertas abiertas</small><strong>' + _e(summary.get("my_open_offers", 0)) + '</strong></article>'
         '<article><small>Ofertas en tu mercado</small><strong>' + _e(summary.get("own_market_total", 0)) + '</strong></article>'
         '<article><small>De otros equipos en tu mercado</small><strong>' + _e(summary.get("own_market_by_others", 0)) + '</strong></article>'
-        '</div><details open><summary>Mis publicaciones activas</summary>' + table(watch.get("my_open_offers") or [], mine=True) + '</details>'
-        '<details open><summary>Ofertas abiertas en ' + _e(watch.get("own_venue_name") or "mi mercado") + '</summary>'
-        + table(own_market) + '</details><details><summary>Todos los mercados · ' + _e(summary.get("open_offers_total", 0))
-        + ' ofertas en ' + _e(summary.get("active_venues", 0)) + ' mercados</summary>' + table(all_offers)
+        '</div><div class="market-live-columns"><div class="market-live-block"><h3>Lo que publicas tú</h3>'
+        '<p>Separado por mercado; “ofrece” y “quiere a cambio” se leen desde el lado de quien publicó la oferta.</p>'
+        + cards(watch.get("my_open_offers") or []) + '</div>'
+        '<div class="market-live-block"><h3>Lo que hay publicado en tu mercado · ' + _e(watch.get("own_venue_name") or "v15") + '</h3>'
+        '<p>Incluye las ofertas de otros equipos y las tuyas que aparecen en el libro de v15.</p>'
+        + cards(own_market) + '</div></div><details><summary>Todos los mercados · ' + _e(summary.get("open_offers_total", 0))
+        + ' ofertas en ' + _e(summary.get("active_venues", 0)) + ' mercados</summary>' + cards(all_offers)
         + '</details></section>')
